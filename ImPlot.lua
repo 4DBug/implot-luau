@@ -1662,7 +1662,699 @@ return function(G)
                 end
             end
         end
-        -- [Port] TODO: Locator_Time, Locator_Log10, Locator_SymLog (log/time scale milestone)
+        local Locator_Default = internal.Locator_Default
+        local DBL_MIN = 2.2250738585072014e-308
+        local DBL_EPSILON = 2.220446049250313e-16
+        local function ImSign(v) if v < 0 then return -1 end return 1 end
+        local function Trunc(v) if v < 0 then return math.ceil(v) end return math.floor(v) end -- [Port] C (int) cast
+
+        -----------------------------------------------------------------------
+        -- Transforms (implot_internal.h)
+        -----------------------------------------------------------------------
+        function internal.TransformForward_Log10(v, _)
+            if v <= 0.0 then v = DBL_MIN end
+            return math.log10(v)
+        end
+        function internal.TransformInverse_Log10(v, _)
+            return 10 ^ v
+        end
+        -- [Port] Luau has no asinh/sinh builtin for asinh; asinh(x) = log(x + sqrt(x*x+1)) (sign-symmetric to stay accurate for x < 0)
+        local function ImAsinh(x)
+            local a = math.abs(x)
+            return ImSign(x) * math.log(a + math.sqrt(a * a + 1))
+        end
+        function internal.TransformForward_SymLog(v, _)
+            return 2.0 * ImAsinh(v / 2.0)
+        end
+        function internal.TransformInverse_SymLog(v, _)
+            return 2.0 * math.sinh(v / 2.0)
+        end
+        local TransformForward_SymLog = internal.TransformForward_SymLog
+
+        -----------------------------------------------------------------------
+        -- Log locators
+        -----------------------------------------------------------------------
+        -- [Port] returns ok, exp_min, exp_max, exp_step instead of out-params
+        function internal.CalcLogarithmicExponents(range, pix, vertical)
+            if range.Min * range.Max > 0 then
+                local nMajor
+                if vertical then
+                    nMajor = math.max(2, math.floor(pix * 0.02 + 0.5))
+                else
+                    nMajor = math.max(2, math.floor(pix * 0.01 + 0.5)) -- TODO: magic numbers
+                end
+                local log_min = math.log10(math.abs(range.Min))
+                local log_max = math.log10(math.abs(range.Max))
+                local log_a = math.min(log_min, log_max)
+                local log_b = math.max(log_min, log_max)
+                local exp_step = math.max(1, Trunc(Trunc(log_b - log_a) / nMajor))
+                local exp_min = Trunc(log_a)
+                local exp_max = Trunc(log_b)
+                if exp_step ~= 1 then
+                    while exp_step % 3 ~= 0 do exp_step += 1 end -- make step size multiple of three
+                    while math.fmod(exp_min, exp_step) ~= 0 do exp_min -= 1 end -- decrease exp_min until exp_min + N * exp_step will be 0
+                end
+                return true, exp_min, exp_max, exp_step
+            end
+            return false, 0, 0, 1
+        end
+        local CalcLogarithmicExponents = internal.CalcLogarithmicExponents
+
+        function internal.AddTicksLogarithmic(range, exp_min, exp_max, exp_step, ticker, formatter, data)
+            local sign = ImSign(range.Max)
+            local e = exp_min - exp_step
+            while e < exp_max + exp_step do
+                local major1 = sign * 10 ^ e
+                if major1 >= range.Min - DBL_EPSILON and major1 <= range.Max + DBL_EPSILON then
+                    ticker:AddTick(major1, true, 0, true, formatter, data)
+                end
+                for j = 0, exp_step - 1 do
+                    major1 = sign * 10 ^ (e + j)
+                    local major2 = sign * 10 ^ (e + j + 1)
+                    local interval = (major2 - major1) / 9
+                    local n = 9
+                    if j < exp_step - 1 then n = 10 end
+                    for i = 1, n - 1 do
+                        local minor = major1 + i * interval
+                        if minor >= range.Min - DBL_EPSILON and minor <= range.Max + DBL_EPSILON then
+                            ticker:AddTick(minor, false, 0, false, formatter, data)
+                        end
+                    end
+                end
+                e += exp_step
+            end
+        end
+        local AddTicksLogarithmic = internal.AddTicksLogarithmic
+
+        function internal.Locator_Log10(ticker, range, pixels, vertical, formatter, formatter_data)
+            local ok, exp_min, exp_max, exp_step = CalcLogarithmicExponents(range, pixels, vertical)
+            if ok then
+                AddTicksLogarithmic(range, exp_min, exp_max, exp_step, ticker, formatter, formatter_data)
+            end
+        end
+
+        local function CalcSymLogPixel(plt, range, pixels)
+            local scaleToPixels = pixels / range:Size()
+            local scaleMin      = TransformForward_SymLog(range.Min, nil)
+            local scaleMax      = TransformForward_SymLog(range.Max, nil)
+            local s             = TransformForward_SymLog(plt, nil)
+            local t             = (s - scaleMin) / (scaleMax - scaleMin)
+            plt                 = range.Min + range:Size() * t
+            return 0 + scaleToPixels * (plt - range.Min)
+        end
+
+        function internal.Locator_SymLog(ticker, range, pixels, vertical, formatter, formatter_data)
+            if range.Min >= -1 and range.Max <= 1 then
+                Locator_Default(ticker, range, pixels, vertical, formatter, formatter_data)
+            elseif range.Min * range.Max < 0 then -- cross zero
+                local pix_min = 0
+                local pix_max = pixels
+                local pix_p1  = CalcSymLogPixel(1, range, pixels)
+                local pix_n1  = CalcSymLogPixel(-1, range, pixels)
+                local rp = ImPlot.ImPlotRange(1, range.Max)
+                local rn = ImPlot.ImPlotRange(range.Min, -1)
+                local _, exp_min_p, exp_max_p, exp_step_p = CalcLogarithmicExponents(rp, math.abs(pix_max - pix_p1), vertical)
+                local _, exp_min_n, exp_max_n, exp_step_n = CalcLogarithmicExponents(rn, math.abs(pix_n1 - pix_min), vertical)
+                local exp_step = math.max(exp_step_n, exp_step_p)
+                ticker:AddTick(0, true, 0, true, formatter, formatter_data)
+                AddTicksLogarithmic(rp, exp_min_p, exp_max_p, exp_step, ticker, formatter, formatter_data)
+                AddTicksLogarithmic(rn, exp_min_n, exp_max_n, exp_step, ticker, formatter, formatter_data)
+            else
+                internal.Locator_Log10(ticker, range, pixels, vertical, formatter, formatter_data)
+            end
+        end
+
+        -- [Port] labels is a 1-based array of strings (or nil); values is a 1-based array
+        function internal.AddTicksCustom(values, labels, n, ticker, formatter, data)
+            for i = 1, n do
+                if labels ~= nil then
+                    ticker:AddTick(values[i], false, 0, true, labels[i])
+                else
+                    ticker:AddTick(values[i], false, 0, true, formatter, data)
+                end
+            end
+        end
+
+        -----------------------------------------------------------------------
+        -- Time Ticks and Utils
+        -----------------------------------------------------------------------
+        internal.IMPLOT_MIN_TIME = 0
+        internal.IMPLOT_MAX_TIME = 32503680000
+        local IMPLOT_MAX_TIME = internal.IMPLOT_MAX_TIME
+
+        local ImPlotTimeUnit = {
+            Us = 0,  -- microsecond
+            Ms = 1,  -- millisecond
+            S = 2,   -- second
+            Min = 3, -- minute
+            Hr = 4,  -- hour
+            Day = 5, -- day
+            Mo = 6,  -- month
+            Yr = 7,  -- year
+            COUNT = 8,
+        }
+        internal.ImPlotTimeUnit = ImPlotTimeUnit
+        local ImPlotDateFmt = {  -- default        [ ISO 8601     ]
+            None = 0,
+            DayMo = 1,           -- 10/3           [ --10-03      ]
+            DayMoYr = 2,         -- 10/3/91        [ 1991-10-03   ]
+            MoYr = 3,            -- Oct 1991       [ 1991-10      ]
+            Mo = 4,              -- Oct            [ --10         ]
+            Yr = 5,              -- 1991           [ 1991         ]
+        }
+        internal.ImPlotDateFmt = ImPlotDateFmt
+        local ImPlotTimeFmt = {  -- default        [ 24 Hour Clock ]
+            None = 0,
+            Us = 1,              -- .428 552       [ .428 552     ]
+            SUs = 2,             -- :29.428 552    [ :29.428 552  ]
+            SMs = 3,             -- :29.428        [ :29.428      ]
+            S = 4,               -- :29            [ :29          ]
+            MinSMs = 5,          -- 21:29.428      [ 21:29.428    ]
+            HrMinSMs = 6,        -- 7:21:29.428pm  [ 19:21:29.428 ]
+            HrMinS = 7,          -- 7:21:29pm      [ 19:21:29     ]
+            HrMin = 8,           -- 7:21pm         [ 19:21        ]
+            Hr = 9,              -- 7pm            [ 19:00        ]
+        }
+        internal.ImPlotTimeFmt = ImPlotTimeFmt
+
+        function internal.ImPlotDateTimeSpec(date_fmt, time_fmt, use_24_hr_clk, use_iso_8601)
+            return { Date = date_fmt, Time = time_fmt, UseISO8601 = use_iso_8601 or false, Use24HourClock = use_24_hr_clk or false }
+        end
+        local ImPlotDateTimeSpec = internal.ImPlotDateTimeSpec
+
+        -- Two part timestamp struct.
+        local TimeMT = {}
+        TimeMT.__index = TimeMT
+        -- [Port] C integer division/modulo truncate toward zero
+        local function ImPlotTime(s, us)
+            s = s or 0; us = us or 0
+            return setmetatable({ S = s + Trunc(us / 1000000), Us = math.fmod(us, 1000000) }, TimeMT)
+        end
+        internal.ImPlotTime = ImPlotTime
+        function TimeMT:RollOver() self.S = self.S + Trunc(self.Us / 1000000); self.Us = math.fmod(self.Us, 1000000) end
+        function TimeMT:ToDouble() return self.S + self.Us / 1000000.0 end
+        function internal.ImPlotTimeFromDouble(t)
+            return ImPlotTime(Trunc(t), Trunc(t * 1000000 - math.floor(t) * 1000000))
+        end
+        local FromDouble = internal.ImPlotTimeFromDouble
+        TimeMT.__add = function(l, r) return ImPlotTime(l.S + r.S, l.Us + r.Us) end
+        TimeMT.__sub = function(l, r) return ImPlotTime(l.S - r.S, l.Us - r.Us) end
+        TimeMT.__eq = function(l, r) return l.S == r.S and l.Us == r.Us end
+        TimeMT.__lt = function(l, r)
+            if l.S == r.S then return l.Us < r.Us end
+            return l.S < r.S
+        end
+        TimeMT.__le = function(l, r) return not (r < l) end
+
+        local function IsLeapYear(year)
+            return (year % 4 == 0 and year % 100 ~= 0) or year % 400 == 0
+        end
+        local DAYS_IN_MONTH = { [0] = 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+        local function GetDaysInMonth(year, month)
+            local d = DAYS_IN_MONTH[month]
+            if month == 1 and IsLeapYear(year) then d += 1 end
+            return d
+        end
+        internal.IsLeapYear = IsLeapYear
+        internal.GetDaysInMonth = GetDaysInMonth
+
+        -- [Port] tm structs are tables with C field names (tm_year since 1900, tm_mon 0-11, tm_mday, tm_hour, tm_min, tm_sec).
+        -- MkGmtTime implements timegm with days-from-civil arithmetic (os.time(table) semantics differ across Lua hosts).
+        local function DaysFromCivil(y, m, d) -- m 1-12
+            if m <= 2 then y -= 1 end
+            local era = math.floor(y / 400)
+            local yoe = y - era * 400
+            local mp = (m + 9) % 12
+            local doy = math.floor((153 * mp + 2) / 5) + d - 1
+            local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+            return era * 146097 + doe - 719468
+        end
+        local function TimeGm(ptm)
+            local mon = ptm.tm_mon
+            local year = ptm.tm_year + 1900 + math.floor(mon / 12)
+            mon = mon % 12
+            return DaysFromCivil(year, mon + 1, 1) * 86400 + (ptm.tm_mday - 1) * 86400
+                + ptm.tm_hour * 3600 + ptm.tm_min * 60 + ptm.tm_sec
+        end
+        local function FromOsDate(d, ptm)
+            ptm.tm_year = d.year - 1900; ptm.tm_mon = d.month - 1; ptm.tm_mday = d.day
+            ptm.tm_hour = d.hour; ptm.tm_min = d.min; ptm.tm_sec = d.sec
+            ptm.tm_wday = d.wday - 1; ptm.tm_yday = d.yday - 1
+            return ptm
+        end
+
+        function internal.MkGmtTime(ptm)
+            local t = ImPlotTime(TimeGm(ptm), 0)
+            if t.S < 0 then t.S = 0 end
+            return t
+        end
+        -- [Port] gmtime via civil-from-days arithmetic (equivalent to os.date('!*t'), but works on hosts without os.date)
+        function internal.GetGmtTime(t, ptm)
+            local s = t.S
+            local z = math.floor(s / 86400)
+            local secs = s - z * 86400
+            ptm.tm_wday = (z + 4) % 7
+            z += 719468
+            local era = math.floor(z / 146097)
+            local doe = z - era * 146097
+            local yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
+            local doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
+            local mp = math.floor((5 * doy + 2) / 153)
+            local d = doy - math.floor((153 * mp + 2) / 5) + 1
+            local m = mp + 3
+            if m > 12 then m -= 12 end
+            local y = yoe + era * 400
+            if m <= 2 then y += 1 end
+            ptm.tm_year = y - 1900; ptm.tm_mon = m - 1; ptm.tm_mday = d
+            ptm.tm_hour = math.floor(secs / 3600); ptm.tm_min = math.floor(secs / 60) % 60; ptm.tm_sec = secs % 60
+            ptm.tm_yday = DaysFromCivil(y, m, d) - DaysFromCivil(y, 1, 1)
+            return ptm
+        end
+        -- [Port] local time: offset of local clock from UTC at that instant, from os.date('*t') vs os.date('!*t')
+        local function LocalOffset(s)
+            local tmp = {}
+            return TimeGm(FromOsDate(os.date("*t", s), tmp)) - TimeGm(FromOsDate(os.date("!*t", s), tmp))
+        end
+        function internal.MkLocTime(ptm)
+            local s = TimeGm(ptm)
+            local t = ImPlotTime(s - LocalOffset(s), 0)
+            if t.S < 0 then t.S = 0 end
+            return t
+        end
+        function internal.GetLocTime(t, ptm)
+            local d = os.date("*t", t.S)
+            if d == nil then return nil end
+            return FromOsDate(d, ptm)
+        end
+        local function MkTime(ptm)
+            if ImPlot.GetStyle().UseLocalTime then return internal.MkLocTime(ptm) end
+            return internal.MkGmtTime(ptm)
+        end
+        local function GetTime(t, ptm)
+            if ImPlot.GetStyle().UseLocalTime then return internal.GetLocTime(t, ptm) end
+            return internal.GetGmtTime(t, ptm)
+        end
+        internal.MkTime = MkTime
+        internal.GetTime = GetTime
+
+        -- [Port] GImPlot->Tm is a module-level scratch table
+        local Tm = { tm_year = 70, tm_mon = 0, tm_mday = 1, tm_hour = 0, tm_min = 0, tm_sec = 0, tm_wday = 0, tm_yday = 0 }
+
+        -- Make a timestamp from time components.
+        -- year[1970-3000], month[0-11], day[1-31], hour[0-23], min[0-59], sec[0-59], us[0,999999]
+        function internal.MakeTime(year, month, day, hour, min, sec, us)
+            month = month or 0; day = day or 1; hour = hour or 0; min = min or 0; sec = sec or 0; us = us or 0
+            local yr = year - 1900
+            if yr < 0 then yr = 0 end
+            sec = sec + Trunc(us / 1000000)
+            us  = math.fmod(us, 1000000)
+            Tm.tm_sec  = sec
+            Tm.tm_min  = min
+            Tm.tm_hour = hour
+            Tm.tm_mday = day
+            Tm.tm_mon  = month
+            Tm.tm_year = yr
+            local t = MkTime(Tm)
+            t.Us = us
+            return t
+        end
+        local MakeTime = internal.MakeTime
+
+        function internal.GetYear(t)
+            GetTime(t, Tm)
+            return Tm.tm_year + 1900
+        end
+        function internal.GetMonth(t)
+            GetTime(t, Tm)
+            return Tm.tm_mon
+        end
+        local GetYear = internal.GetYear
+
+        -- Adds or subtracts time from a timestamp. #count > 0 to add, < 0 to subtract.
+        function internal.AddTime(t, unit, count)
+            local t_out = ImPlotTime(t.S, t.Us)
+            if unit == ImPlotTimeUnit.Us then
+                t_out.Us += count
+            elseif unit == ImPlotTimeUnit.Ms then
+                t_out.Us += count * 1000
+            elseif unit == ImPlotTimeUnit.S then
+                t_out.S += count
+            elseif unit == ImPlotTimeUnit.Min then
+                t_out.S += count * 60
+            elseif unit == ImPlotTimeUnit.Hr then
+                t_out.S += count * 3600
+            elseif unit == ImPlotTimeUnit.Day then
+                t_out.S += count * 86400
+            elseif unit == ImPlotTimeUnit.Mo then
+                for _ = 1, math.abs(count) do
+                    GetTime(t_out, Tm)
+                    if count > 0 then
+                        t_out.S += 86400 * GetDaysInMonth(Tm.tm_year + 1900, Tm.tm_mon)
+                    elseif count < 0 then
+                        local y, m = Tm.tm_year + 1900, Tm.tm_mon - 1
+                        if Tm.tm_mon == 0 then y -= 1; m = 11 end
+                        t_out.S -= 86400 * GetDaysInMonth(y, m) -- NOT WORKING
+                    end
+                end
+            elseif unit == ImPlotTimeUnit.Yr then
+                for _ = 1, math.abs(count) do
+                    if count > 0 then
+                        t_out.S += 86400 * (365 + ((IsLeapYear(GetYear(t_out)) and 1) or 0))
+                    elseif count < 0 then
+                        t_out.S -= 86400 * (365 + ((IsLeapYear(GetYear(t_out) - 1) and 1) or 0))
+                    end
+                    -- this is incorrect if leap year and we are past Feb 28
+                end
+            end
+            t_out:RollOver()
+            return t_out
+        end
+        local AddTime = internal.AddTime
+
+        -- Rounds a timestamp down to nearest unit.
+        function internal.FloorTime(t, unit)
+            GetTime(t, Tm)
+            if unit == ImPlotTimeUnit.S then return ImPlotTime(t.S, 0) end
+            if unit == ImPlotTimeUnit.Ms then return ImPlotTime(t.S, Trunc(t.Us / 1000) * 1000) end
+            if unit == ImPlotTimeUnit.Us or unit > ImPlotTimeUnit.Yr then return ImPlotTime(t.S, t.Us) end
+            -- [Port] switch fall-through
+            if unit >= ImPlotTimeUnit.Yr then Tm.tm_mon = 0 end
+            if unit >= ImPlotTimeUnit.Mo then Tm.tm_mday = 1 end
+            if unit >= ImPlotTimeUnit.Day then Tm.tm_hour = 0 end
+            if unit >= ImPlotTimeUnit.Hr then Tm.tm_min = 0 end
+            Tm.tm_sec = 0
+            return MkTime(Tm)
+        end
+        local FloorTime = internal.FloorTime
+        -- Rounds a timestamp up to the nearest unit.
+        function internal.CeilTime(t, unit)
+            return AddTime(FloorTime(t, unit), unit, 1)
+        end
+        -- Rounds a timestamp up or down to the nearest unit.
+        function internal.RoundTime(t, unit)
+            local t1 = FloorTime(t, unit)
+            local t2 = AddTime(t1, unit, 1)
+            if t1.S == t2.S then
+                if t.Us - t1.Us < t2.Us - t.Us then return t1 end
+                return t2
+            end
+            if t.S - t1.S < t2.S - t.S then return t1 end
+            return t2
+        end
+        -- Combines the date of one timestamp with the time-of-day of another timestamp.
+        function internal.CombineDateTime(date_part, tod_part)
+            GetTime(date_part, Tm)
+            local y, m, d = Tm.tm_year, Tm.tm_mon, Tm.tm_mday
+            GetTime(tod_part, Tm)
+            Tm.tm_year = y
+            Tm.tm_mon  = m
+            Tm.tm_mday = d
+            local t = MkTime(Tm)
+            t.Us = tod_part.Us
+            return t
+        end
+        function internal.Now() return FromDouble(os.time()) end
+        function internal.Today() return FloorTime(internal.Now(), ImPlotTimeUnit.Day) end
+
+        -- TODO: allow users to define these
+        internal.MONTH_NAMES = { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" }
+        internal.WD_ABRVS    = { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" }
+        local MONTH_ABRVS    = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+        internal.MONTH_ABRVS = MONTH_ABRVS
+
+        -- [Port] Format* return the string instead of writing to a buffer ("" for None)
+        local sf = string.format
+        function internal.FormatTime(t, fmt, use_24_hr_clk)
+            GetTime(t, Tm)
+            local us  = math.fmod(t.Us, 1000)
+            local ms  = Trunc(t.Us / 1000)
+            local sec = Tm.tm_sec
+            local min = Tm.tm_min
+            local F = ImPlotTimeFmt
+            if fmt == F.Us then return sf(".%03d %03d", ms, us) end
+            if fmt == F.SUs then return sf(":%02d.%03d %03d", sec, ms, us) end
+            if fmt == F.SMs then return sf(":%02d.%03d", sec, ms) end
+            if fmt == F.S then return sf(":%02d", sec) end
+            if fmt == F.MinSMs then return sf(":%02d:%02d.%03d", min, sec, ms) end
+            if use_24_hr_clk then
+                local hr = Tm.tm_hour
+                if fmt == F.HrMinSMs then return sf("%02d:%02d:%02d.%03d", hr, min, sec, ms) end
+                if fmt == F.HrMinS then return sf("%02d:%02d:%02d", hr, min, sec) end
+                if fmt == F.HrMin then return sf("%02d:%02d", hr, min) end
+                if fmt == F.Hr then return sf("%02d:00", hr) end
+            else
+                local ap = "pm"
+                if Tm.tm_hour < 12 then ap = "am" end
+                local hr = Tm.tm_hour % 12
+                if Tm.tm_hour == 0 or Tm.tm_hour == 12 then hr = 12 end
+                if fmt == F.HrMinSMs then return sf("%d:%02d:%02d.%03d%s", hr, min, sec, ms, ap) end
+                if fmt == F.HrMinS then return sf("%d:%02d:%02d%s", hr, min, sec, ap) end
+                if fmt == F.HrMin then return sf("%d:%02d%s", hr, min, ap) end
+                if fmt == F.Hr then return sf("%d%s", hr, ap) end
+            end
+            return ""
+        end
+        local FormatTime = internal.FormatTime
+
+        function internal.FormatDate(t, fmt, use_iso_8601)
+            GetTime(t, Tm)
+            local day  = Tm.tm_mday
+            local mon  = Tm.tm_mon + 1
+            local year = Tm.tm_year + 1900
+            local yr   = year % 100
+            local F = ImPlotDateFmt
+            if use_iso_8601 then
+                if fmt == F.DayMo then return sf("--%02d-%02d", mon, day) end
+                if fmt == F.DayMoYr then return sf("%d-%02d-%02d", year, mon, day) end
+                if fmt == F.MoYr then return sf("%d-%02d", year, mon) end
+                if fmt == F.Mo then return sf("--%02d", mon) end
+                if fmt == F.Yr then return sf("%d", year) end
+            else
+                if fmt == F.DayMo then return sf("%d/%d", mon, day) end
+                if fmt == F.DayMoYr then return sf("%d/%d/%02d", mon, day, yr) end
+                if fmt == F.MoYr then return sf("%s %d", MONTH_ABRVS[Tm.tm_mon + 1], year) end
+                if fmt == F.Mo then return MONTH_ABRVS[Tm.tm_mon + 1] end
+                if fmt == F.Yr then return sf("%d", year) end
+            end
+            return ""
+        end
+        local FormatDate = internal.FormatDate
+
+        function internal.FormatDateTime(t, fmt)
+            local out = ""
+            if fmt.Date ~= ImPlotDateFmt.None then
+                out = FormatDate(t, fmt.Date, fmt.UseISO8601)
+            end
+            if fmt.Time ~= ImPlotTimeFmt.None then
+                if fmt.Date ~= ImPlotDateFmt.None then
+                    out ..= " "
+                end
+                out ..= FormatTime(t, fmt.Time, fmt.Use24HourClock)
+            end
+            return out
+        end
+        local FormatDateTime = internal.FormatDateTime
+
+        local t_max_width = nil
+        local function GetDateTimeWidth(fmt)
+            if t_max_width == nil then
+                t_max_width = MakeTime(2888, 12, 22, 12, 58, 58, 888888) -- best guess at time that maximizes pixel width
+            end
+            return ImGui.CalcTextSize(FormatDateTime(t_max_width, fmt)).x
+        end
+
+        local function TimeLabelSame(l1, l2)
+            local n = math.min(#l1, #l2)
+            return string.sub(l1, #l1 - n + 1) == string.sub(l2, #l2 - n + 1)
+        end
+
+        local D, T = ImPlotDateFmt, ImPlotTimeFmt
+        -- [Port] spec tables are indexed by ImPlotTimeUnit (0-based)
+        local TimeFormatLevel0 = {
+            [0] = ImPlotDateTimeSpec(D.None, T.Us),
+            ImPlotDateTimeSpec(D.None, T.SMs),
+            ImPlotDateTimeSpec(D.None, T.S),
+            ImPlotDateTimeSpec(D.None, T.HrMin),
+            ImPlotDateTimeSpec(D.None, T.Hr),
+            ImPlotDateTimeSpec(D.DayMo, T.None),
+            ImPlotDateTimeSpec(D.Mo, T.None),
+            ImPlotDateTimeSpec(D.Yr, T.None),
+        }
+        local TimeFormatLevel1 = {
+            [0] = ImPlotDateTimeSpec(D.None, T.HrMin),
+            ImPlotDateTimeSpec(D.None, T.HrMinS),
+            ImPlotDateTimeSpec(D.None, T.HrMin),
+            ImPlotDateTimeSpec(D.None, T.HrMin),
+            ImPlotDateTimeSpec(D.DayMoYr, T.None),
+            ImPlotDateTimeSpec(D.DayMoYr, T.None),
+            ImPlotDateTimeSpec(D.Yr, T.None),
+            ImPlotDateTimeSpec(D.Yr, T.None),
+        }
+        local TimeFormatLevel1First = {
+            [0] = ImPlotDateTimeSpec(D.DayMoYr, T.HrMinS),
+            ImPlotDateTimeSpec(D.DayMoYr, T.HrMinS),
+            ImPlotDateTimeSpec(D.DayMoYr, T.HrMin),
+            ImPlotDateTimeSpec(D.DayMoYr, T.HrMin),
+            ImPlotDateTimeSpec(D.DayMoYr, T.None),
+            ImPlotDateTimeSpec(D.DayMoYr, T.None),
+            ImPlotDateTimeSpec(D.Yr, T.None),
+            ImPlotDateTimeSpec(D.Yr, T.None),
+        }
+        internal.TimeFormatMouseCursor = {
+            [0] = ImPlotDateTimeSpec(D.None, T.Us),
+            ImPlotDateTimeSpec(D.None, T.SUs),
+            ImPlotDateTimeSpec(D.None, T.SMs),
+            ImPlotDateTimeSpec(D.None, T.HrMinS),
+            ImPlotDateTimeSpec(D.None, T.HrMin),
+            ImPlotDateTimeSpec(D.DayMo, T.Hr),
+            ImPlotDateTimeSpec(D.DayMoYr, T.None),
+            ImPlotDateTimeSpec(D.MoYr, T.None),
+        }
+
+        local function GetDateTimeFmt(ctx, idx)
+            local style = ImPlot.GetStyle()
+            local src = ctx[idx]
+            return ImPlotDateTimeSpec(src.Date, src.Time, style.Use24HourClock, style.UseISO8601)
+        end
+        internal.GetDateTimeFmt = GetDateTimeFmt
+
+        -- this may not be thread safe?
+        local TimeUnitSpans = { [0] = 0.000001, 0.001, 1, 60, 3600, 86400, 2629800, 31557600 }
+        local TimeUnitCutoffs = { [0] = 0.001, 1, 60, 3600, 86400, 2629800, 31557600, IMPLOT_MAX_TIME }
+        local function GetUnitForRange(range)
+            for i = 0, ImPlotTimeUnit.COUNT - 1 do
+                if range <= TimeUnitCutoffs[i] then
+                    return i
+                end
+            end
+            return ImPlotTimeUnit.Yr
+        end
+        internal.GetUnitForRange = GetUnitForRange
+
+        local function LowerBoundStep(max_divs, divs, step)
+            if max_divs < divs[1] then
+                return 0
+            end
+            for i = 2, #divs do
+                if max_divs < divs[i] then
+                    return step[i - 1]
+                end
+            end
+            return step[#step]
+        end
+        local function GetTimeStep(max_divs, unit)
+            if unit == ImPlotTimeUnit.Ms or unit == ImPlotTimeUnit.Us then
+                return LowerBoundStep(max_divs, { 2, 4, 5, 10, 20, 40, 50, 100, 200, 500, 1000 }, { 500, 250, 200, 100, 50, 25, 20, 10, 5, 2, 1 })
+            end
+            if unit == ImPlotTimeUnit.S or unit == ImPlotTimeUnit.Min then
+                return LowerBoundStep(max_divs, { 2, 4, 6, 12, 60 }, { 30, 15, 10, 5, 1 })
+            elseif unit == ImPlotTimeUnit.Hr then
+                return LowerBoundStep(max_divs, { 2, 4, 8, 12, 24 }, { 12, 6, 3, 2, 1 })
+            elseif unit == ImPlotTimeUnit.Day then
+                return LowerBoundStep(max_divs, { 2, 4, 14, 28 }, { 14, 7, 2, 1 })
+            elseif unit == ImPlotTimeUnit.Mo then
+                return LowerBoundStep(max_divs, { 2, 4, 6, 12 }, { 6, 3, 2, 1 })
+            end
+            return 0
+        end
+
+        -- [Port] Formatter_Time_Data is a table { Time, Spec, UserFormatter, UserFormatterData }
+        function internal.Formatter_Time(_, ftd)
+            return FormatDateTime(ftd.Time, ftd.Spec)
+        end
+        local Formatter_Time = internal.Formatter_Time
+
+        function internal.Locator_Time(ticker, range, pixels, vertical, formatter, formatter_data)
+            IM_ASSERT(vertical == false, "Cannot locate Time ticks on vertical axis!")
+            -- get units for level 0 and level 1 labels
+            local unit0 = GetUnitForRange(range:Size() / (pixels / 100)) -- level = 0 (top)
+            local unit1 = math.clamp(unit0 + 1, 0, ImPlotTimeUnit.COUNT - 1) -- level = 1 (bottom)
+            -- get time format specs
+            local fmt0 = GetDateTimeFmt(TimeFormatLevel0, unit0)
+            local fmt1 = GetDateTimeFmt(TimeFormatLevel1, unit1)
+            local fmtf = GetDateTimeFmt(TimeFormatLevel1First, unit1)
+            -- min max times
+            local t_min = FromDouble(range.Min)
+            local t_max = FromDouble(range.Max)
+            -- maximum allowable density of labels
+            local max_density = 0.5
+            -- book keeping
+            local last_major = nil -- [Port] label string instead of last_major_offset
+            -- formatter data
+            local ftd = { Time = nil, Spec = nil, UserFormatter = formatter, UserFormatterData = formatter_data }
+            if unit0 ~= ImPlotTimeUnit.Yr then
+                -- pixels per major (level 1) division
+                local pix_per_major_div = pixels / (range:Size() / TimeUnitSpans[unit1])
+                -- nominal pixels taken up by labels
+                local fmt0_width = GetDateTimeWidth(fmt0)
+                local fmt1_width = GetDateTimeWidth(fmt1)
+                local fmtf_width = GetDateTimeWidth(fmtf)
+                -- the maximum number of minor (level 0) labels that can fit between major (level 1) divisions
+                local minor_per_major = Trunc(max_density * pix_per_major_div / fmt0_width)
+                -- the minor step size (level 0)
+                local step = GetTimeStep(minor_per_major, unit0)
+                -- generate ticks
+                local t1 = FloorTime(FromDouble(range.Min), unit1)
+                while t1 < t_max do
+                    -- get next major
+                    local t2 = AddTime(t1, unit1, 1)
+                    -- add major tick
+                    if t1 >= t_min and t1 <= t_max then
+                        -- minor level 0 tick
+                        ftd.Time = t1; ftd.Spec = fmt0
+                        ticker:AddTick(t1:ToDouble(), true, 0, true, Formatter_Time, ftd)
+                        -- major level 1 tick
+                        ftd.Time = t1
+                        if last_major == nil then ftd.Spec = fmtf else ftd.Spec = fmt1 end
+                        local tick_maj = ticker:AddTick(t1:ToDouble(), true, 1, true, Formatter_Time, ftd)
+                        local this_major = tick_maj.Text
+                        if last_major ~= nil and TimeLabelSame(last_major, this_major) then
+                            tick_maj.ShowLabel = false
+                        end
+                        last_major = this_major
+                    end
+                    -- add minor ticks up until next major
+                    if minor_per_major > 1 and (t_min <= t2 and t1 <= t_max) then
+                        local t12 = AddTime(t1, unit0, step)
+                        while t12 < t2 do
+                            local px_to_t2 = ((t2 - t12):ToDouble() / range:Size()) * pixels
+                            if t12 >= t_min and t12 <= t_max then
+                                ftd.Time = t12; ftd.Spec = fmt0
+                                ticker:AddTick(t12:ToDouble(), false, 0, px_to_t2 >= fmt0_width, Formatter_Time, ftd)
+                                if last_major == nil and px_to_t2 >= fmt0_width and px_to_t2 >= (fmt1_width + fmtf_width) / 2 then
+                                    ftd.Time = t12; ftd.Spec = fmtf
+                                    local tick_maj = ticker:AddTick(t12:ToDouble(), true, 1, true, Formatter_Time, ftd)
+                                    last_major = tick_maj.Text
+                                end
+                            end
+                            t12 = AddTime(t12, unit0, step)
+                        end
+                    end
+                    t1 = t2
+                end
+            else
+                local fmty        = GetDateTimeFmt(TimeFormatLevel0, ImPlotTimeUnit.Yr)
+                local label_width = GetDateTimeWidth(fmty)
+                local max_labels  = Trunc(max_density * pixels / label_width)
+                local year_min    = GetYear(t_min)
+                local year_max    = GetYear(internal.CeilTime(t_max, ImPlotTimeUnit.Yr))
+                local nice_range  = internal.NiceNum((year_max - year_min) * 0.99, false)
+                local interval    = internal.NiceNum(nice_range / (max_labels - 1), true)
+                local graphmin    = Trunc(math.floor(year_min / interval) * interval)
+                local graphmax    = Trunc(math.ceil(year_max / interval) * interval)
+                local step        = Trunc(interval)
+                if step <= 0 then step = 1 end
+                local y = graphmin
+                while y < graphmax do
+                    local t = MakeTime(y)
+                    if t >= t_min and t <= t_max then
+                        ftd.Time = t; ftd.Spec = fmty
+                        ticker:AddTick(t:ToDouble(), true, 0, true, Formatter_Time, ftd)
+                    end
+                    y += step
+                end
+            end
+        end
     end
 
     --------------------------------------------------------------------------
@@ -2575,12 +3267,18 @@ return function(G)
             axis.RangeCond = cond
         end
 
-        -- [Port] only the format-string overload; TODO: SetupAxisFormat(idx, formatter, data)
-        function ImPlot.SetupAxisFormat(idx, fmt)
+        -- [Port] SetupAxisFormat(idx, fmt) and SetupAxisFormat(idx, formatter, data) overloads:
+        -- `fmt_or_formatter` is a format string or a formatter function(value, data) -> string
+        function ImPlot.SetupAxisFormat(idx, fmt, data)
             CheckSetup()
             local plot = GImPlot.CurrentPlot
             local axis = plot.Axes[idx]
             IM_ASSERT(axis.Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            if type(fmt) == "function" then
+                axis.Formatter = fmt
+                axis.FormatterData = data
+                return
+            end
             axis.HasFormatSpec = fmt ~= nil
             if fmt ~= nil then
                 axis.FormatSpec = fmt
@@ -2598,7 +3296,100 @@ return function(G)
             axis:PullLinks()
         end
 
-        -- [Port] TODO: SetupAxisTicks, SetupAxisScale, SetupAxisLimitsConstraints, SetupAxisZoomConstraints, SetupMouseText
+        -- [Port] SetupAxisTicks(idx, values, n_ticks, labels, show_default) and
+        -- SetupAxisTicks(idx, v_min, v_max, n_ticks, labels, show_default) overloads (values/labels are 1-based arrays)
+        function ImPlot.SetupAxisTicks(idx, a, b, c, d, e)
+            if type(a) == "number" then
+                local v_min, v_max, n_ticks, labels, show_default = a, b, c, d, e
+                IM_ASSERT(labels == nil or n_ticks >= 2, "When providing custom labels, n_ticks must be at least 2!")
+                if n_ticks < 2 then n_ticks = 2 end
+                local values = table.create(n_ticks)
+                local step = (v_max - v_min) / (n_ticks - 1)
+                for i = 1, n_ticks do
+                    values[i] = v_min + (i - 1) * step
+                end
+                return ImPlot.SetupAxisTicks(idx, values, n_ticks, labels, show_default)
+            end
+            local values, labels, show_default = a, c, d
+            local n_ticks = b or #values
+            CheckSetup()
+            local plot = GImPlot.CurrentPlot
+            local axis = plot.Axes[idx]
+            IM_ASSERT(axis.Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            axis.ShowDefaultTicks = show_default or false
+            local formatter = axis.Formatter or internal.Formatter_Default
+            local data
+            if axis.Formatter ~= nil and axis.FormatterData ~= nil then
+                data = axis.FormatterData
+            elseif axis.HasFormatSpec then
+                data = axis.FormatSpec
+            else
+                data = internal.IMPLOT_LABEL_FORMAT
+            end
+            internal.AddTicksCustom(values, labels, n_ticks, axis.Ticker, formatter, data)
+        end
+
+        -- [Port] SetupAxisScale(idx, scale) and SetupAxisScale(idx, fwd, inv, data) overloads
+        function ImPlot.SetupAxisScale(idx, scale, inv, data)
+            CheckSetup()
+            local plot = GImPlot.CurrentPlot
+            local axis = plot.Axes[idx]
+            IM_ASSERT(axis.Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            if type(scale) == "function" then
+                axis.Scale = IMPLOT_AUTO
+                axis.TransformForward = scale
+                axis.TransformInverse = inv
+                axis.TransformData = data
+                return
+            end
+            axis.Scale = scale
+            if scale == ImPlotScale.Time then
+                axis.TransformForward = nil
+                axis.TransformInverse = nil
+                axis.TransformData    = nil
+                axis.Locator          = internal.Locator_Time
+                axis.ConstraintRange  = ImPlot.ImPlotRange(internal.IMPLOT_MIN_TIME, internal.IMPLOT_MAX_TIME)
+                axis.Ticker.Levels    = 2
+            elseif scale == ImPlotScale.Log10 then
+                axis.TransformForward = internal.TransformForward_Log10
+                axis.TransformInverse = internal.TransformInverse_Log10
+                axis.TransformData    = nil
+                axis.Locator          = internal.Locator_Log10
+                axis.ConstraintRange  = ImPlot.ImPlotRange(2.2250738585072014e-308, math.huge)
+            elseif scale == ImPlotScale.SymLog then
+                axis.TransformForward = internal.TransformForward_SymLog
+                axis.TransformInverse = internal.TransformInverse_SymLog
+                axis.TransformData    = nil
+                axis.Locator          = internal.Locator_SymLog
+                axis.ConstraintRange  = ImPlot.ImPlotRange(-math.huge, math.huge)
+            else
+                axis.TransformForward = nil
+                axis.TransformInverse = nil
+                axis.TransformData    = nil
+                axis.Locator          = nil
+                axis.ConstraintRange  = ImPlot.ImPlotRange(-math.huge, math.huge)
+            end
+        end
+
+        function ImPlot.SetupAxisLimitsConstraints(idx, v_min, v_max)
+            CheckSetup()
+            local plot = GImPlot.CurrentPlot
+            local axis = plot.Axes[idx]
+            IM_ASSERT(axis.Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            axis.ConstraintRange.Min = v_min
+            axis.ConstraintRange.Max = v_max
+        end
+
+        function ImPlot.SetupAxisZoomConstraints(idx, z_min, z_max)
+            CheckSetup()
+            local plot = GImPlot.CurrentPlot
+            local axis = plot.Axes[idx]
+            IM_ASSERT(axis.Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            axis.ConstraintZoom.Min = z_min
+            axis.ConstraintZoom.Max = z_max
+        end
+
+        -- [Port] TODO: SetupMouseText
 
         function ImPlot.SetupAxes(x_label, y_label, x_flags, y_flags)
             ImPlot.SetupAxis(ImAxis.X1, x_label, x_flags)
