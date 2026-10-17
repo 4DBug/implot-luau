@@ -880,7 +880,9 @@ return function(G)
                 -- [Port] ImPlotAnnotationCollection / ImPlotTagCollection: plain arrays of records with the text stored inline
                 Annotations = {},
                 Tags = {},
-                -- [Port] TODO: Subplots (later milestones)
+                -- [Port] ctors resolved lazily (defined in the subplots section)
+                Subplots = G.ImPool(function() return internal.ImPlotSubplot() end),
+                AlignmentData = G.ImPool(function() return internal.ImPlotAlignmentData() end),
                 -- [Port] ctor resolved lazily (defined in the items section)
                 NextItemData = nil,
                 NextPlotData = internal.ImPlotNextPlotData(),
@@ -1004,7 +1006,7 @@ return function(G)
         }
 
         function internal.Initialize(ctx)
-            -- [Port] TODO: ResetCtxForNextPlot / ResetCtxForNextAlignedPlots / ResetCtxForNextSubplot (later milestone)
+            -- [Port] ResetCtxForNext* are no-ops on a freshly built context (all fields start nil/empty)
             for _, c in ipairs(cmaps) do
                 ctx.ColormapData:Append(c[1], c[3], #c[3], c[2])
             end
@@ -2460,6 +2462,17 @@ return function(G)
             ctx.PreviousItem = nil
         end
 
+        function internal.ResetCtxForNextAlignedPlots(ctx)
+            ctx.CurrentAlignmentH = nil
+            ctx.CurrentAlignmentV = nil
+        end
+
+        function internal.ResetCtxForNextSubplot(ctx)
+            ctx.CurrentSubplot    = nil
+            ctx.CurrentAlignmentH = nil
+            ctx.CurrentAlignmentV = nil
+        end
+
         function internal.GetPlot(title)
             local Window = ImGui.GetCurrentWindow()
             return GImPlot.Plots:GetByKey(Window:GetID(title))
@@ -2540,7 +2553,23 @@ return function(G)
             end
 
             if align then
-                -- [Port] TODO: ImPlotAlignmentData (aligned plots milestone)
+                count_T, count_B = 0, 0
+                local delta_T, delta_B
+                pad_T, pad_B, delta_T, delta_B = align:Update(pad_T, pad_B)
+                for i = IMPLOT_NUM_X_AXES - 1, 0, -1 do
+                    local axis = plot:XAxis(i)
+                    if axis.Enabled then
+                        if axis:IsOpposite() then
+                            axis.Datum1 += delta_T
+                            if count_T > 1 then axis.Datum2 += delta_T end
+                            count_T += 1
+                        else
+                            axis.Datum1 -= delta_B
+                            if count_B > 1 then axis.Datum2 -= delta_B end
+                            count_B += 1
+                        end
+                    end
+                end
             end
             return pad_T, pad_B
         end
@@ -2613,7 +2642,23 @@ return function(G)
             plot.PlotRect.Max.x = plot.CanvasRect.Max.x - pad_R
 
             if align then
-                -- [Port] TODO: ImPlotAlignmentData (aligned plots milestone)
+                count_L, count_R = 0, 0
+                local delta_L, delta_R
+                pad_L, pad_R, delta_L, delta_R = align:Update(pad_L, pad_R)
+                for i = IMPLOT_NUM_Y_AXES - 1, 0, -1 do
+                    local axis = plot:YAxis(i)
+                    if axis.Enabled then
+                        if axis:IsOpposite() then
+                            axis.Datum1 -= delta_R
+                            if count_R > 1 then axis.Datum2 -= delta_R end
+                            count_R += 1
+                        else
+                            axis.Datum1 += delta_L
+                            if count_L > 1 then axis.Datum2 += delta_L end
+                            count_L += 1
+                        end
+                    end
+                end
             end
             return pad_L, pad_R
         end
@@ -2760,7 +2805,26 @@ return function(G)
             ImGui.PopItemWidth()
         end
 
-        -- [Port] TODO: Subplots menu (subplots milestone)
+        function internal.ShowSubplotsContextMenu(subplot)
+            local F = ImPlot.ImPlotSubplotFlags
+            if ImGui.BeginMenu("Linking") then
+                if ImGui.MenuItem("Link Rows", nil, ImHasFlag(subplot.Flags, F.LinkRows)) then subplot.Flags = ImFlipFlag(subplot.Flags, F.LinkRows) end
+                if ImGui.MenuItem("Link Cols", nil, ImHasFlag(subplot.Flags, F.LinkCols)) then subplot.Flags = ImFlipFlag(subplot.Flags, F.LinkCols) end
+                if ImGui.MenuItem("Link All X", nil, ImHasFlag(subplot.Flags, F.LinkAllX)) then subplot.Flags = ImFlipFlag(subplot.Flags, F.LinkAllX) end
+                if ImGui.MenuItem("Link All Y", nil, ImHasFlag(subplot.Flags, F.LinkAllY)) then subplot.Flags = ImFlipFlag(subplot.Flags, F.LinkAllY) end
+                ImGui.EndMenu()
+            end
+            if ImGui.BeginMenu("Settings") then
+                BeginDisabledControls(not subplot.HasTitle)
+                if ImGui.MenuItem("Title", nil, subplot.HasTitle and not ImHasFlag(subplot.Flags, F.NoTitle)) then subplot.Flags = ImFlipFlag(subplot.Flags, F.NoTitle) end
+                EndDisabledControls(not subplot.HasTitle)
+                if ImGui.MenuItem("Resizable", nil, not ImHasFlag(subplot.Flags, F.NoResize)) then subplot.Flags = ImFlipFlag(subplot.Flags, F.NoResize) end
+                if ImGui.MenuItem("Align", nil, not ImHasFlag(subplot.Flags, F.NoAlign)) then subplot.Flags = ImFlipFlag(subplot.Flags, F.NoAlign) end
+                if ImGui.MenuItem("Share Items", nil, ImHasFlag(subplot.Flags, F.ShareItems)) then subplot.Flags = ImFlipFlag(subplot.Flags, F.ShareItems) end
+                ImGui.EndMenu()
+            end
+        end
+
         function internal.ShowPlotContextMenu(plot)
             local gp = GImPlot
             local owns_legend = gp.CurrentItems == plot.Items
@@ -2803,6 +2867,11 @@ return function(G)
                         if internal.ShowLegendContextMenu(plot.Items.Legend, not ImHasFlag(plot.Flags, ImPlotFlags.NoLegend)) then
                             plot.Flags = ImFlipFlag(plot.Flags, ImPlotFlags.NoLegend)
                         end
+                    elseif gp.CurrentSubplot ~= nil then
+                        local sp = gp.CurrentSubplot
+                        if internal.ShowLegendContextMenu(sp.Items.Legend, not ImHasFlag(sp.Flags, ImPlot.ImPlotSubplotFlags.NoLegend)) then
+                            sp.Flags = ImFlipFlag(sp.Flags, ImPlot.ImPlotSubplotFlags.NoLegend)
+                        end
                     end
                     ImGui.EndMenu()
                 end
@@ -2827,6 +2896,13 @@ return function(G)
                     plot.Flags = ImFlipFlag(plot.Flags, ImPlotFlags.Crosshairs)
                 end
                 ImGui.EndMenu()
+            end
+            if gp.CurrentSubplot ~= nil and not ImHasFlag(gp.CurrentSubplot.Flags, ImPlot.ImPlotSubplotFlags.NoMenus) then
+                ImGui.Separator()
+                if ImGui.BeginMenu("Subplots") then
+                    internal.ShowSubplotsContextMenu(gp.CurrentSubplot)
+                    ImGui.EndMenu()
+                end
             end
         end
 
@@ -3424,13 +3500,15 @@ return function(G)
             IM_ASSERT(gp.CurrentPlot == nil, "Mismatched BeginPlot()/EndPlot()!")
 
             -- FRONT MATTER -----------------------------------------------------------
-            -- [Port] TODO: subplots (PushID(CurrentSubplot.CurrentIdx))
+            if gp.CurrentSubplot ~= nil then
+                ImGui.PushID(gp.CurrentSubplot.CurrentIdx)
+            end
 
             -- get globals
             local Window = ImGui.GetCurrentWindow()
 
             -- skip if needed
-            if Window.SkipItems then
+            if Window.SkipItems and not gp.CurrentSubplot then
                 internal.ResetCtxForNextPlot(gp)
                 return false
             end
@@ -3482,12 +3560,17 @@ return function(G)
             plot:SetTitle(title_id)
 
             -- set frame size
-            local frame_size = ImGui.CalcItemSize(size, gp.Style.PlotDefaultSize.x, gp.Style.PlotDefaultSize.y)
+            local frame_size
+            if gp.CurrentSubplot ~= nil then
+                frame_size = ImVec2(gp.CurrentSubplot.CellSize.x, gp.CurrentSubplot.CellSize.y)
+            else
+                frame_size = ImGui.CalcItemSize(size, gp.Style.PlotDefaultSize.x, gp.Style.PlotDefaultSize.y)
+            end
 
-            if frame_size.x < gp.Style.PlotMinSize.x and size.x < 0.0 then
+            if frame_size.x < gp.Style.PlotMinSize.x and (size.x < 0.0 or gp.CurrentSubplot ~= nil) then
                 frame_size.x = gp.Style.PlotMinSize.x
             end
-            if frame_size.y < gp.Style.PlotMinSize.y and size.y < 0.0 then
+            if frame_size.y < gp.Style.PlotMinSize.y and (size.y < 0.0 or gp.CurrentSubplot ~= nil) then
                 frame_size.y = gp.Style.PlotMinSize.y
             end
 
@@ -3496,7 +3579,7 @@ return function(G)
             fr.Min.x, fr.Min.y = cp.x, cp.y
             fr.Max.x, fr.Max.y = cp.x + frame_size.x, cp.y + frame_size.y
             ImGui.ItemSize(fr)
-            if not ImGui.ItemAdd(fr, plot.ID, fr) then
+            if not ImGui.ItemAdd(fr, plot.ID, fr) and not gp.CurrentSubplot then
                 internal.ResetCtxForNextPlot(gp)
                 return false
             end
@@ -4029,7 +4112,18 @@ return function(G)
                 DrawList:AddText(SetTmp(pos.x + gs.AnnotationPadding.x, pos.y + gs.AnnotationPadding.y), an.ColorFg, txt)
             end
 
-            -- [Port] TODO: crosshairs
+            -- render crosshairs
+            local any_x_held = plot.Held or AnyAxesHeld(plot, ImAxis.X1, IMPLOT_NUM_X_AXES)
+            local any_y_held = plot.Held or AnyAxesHeld(plot, ImAxis.Y1, IMPLOT_NUM_Y_AXES)
+            if ImHasFlag(plot.Flags, ImPlotFlags.Crosshairs) and plot.Hovered and not (any_x_held or any_y_held) and not plot.Selecting and not plot.Items.Legend.Hovered then
+                ImGui.SetMouseCursor(G.ImGuiMouseCursor.None)
+                local xy = ImGui.GetIO().MousePos
+                local col = GetStyleColorU32(ImPlotCol.Crosshairs)
+                AddLineH(DrawList, pr.Min.x, xy.x - 5, xy.y, col)
+                AddLineH(DrawList, xy.x + 5, pr.Max.x, xy.y, col)
+                AddLineV(DrawList, xy.x, pr.Min.y, xy.y - 5, col)
+                AddLineV(DrawList, xy.x, xy.y + 5, pr.Max.y, col)
+            end
 
             -- render mouse pos
             if not ImHasFlag(plot.Flags, ImPlotFlags.NoMouseText) and (plot.Hovered or ImHasFlag(plot.MouseTextFlags, ImPlot.ImPlotMouseTextFlags.ShowAlways)) then
@@ -4078,7 +4172,40 @@ return function(G)
             end
             internal.PopPlotClipRect()
 
-            -- [Port] TODO: axis side switch
+            -- axis side switch
+            if not plot.Held then
+                local mouse_pos = ImGui.GetIO().MousePos
+                for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                    local x_axis = plot:XAxis(i)
+                    if not ImHasFlag(x_axis.Flags, ImPlotAxisFlags.NoSideSwitch) and x_axis.Held and pr:Contains(mouse_pos) then
+                        local rect
+                        if not x_axis:IsOpposite() then
+                            rect = ImRect(pr.Min.x - 5, pr.Min.y - 5, pr.Max.x + 5, pr.Min.y + 5)
+                            if mouse_pos.y < pr.Max.y - 10 then DrawList:AddRectFilled(rect.Min, rect.Max, x_axis.ColorHov) end
+                            if rect:Contains(mouse_pos) then x_axis.Flags = bit32.bor(x_axis.Flags, ImPlotAxisFlags.Opposite) end
+                        else
+                            rect = ImRect(pr.Min.x - 5, pr.Max.y - 5, pr.Max.x + 5, pr.Max.y + 5)
+                            if mouse_pos.y > pr.Min.y + 10 then DrawList:AddRectFilled(rect.Min, rect.Max, x_axis.ColorHov) end
+                            if rect:Contains(mouse_pos) then x_axis.Flags = bit32.band(x_axis.Flags, bit32.bnot(ImPlotAxisFlags.Opposite)) end
+                        end
+                    end
+                end
+                for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                    local y_axis = plot:YAxis(i)
+                    if not ImHasFlag(y_axis.Flags, ImPlotAxisFlags.NoSideSwitch) and y_axis.Held and pr:Contains(mouse_pos) then
+                        local rect
+                        if not y_axis:IsOpposite() then
+                            rect = ImRect(pr.Max.x - 5, pr.Min.y - 5, pr.Max.x + 5, pr.Max.y + 5)
+                            if mouse_pos.x > pr.Min.x + 10 then DrawList:AddRectFilled(rect.Min, rect.Max, y_axis.ColorHov) end
+                            if rect:Contains(mouse_pos) then y_axis.Flags = bit32.bor(y_axis.Flags, ImPlotAxisFlags.Opposite) end
+                        else
+                            rect = ImRect(pr.Min.x - 5, pr.Min.y - 5, pr.Min.x + 5, pr.Max.y + 5)
+                            if mouse_pos.x < pr.Max.x - 10 then DrawList:AddRectFilled(rect.Min, rect.Max, y_axis.ColorHov) end
+                            if rect:Contains(mouse_pos) then y_axis.Flags = bit32.band(y_axis.Flags, bit32.bnot(ImPlotAxisFlags.Opposite)) end
+                        end
+                    end
+                end
+            end
 
             -- render legend
             internal.RenderPlotLegend(plot, DrawList)
@@ -4122,15 +4249,39 @@ return function(G)
             end
 
             -- FIT DATA --------------------------------------------------------------
-            -- [Port] TODO: ImPlotFlags_Equal aspect handling during fit
+            local fit_equal = ImHasFlag(plot.Flags, ImPlotFlags.Equal)
             if plot.FitThisFrame then
-                for i = 0, ImAxis.COUNT - 1 do
-                    local axis = plot.Axes[i]
-                    if axis.FitThisFrame then
-                        if axis.Vertical then
-                            axis:ApplyFit(gs.FitPadding.y)
-                        else
-                            axis:ApplyFit(gs.FitPadding.x)
+                for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                    local x_axis = plot:XAxis(i)
+                    if x_axis.FitThisFrame then
+                        x_axis:ApplyFit(gs.FitPadding.x)
+                        if fit_equal and x_axis.OrthoAxis ~= nil then
+                            local aspect = x_axis:GetAspect()
+                            local y_axis = x_axis.OrthoAxis
+                            if y_axis.FitThisFrame then
+                                y_axis:ApplyFit(gs.FitPadding.y)
+                                y_axis.FitThisFrame = false
+                                aspect = math.max(aspect, y_axis:GetAspect())
+                            end
+                            x_axis:SetAspect(aspect)
+                            y_axis:SetAspect(aspect)
+                        end
+                    end
+                end
+                for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                    local y_axis = plot:YAxis(i)
+                    if y_axis.FitThisFrame then
+                        y_axis:ApplyFit(gs.FitPadding.y)
+                        if fit_equal and y_axis.OrthoAxis ~= nil then
+                            local aspect = y_axis:GetAspect()
+                            local x_axis = y_axis.OrthoAxis
+                            if x_axis.FitThisFrame then
+                                x_axis:ApplyFit(gs.FitPadding.x)
+                                x_axis.FitThisFrame = false
+                                aspect = math.max(x_axis:GetAspect(), aspect)
+                            end
+                            x_axis:SetAspect(aspect)
+                            y_axis:SetAspect(aspect)
                         end
                     end
                 end
@@ -4202,6 +4353,12 @@ return function(G)
             ImGui.PopID()
             -- Reset context for next plot
             internal.ResetCtxForNextPlot(gp)
+
+            -- setup next subplot
+            if gp.CurrentSubplot ~= nil then
+                ImGui.PopID()
+                internal.SubplotNextCell()
+            end
         end
 
         -----------------------------------------------------------------------
@@ -4551,7 +4708,10 @@ return function(G)
                 local plot = gp.Plots:GetByIndex(p)
                 if plot then plot.Items:Reset() end
             end
-            -- [Port] TODO: subplots
+            for p = 0, gp.Subplots:GetMapSize() - 1 do
+                local subplot = gp.Subplots:GetByIndex(p)
+                if subplot then subplot.Items:Reset() end
+            end
         end
 
         function ImPlot.BustColorCache(plot_title_id)
@@ -7372,7 +7532,6 @@ return function(G)
         function internal.RenderPlotLegend(plot, DrawList)
             local gp = GImPlot
             local gs = gp.Style
-            local IO = ImGui.GetIO()
             -- reset legend hovers
             plot.Items.Legend.Hovered = false
             for i = 0, plot.Items:GetItemCount() - 1 do
@@ -7385,24 +7544,43 @@ return function(G)
                 r.Min.x, r.Min.y, r.Max.x, r.Max.y = 0, 0, 0, 0
                 return
             end
-            local legend      = plot.Items.Legend
-            local legend_out  = ImHasFlag(legend.Flags, ImPlotLegendFlags.Outside)
+            local legend     = plot.Items.Legend
+            local legend_out = ImHasFlag(legend.Flags, ImPlotLegendFlags.Outside)
+            local legend_contextable = internal.RenderItemsLegend(plot.Items,
+                legend_out and plot.FrameRect or plot.PlotRect, legend_out and gs.PlotPadding or gs.LegendPadding, ImGui.IsWindowHovered(), DrawList)
+
+            -- main ctx menu
+            if gp.OpenContextThisFrame and legend_contextable and not ImHasFlag(plot.Flags, ImPlotFlags.NoMenus) then
+                ImGui.OpenPopup("##LegendContext")
+            end
+            if ImGui.BeginPopup("##LegendContext") then
+                ImGui.Text("Legend"); ImGui.Separator()
+                if internal.ShowLegendContextMenu(legend, not ImHasFlag(plot.Flags, ImPlotFlags.NoLegend)) then
+                    plot.Flags = bit32.bxor(plot.Flags, ImPlotFlags.NoLegend)
+                end
+                ImGui.EndPopup()
+            end
+        end
+
+        -- [Port] shared legend box/scroll/entries rendering of EndPlot and EndSubplots; returns legend_contextable
+        function internal.RenderItemsLegend(items, outer, outer_pad, can_hover, DrawList)
+            local gs = GImPlot.Style
+            local IO = ImGui.GetIO()
+            local legend      = items.Legend
             local legend_horz = ImHasFlag(legend.Flags, ImPlotLegendFlags.Horizontal)
-            local legend_size = internal.CalcLegendSize(plot.Items, gs.LegendInnerPadding, gs.LegendSpacing, not legend_horz)
-            local outer       = legend_out and plot.FrameRect or plot.PlotRect
-            local outer_pad   = legend_out and gs.PlotPadding or gs.LegendPadding
+            local legend_size = internal.CalcLegendSize(items, gs.LegendInnerPadding, gs.LegendSpacing, not legend_horz)
             local legend_pos  = internal.GetLocationPos(outer, legend_size, legend.Location, outer_pad)
             local lr, lc = legend.Rect, legend.RectClamped
             lr.Min.x, lr.Min.y, lr.Max.x, lr.Max.y = legend_pos.x, legend_pos.y, legend_pos.x + legend_size.x, legend_pos.y + legend_size.y
             lc.Min.x, lc.Min.y, lc.Max.x, lc.Max.y = lr.Min.x, lr.Min.y, lr.Max.x, lr.Max.y
             local legend_scrollable = internal.ClampLegendRect(lc, outer, outer_pad)
-            ImGui.KeepAliveID(plot.Items.ID)
-            _, legend.Hovered, legend.Held = ImGui.ButtonBehavior(lc, plot.Items.ID, legend_button_flags)
-            legend.Hovered = legend.Hovered or (ImGui.IsWindowHovered() and lc:Contains(IO.MousePos))
+            ImGui.KeepAliveID(items.ID)
+            _, legend.Hovered, legend.Held = ImGui.ButtonBehavior(lc, items.ID, legend_button_flags)
+            legend.Hovered = legend.Hovered or (can_hover and lc:Contains(IO.MousePos))
 
             if legend_scrollable then
                 if legend.Hovered then
-                    ImGui.SetKeyOwner(G.ImGuiKey.MouseWheelY, plot.Items.ID)
+                    ImGui.SetKeyOwner(G.ImGuiKey.MouseWheelY, items.ID)
                     if IO.MouseWheel ~= 0.0 then
                         local max_step_x = (lr.Max.x - lr.Min.x) * 0.67
                         local font_size = ImGui.GetCurrentWindow().FontRefSize or ImGui.GetFontSize()
@@ -7426,22 +7604,36 @@ return function(G)
             local col_bd = GetStyleColorU32(ImPlotCol.LegendBorder)
             ImGui.PushClipRect(lc.Min, lc.Max, true)
             DrawList:AddRectFilled(lc.Min, lc.Max, col_bg)
-            local legend_contextable = internal.ShowLegendEntries(plot.Items, lr, legend.Hovered, gs.LegendInnerPadding, gs.LegendSpacing, not legend_horz, DrawList)
+            local legend_contextable = internal.ShowLegendEntries(items, lr, legend.Hovered, gs.LegendInnerPadding, gs.LegendSpacing, not legend_horz, DrawList)
                                        and not ImHasFlag(legend.Flags, ImPlotLegendFlags.NoMenus)
             DrawList:AddRect(lc.Min, lc.Max, col_bd)
             ImGui.PopClipRect()
+            return legend_contextable
+        end
 
-            -- main ctx menu
-            if gp.OpenContextThisFrame and legend_contextable and not ImHasFlag(plot.Flags, ImPlotFlags.NoMenus) then
-                ImGui.OpenPopup("##LegendContext")
+        -- Legend Utils and Tools
+
+        function ImPlot.BeginLegendPopup(label_id, mouse_button)
+            if mouse_button == nil then mouse_button = G.ImGuiMouseButton.Right end
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentItems ~= nil, "BeginLegendPopup() needs to be called within an itemized context!")
+            internal.SetupLock()
+            if ImGui.GetCurrentWindow().SkipItems then
+                return false
             end
-            if ImGui.BeginPopup("##LegendContext") then
-                ImGui.Text("Legend"); ImGui.Separator()
-                if internal.ShowLegendContextMenu(legend, not ImHasFlag(plot.Flags, ImPlotFlags.NoLegend)) then
-                    plot.Flags = bit32.bxor(plot.Flags, ImPlotFlags.NoLegend)
+            local id = gp.CurrentItems:GetItemID(label_id)
+            if ImGui.IsMouseReleased(mouse_button) then
+                local item = gp.CurrentItems:GetItem(id)
+                if item and item.LegendHovered then
+                    ImGui.OpenPopupEx(id)
                 end
-                ImGui.EndPopup()
             end
+            return ImGui.BeginPopupEx(id, bor(G.ImGuiWindowFlags.AlwaysAutoResize, G.ImGuiWindowFlags.NoTitleBar, G.ImGuiWindowFlags.NoSavedSettings))
+        end
+
+        function ImPlot.EndLegendPopup()
+            internal.SetupLock()
+            ImGui.EndPopup()
         end
     end
 
@@ -7872,6 +8064,767 @@ return function(G)
             internal.PopPlotClipRect()
             ImGui.PopID()
             return v[1], v[2], v[3], v[4], modified, out_clicked, out_hovered, out_held
+        end
+    end
+
+    --------------------------------------------------------------------------
+    -- [SECTION] Subplots, Aligned Plots, Drag and Drop Utils
+    -- [Port] BeginSubplots row_sizes/col_sizes: optional plain arrays (1-based), updated in place
+    --------------------------------------------------------------------------
+    do
+        local ImAxis = ImPlot.ImAxis
+        local ImPlotSubplotFlags = ImPlot.ImPlotSubplotFlags
+        local ImPlotLegendFlags = ImPlot.ImPlotLegendFlags
+        local ImPlotLocation = ImPlot.ImPlotLocation
+        local ImHasFlag = internal.ImHasFlag
+        local GetStyleColorU32 = internal.GetStyleColorU32
+        local ImRect = G.ImRect
+        local bor = bit32.bor
+
+        local SUBPLOT_BORDER_SIZE             = 1.0
+        local SUBPLOT_SPLITTER_HALF_THICKNESS = 4.0
+        local SUBPLOT_SPLITTER_FEEDBACK_TIMER = 0.06
+
+        local function IM_ROUND(v) return math.floor(v + 0.5) end
+
+        local AlignMT = {}
+        AlignMT.__index = AlignMT
+        function internal.ImPlotAlignmentData()
+            return setmetatable({ Vertical = true, PadA = 0, PadB = 0, PadAMax = 0, PadBMax = 0 }, AlignMT)
+        end
+        function AlignMT:Begin() self.PadAMax = 0; self.PadBMax = 0 end
+        -- [Port] returns (pad_a, pad_b, delta_a, delta_b) instead of writing through references
+        function AlignMT:Update(pad_a, pad_b)
+            local bak_a, bak_b = pad_a, pad_b
+            local delta_a, delta_b = 0, 0
+            if self.PadAMax < pad_a then self.PadAMax = pad_a end
+            if self.PadBMax < pad_b then self.PadBMax = pad_b end
+            if pad_a < self.PadA then pad_a = self.PadA; delta_a = pad_a - bak_a end
+            if pad_b < self.PadB then pad_b = self.PadB; delta_b = pad_b - bak_b end
+            return pad_a, pad_b, delta_a, delta_b
+        end
+        function AlignMT:End() self.PadA = self.PadAMax; self.PadB = self.PadBMax end
+        function AlignMT:Reset() self.PadA = 0; self.PadB = 0; self.PadAMax = 0; self.PadBMax = 0 end
+
+        -- [Port] Row/ColLinkData entries are { Min = ref, Max = ref } link refs (see SetNextAxisLinks)
+        function internal.ImPlotSubplot()
+            local items = internal.ImPlotItemGroup()
+            items.Legend.Location    = ImPlotLocation.North
+            items.Legend.Flags       = bor(ImPlotLegendFlags.Horizontal, ImPlotLegendFlags.Outside)
+            items.Legend.CanGoInside = false
+            return {
+                ID = 0, Flags = ImPlotSubplotFlags.None, PreviousFlags = ImPlotSubplotFlags.None,
+                Items = items, Rows = 0, Cols = 0, CurrentIdx = 0,
+                FrameRect = ImRect(), GridRect = ImRect(), CellSize = ImVec2(0, 0),
+                RowAlignmentData = {}, ColAlignmentData = {}, RowRatios = {}, ColRatios = {},
+                RowLinkData = {}, ColLinkData = {}, -- [Port] all 1-based arrays
+                TempSizes = { 0, 0 }, FrameHovered = false, HasTitle = false,
+            }
+        end
+
+        function internal.SubplotSetCell(row, col)
+            local gp = GImPlot
+            local subplot = gp.CurrentSubplot
+            if row >= subplot.Rows or col >= subplot.Cols then
+                return
+            end
+            local xoff, yoff = 0, 0
+            for c = 1, col do xoff += subplot.ColRatios[c] end
+            for r = 1, row do yoff += subplot.RowRatios[r] end
+            local gr = subplot.GridRect
+            local cp = ImGui.GetCurrentWindow().DC.CursorPos
+            cp.x = IM_ROUND(gr.Min.x + xoff * gr:GetWidth())
+            cp.y = IM_ROUND(gr.Min.y + yoff * gr:GetHeight())
+            -- set cell size
+            subplot.CellSize.x = IM_ROUND(gr:GetWidth() * subplot.ColRatios[col + 1])
+            subplot.CellSize.y = IM_ROUND(gr:GetHeight() * subplot.RowRatios[row + 1])
+            -- setup links
+            local lx = ImHasFlag(subplot.Flags, ImPlotSubplotFlags.LinkAllX)
+            local ly = ImHasFlag(subplot.Flags, ImPlotSubplotFlags.LinkAllY)
+            local lr = ImHasFlag(subplot.Flags, ImPlotSubplotFlags.LinkRows)
+            local lc = ImHasFlag(subplot.Flags, ImPlotSubplotFlags.LinkCols)
+            local xl = (lx and subplot.ColLinkData[1]) or (lc and subplot.ColLinkData[col + 1]) or nil
+            local yl = (ly and subplot.RowLinkData[1]) or (lr and subplot.RowLinkData[row + 1]) or nil
+            ImPlot.SetNextAxisLinks(ImAxis.X1, xl and xl.Min, xl and xl.Max)
+            ImPlot.SetNextAxisLinks(ImAxis.Y1, yl and yl.Min, yl and yl.Max)
+            -- setup alignment
+            if not ImHasFlag(subplot.Flags, ImPlotSubplotFlags.NoAlign) then
+                gp.CurrentAlignmentH = subplot.RowAlignmentData[row + 1]
+                gp.CurrentAlignmentV = subplot.ColAlignmentData[col + 1]
+            end
+            -- set idx
+            if ImHasFlag(subplot.Flags, ImPlotSubplotFlags.ColMajor) then
+                subplot.CurrentIdx = col * subplot.Rows + row
+            else
+                subplot.CurrentIdx = row * subplot.Cols + col
+            end
+        end
+
+        function internal.SubplotSetCellIdx(idx)
+            local subplot = GImPlot.CurrentSubplot
+            if idx >= subplot.Rows * subplot.Cols then
+                return
+            end
+            if ImHasFlag(subplot.Flags, ImPlotSubplotFlags.ColMajor) then
+                internal.SubplotSetCell(idx % subplot.Rows, idx // subplot.Rows)
+            else
+                internal.SubplotSetCell(idx // subplot.Cols, idx % subplot.Cols)
+            end
+        end
+
+        function internal.SubplotNextCell()
+            local subplot = GImPlot.CurrentSubplot
+            subplot.CurrentIdx += 1
+            internal.SubplotSetCellIdx(subplot.CurrentIdx)
+        end
+
+        local function RenderSplitter(subplot, sep_bb, sep_id, ratios, i, vertical, line_pos, hov_col, act_col, DrawList)
+            local g = ImGui.GetCurrentContext()
+            ImGui.KeepAliveID(sep_id)
+            local sep_clk, sep_hov, sep_hld = ImGui.ButtonBehavior(sep_bb, sep_id,
+                bor(G.ImGuiButtonFlags.FlattenChildren, G.ImGuiButtonFlags.PressedOnClick, G.ImGuiButtonFlags.PressedOnDoubleClick))
+            if (sep_hov and g.HoveredIdTimer > SUBPLOT_SPLITTER_FEEDBACK_TIMER) or sep_hld then
+                if sep_clk and ImGui.IsMouseDoubleClicked(0) then
+                    local p = (ratios[i] + ratios[i + 1]) / 2
+                    ratios[i], ratios[i + 1] = p, p
+                end
+                if sep_clk then
+                    subplot.TempSizes[1] = ratios[i]
+                    subplot.TempSizes[2] = ratios[i + 1]
+                end
+                if sep_hld then
+                    local dp
+                    if vertical then
+                        dp = ImGui.GetMouseDragDelta(0).y / subplot.GridRect:GetHeight()
+                    else
+                        dp = ImGui.GetMouseDragDelta(0).x / subplot.GridRect:GetWidth()
+                    end
+                    if subplot.TempSizes[1] + dp > 0.1 and subplot.TempSizes[2] - dp > 0.1 then
+                        ratios[i]     = subplot.TempSizes[1] + dp
+                        ratios[i + 1] = subplot.TempSizes[2] - dp
+                    end
+                end
+                local gr = subplot.GridRect
+                if vertical then
+                    internal.AddLineH(DrawList, IM_ROUND(gr.Min.x), IM_ROUND(gr.Max.x), IM_ROUND(line_pos), sep_hld and act_col or hov_col, SUBPLOT_BORDER_SIZE)
+                    ImGui.SetMouseCursor(G.ImGuiMouseCursor.ResizeNS)
+                else
+                    internal.AddLineV(DrawList, IM_ROUND(line_pos), IM_ROUND(gr.Min.y), IM_ROUND(gr.Max.y), sep_hld and act_col or hov_col, SUBPLOT_BORDER_SIZE)
+                    ImGui.SetMouseCursor(G.ImGuiMouseCursor.ResizeEW)
+                end
+            end
+        end
+
+        function ImPlot.BeginSubplots(title, rows, cols, size, flags, row_sizes, col_sizes)
+            if flags == nil then flags = ImPlotSubplotFlags.None end
+            IM_ASSERT(rows > 0 and cols > 0, "Invalid sizing arguments!")
+            IM_ASSERT(GImPlot ~= nil, "No current context. Did you call ImPlot::CreateContext() or ImPlot::SetCurrentContext()?")
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentSubplot == nil, "Mismatched BeginSubplots()/EndSubplots()!")
+            local Window = ImGui.GetCurrentWindow()
+            if Window.SkipItems then
+                return false
+            end
+            local ID = Window:GetID(title)
+            local just_created = gp.Subplots:GetByKey(ID) == nil
+            gp.CurrentSubplot = gp.Subplots:GetOrAddByKey(ID)
+            local subplot = gp.CurrentSubplot
+            subplot.ID       = ID
+            subplot.Items.ID = ID - 1
+            subplot.HasTitle = ImGui.FindRenderedTextEnd(title) ~= 1
+            -- push ID
+            ImGui.PushID(ID)
+
+            if just_created or flags ~= subplot.PreviousFlags then
+                subplot.Flags = flags
+            end
+            subplot.PreviousFlags = flags
+
+            -- check for change in rows and cols
+            if subplot.Rows ~= rows or subplot.Cols ~= cols then
+                table.clear(subplot.RowAlignmentData); table.clear(subplot.RowLinkData); table.clear(subplot.RowRatios)
+                for r = 1, rows do
+                    subplot.RowAlignmentData[r] = internal.ImPlotAlignmentData()
+                    subplot.RowLinkData[r] = { Min = { 0 }, Max = { 1 } }
+                    subplot.RowRatios[r] = 1.0 / rows
+                end
+                table.clear(subplot.ColAlignmentData); table.clear(subplot.ColLinkData); table.clear(subplot.ColRatios)
+                for c = 1, cols do
+                    subplot.ColAlignmentData[c] = internal.ImPlotAlignmentData()
+                    subplot.ColLinkData[c] = { Min = { 0 }, Max = { 1 } }
+                    subplot.ColRatios[c] = 1.0 / cols
+                end
+            end
+            -- check incoming size requests
+            local row_sum, col_sum = 0, 0
+            if row_sizes ~= nil then
+                for r = 1, rows do row_sum += row_sizes[r] end
+                for r = 1, rows do subplot.RowRatios[r] = row_sizes[r] / row_sum end
+            end
+            if col_sizes ~= nil then
+                for c = 1, cols do col_sum += col_sizes[c] end
+                for c = 1, cols do subplot.ColRatios[c] = col_sizes[c] / col_sum end
+            end
+            subplot.Rows = rows
+            subplot.Cols = cols
+
+            -- calc plot frame sizes
+            local gs = gp.Style
+            local title_size = ImVec2(0, 0)
+            if not ImHasFlag(subplot.Flags, ImPlotSubplotFlags.NoTitle) then
+                title_size = ImGui.CalcTextSize(title, nil, true)
+            end
+            local pad_top = title_size.x > 0 and (title_size.y + gs.LabelPadding.y) or 0
+            local half_pad = ImVec2(gs.PlotPadding.x / 2, gs.PlotPadding.y / 2)
+            local frame_size = ImGui.CalcItemSize(size or ImVec2(-1, 0), gs.PlotDefaultSize.x, gs.PlotDefaultSize.y)
+            local cp = Window.DC.CursorPos
+            local fr, gr = subplot.FrameRect, subplot.GridRect
+            fr.Min.x, fr.Min.y, fr.Max.x, fr.Max.y = cp.x, cp.y, cp.x + frame_size.x, cp.y + frame_size.y
+            gr.Min.x, gr.Min.y = fr.Min.x + half_pad.x, fr.Min.y + half_pad.y + pad_top
+            gr.Max.x, gr.Max.y = fr.Max.x - half_pad.x, fr.Max.y - half_pad.y
+            subplot.FrameHovered = fr:Contains(ImGui.GetMousePos())
+                and ImGui.IsWindowHovered(bor(G.ImGuiHoveredFlags.ChildWindows, G.ImGuiHoveredFlags.AllowWhenBlockedByActiveItem))
+
+            -- outside legend adjustments (TODO: make function)
+            local share_items = ImHasFlag(subplot.Flags, ImPlotSubplotFlags.ShareItems)
+            if share_items then
+                gp.CurrentItems = subplot.Items
+            end
+            if share_items and not ImHasFlag(subplot.Flags, ImPlotSubplotFlags.NoLegend) and subplot.Items:GetLegendCount() > 0 then
+                local legend = subplot.Items.Legend
+                local horz = ImHasFlag(legend.Flags, ImPlotLegendFlags.Horizontal)
+                local legend_size = internal.CalcLegendSize(subplot.Items, gs.LegendInnerPadding, gs.LegendSpacing, not horz)
+                local loc = legend.Location
+                local west  = ImHasFlag(loc, ImPlotLocation.West) and not ImHasFlag(loc, ImPlotLocation.East)
+                local east  = ImHasFlag(loc, ImPlotLocation.East) and not ImHasFlag(loc, ImPlotLocation.West)
+                local north = ImHasFlag(loc, ImPlotLocation.North) and not ImHasFlag(loc, ImPlotLocation.South)
+                local south = ImHasFlag(loc, ImPlotLocation.South) and not ImHasFlag(loc, ImPlotLocation.North)
+                if (west and not horz) or (west and horz and not north and not south) then gr.Min.x += legend_size.x + gs.LegendPadding.x end
+                if (east and not horz) or (east and horz and not north and not south) then gr.Max.x -= legend_size.x + gs.LegendPadding.x end
+                if (north and horz) or (north and not horz and not west and not east) then gr.Min.y += legend_size.y + gs.LegendPadding.y end
+                if (south and horz) or (south and not horz and not west and not east) then gr.Max.y -= legend_size.y + gs.LegendPadding.y end
+            end
+
+            -- render single background frame
+            ImGui.RenderFrame(fr.Min, fr.Max, GetStyleColorU32(ImPlot.ImPlotCol.FrameBg), true, ImGui.GetStyle().FrameRounding)
+            -- render title
+            if title_size.x > 0 and not ImHasFlag(subplot.Flags, ImPlotSubplotFlags.NoTitle) then
+                local col = GetStyleColorU32(ImPlot.ImPlotCol.TitleText)
+                internal.AddTextCentered(ImGui.GetWindowDrawList(), ImVec2(gr:GetCenter().x, gr.Min.y - pad_top + half_pad.y), col, title)
+            end
+
+            -- render splitters
+            if not ImHasFlag(subplot.Flags, ImPlotSubplotFlags.NoResize) then
+                local DrawList = ImGui.GetWindowDrawList()
+                local colors = ImGui.GetStyle().Colors
+                local hov_col = ImGui.ColorConvertFloat4ToU32(colors[G.ImGuiCol.SeparatorHovered])
+                local act_col = ImGui.ColorConvertFloat4ToU32(colors[G.ImGuiCol.SeparatorActive])
+                local xpos, ypos = gr.Min.x, gr.Min.y
+                local separator = 1
+                for r = 1, subplot.Rows - 1 do
+                    ypos += subplot.RowRatios[r] * gr:GetHeight()
+                    local sep_bb = ImRect(gr.Min.x, ypos - SUBPLOT_SPLITTER_HALF_THICKNESS, gr.Max.x, ypos + SUBPLOT_SPLITTER_HALF_THICKNESS)
+                    RenderSplitter(subplot, sep_bb, subplot.ID + separator, subplot.RowRatios, r, true, ypos, hov_col, act_col, DrawList)
+                    separator += 1
+                end
+                for c = 1, subplot.Cols - 1 do
+                    xpos += subplot.ColRatios[c] * gr:GetWidth()
+                    local sep_bb = ImRect(xpos - SUBPLOT_SPLITTER_HALF_THICKNESS, gr.Min.y, xpos + SUBPLOT_SPLITTER_HALF_THICKNESS, gr.Max.y)
+                    RenderSplitter(subplot, sep_bb, subplot.ID + separator, subplot.ColRatios, c, false, xpos, hov_col, act_col, DrawList)
+                    separator += 1
+                end
+            end
+
+            -- set outgoing sizes
+            if row_sizes ~= nil then
+                for r = 1, rows do row_sizes[r] = subplot.RowRatios[r] * row_sum end
+            end
+            if col_sizes ~= nil then
+                for c = 1, cols do col_sizes[c] = subplot.ColRatios[c] * col_sum end
+            end
+
+            -- push styling
+            ImPlot.PushStyleColor(ImPlot.ImPlotCol.FrameBg, G.IM_COL32_BLACK_TRANS)
+            ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar.PlotPadding, half_pad)
+            ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar.PlotMinSize, ImVec2(0, 0))
+            ImGui.PushStyleVar(G.ImGuiStyleVar.FrameBorderSize, 0)
+
+            -- set initial cursor pos
+            cp.x, cp.y = gr.Min.x, gr.Min.y
+            -- begin alignments
+            for r = 1, subplot.Rows do subplot.RowAlignmentData[r]:Begin() end
+            for c = 1, subplot.Cols do subplot.ColAlignmentData[c]:Begin() end
+            -- clear legend data
+            subplot.Items.Legend:Reset()
+            -- Setup first subplot
+            internal.SubplotSetCell(0, 0)
+            return true
+        end
+
+        function ImPlot.EndSubplots()
+            IM_ASSERT(GImPlot ~= nil, "No current context. Did you call ImPlot::CreateContext() or ImPlot::SetCurrentContext()?")
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentSubplot ~= nil, "Mismatched BeginSubplots()/EndSubplots()!")
+            local subplot = gp.CurrentSubplot
+            local gs = gp.Style
+            -- set alignments
+            for r = 1, subplot.Rows do subplot.RowAlignmentData[r]:End() end
+            for c = 1, subplot.Cols do subplot.ColAlignmentData[c]:End() end
+            -- pop styling
+            ImPlot.PopStyleColor()
+            ImPlot.PopStyleVar()
+            ImPlot.PopStyleVar()
+            ImGui.PopStyleVar()
+            -- legend
+            subplot.Items.Legend.Hovered = false
+            for i = 0, subplot.Items:GetItemCount() - 1 do
+                local it = subplot.Items:GetItemByIndex(i)
+                if it then it.LegendHovered = false end
+            end
+            -- render legend
+            local share_items = ImHasFlag(subplot.Flags, ImPlotSubplotFlags.ShareItems)
+            if share_items and not ImHasFlag(subplot.Flags, ImPlotSubplotFlags.NoLegend) and subplot.Items:GetLegendCount() > 0 then
+                local legend = subplot.Items.Legend
+                local legend_contextable = internal.RenderItemsLegend(subplot.Items, subplot.FrameRect, gs.PlotPadding, subplot.FrameHovered, ImGui.GetWindowDrawList())
+                if legend_contextable and not ImHasFlag(subplot.Flags, ImPlotSubplotFlags.NoMenus) and ImGui.GetIO().MouseReleased[gp.InputMap.Menu] then
+                    ImGui.OpenPopup("##LegendContext")
+                end
+                if ImGui.BeginPopup("##LegendContext") then
+                    ImGui.Text("Legend"); ImGui.Separator()
+                    if internal.ShowLegendContextMenu(legend, not ImHasFlag(subplot.Flags, ImPlotSubplotFlags.NoLegend)) then
+                        subplot.Flags = bit32.bxor(subplot.Flags, ImPlotSubplotFlags.NoLegend)
+                    end
+                    ImGui.EndPopup()
+                end
+            else
+                local r = subplot.Items.Legend.Rect
+                r.Min.x, r.Min.y, r.Max.x, r.Max.y = 0, 0, 0, 0
+            end
+            -- remove items
+            if gp.CurrentItems == subplot.Items then
+                gp.CurrentItems = nil
+            end
+            -- reset the plot items for the next frame (TODO: put this elsewhere)
+            for i = 0, subplot.Items:GetItemCount() - 1 do
+                local it = subplot.Items:GetItemByIndex(i)
+                if it then it.SeenThisFrame = false end
+            end
+            -- pop id
+            ImGui.PopID()
+            -- set DC back correctly
+            local fr = subplot.FrameRect
+            local cp = ImGui.GetCurrentWindow().DC.CursorPos
+            cp.x, cp.y = fr.Min.x, fr.Min.y
+            ImGui.Dummy(fr:GetSize())
+            internal.ResetCtxForNextSubplot(gp)
+        end
+
+        function ImPlot.IsSubplotsHovered()
+            IM_ASSERT(GImPlot.CurrentSubplot ~= nil, "IsSubplotsHovered() needs to be called between BeginSubplots() and EndSubplots()!")
+            return GImPlot.CurrentSubplot.FrameHovered
+        end
+
+        -- Aligned Plots
+
+        function ImPlot.BeginAlignedPlots(group_id, vertical)
+            if vertical == nil then vertical = true end
+            IM_ASSERT(GImPlot ~= nil, "No current context. Did you call ImPlot::CreateContext() or ImPlot::SetCurrentContext()?")
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentAlignmentH == nil and gp.CurrentAlignmentV == nil, "Mismatched BeginAlignedPlots()/EndAlignedPlots()!")
+            local Window = ImGui.GetCurrentWindow()
+            if Window.SkipItems then
+                return false
+            end
+            local alignment = gp.AlignmentData:GetOrAddByKey(Window:GetID(group_id))
+            if vertical then
+                gp.CurrentAlignmentV = alignment
+            else
+                gp.CurrentAlignmentH = alignment
+            end
+            if alignment.Vertical ~= vertical then
+                alignment:Reset()
+            end
+            alignment.Vertical = vertical
+            alignment:Begin()
+            return true
+        end
+
+        function ImPlot.EndAlignedPlots()
+            IM_ASSERT(GImPlot ~= nil, "No current context. Did you call ImPlot::CreateContext() or ImPlot::SetCurrentContext()?")
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentAlignmentH ~= nil or gp.CurrentAlignmentV ~= nil, "Mismatched BeginAlignedPlots()/EndAlignedPlots()!")
+            local alignment = gp.CurrentAlignmentH or gp.CurrentAlignmentV
+            if alignment then
+                alignment:End()
+            end
+            internal.ResetCtxForNextAlignedPlots(gp)
+        end
+
+        -- Drag and Drop Utils
+
+        function ImPlot.BeginDragDropTargetPlot()
+            internal.SetupLock()
+            local plot = GImPlot.CurrentPlot
+            return ImGui.BeginDragDropTargetCustom(plot.PlotRect, plot.ID)
+        end
+
+        function ImPlot.BeginDragDropTargetAxis(axis)
+            internal.SetupLock()
+            local ax = GImPlot.CurrentPlot.Axes[axis]
+            local rect = ImRect(ax.HoverRect.Min, ax.HoverRect.Max)
+            rect:Expand(-3.5)
+            return ImGui.BeginDragDropTargetCustom(rect, ax.ID)
+        end
+
+        function ImPlot.BeginDragDropTargetLegend()
+            internal.SetupLock()
+            local items = GImPlot.CurrentItems
+            return ImGui.BeginDragDropTargetCustom(items.Legend.RectClamped, items.ID)
+        end
+
+        function ImPlot.EndDragDropTarget()
+            internal.SetupLock()
+            ImGui.EndDragDropTarget()
+        end
+
+        function ImPlot.BeginDragDropSourcePlot(flags)
+            internal.SetupLock()
+            local gp = GImPlot
+            local g = ImGui.GetCurrentContext()
+            local plot = gp.CurrentPlot
+            if g.IO.KeyMods == gp.InputMap.OverrideMod or g.DragDropPayload.SourceId == plot.ID then
+                return ImGui.ItemAdd(plot.PlotRect, plot.ID) and ImGui.BeginDragDropSource(flags or 0)
+            end
+            return false
+        end
+
+        function ImPlot.BeginDragDropSourceAxis(idx, flags)
+            internal.SetupLock()
+            local gp = GImPlot
+            local g = ImGui.GetCurrentContext()
+            local axis = gp.CurrentPlot.Axes[idx]
+            if g.IO.KeyMods == gp.InputMap.OverrideMod or g.DragDropPayload.SourceId == axis.ID then
+                return ImGui.ItemAdd(axis.HoverRect, axis.ID) and ImGui.BeginDragDropSource(flags or 0)
+            end
+            return false
+        end
+
+        function ImPlot.BeginDragDropSourceItem(label_id, flags)
+            internal.SetupLock()
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentItems ~= nil, "BeginDragDropSourceItem() needs to be called within an itemized context!")
+            local item = gp.CurrentItems:GetItem(label_id)
+            if item ~= nil then
+                return ImGui.ItemAdd(item.LegendHoverRect, item.ID) and ImGui.BeginDragDropSource(flags or 0)
+            end
+            return false
+        end
+
+        function ImPlot.EndDragDropSource()
+            internal.SetupLock()
+            ImGui.EndDragDropSource()
+        end
+    end
+
+    --------------------------------------------------------------------------
+    -- [SECTION] Style Editor, Selectors, User Guide
+    -- [Port] function-local statics live in the `S` table below
+    --------------------------------------------------------------------------
+    do
+        local ImPlotCol = ImPlot.ImPlotCol
+        local S = { style_idx = -1, map_idx = -1, ref_saved_style = nil, colors_output_dest = 0, output_only_modified = false,
+                    filter = nil, alpha_flags = nil, cmap_output_dest = 0, edit = false }
+
+        local function HelpMarker(desc)
+            ImGui.TextDisabled("(?)")
+            if ImGui.IsItemHovered() then
+                ImGui.BeginTooltip()
+                ImGui.PushTextWrapPos(ImGui.GetFontSize() * 35.0)
+                ImGui.TextUnformatted(desc)
+                ImGui.PopTextWrapPos()
+                ImGui.EndTooltip()
+            end
+        end
+
+        -- [Port] ImPlotStyle assignment (deep copy)
+        local function CopyStyle(dst, src)
+            for k, v in pairs(src) do
+                if k == "Colors" then
+                    dst.Colors = {}
+                    for i, c in pairs(v) do dst.Colors[i] = ImVec4(c.x, c.y, c.z, c.w) end
+                elseif type(v) == "table" then
+                    dst[k] = ImVec2(v.x, v.y)
+                else
+                    dst[k] = v
+                end
+            end
+            return dst
+        end
+
+        local function ColorsDiffer(a, b)
+            return a.x ~= b.x or a.y ~= b.y or a.z ~= b.z or a.w ~= b.w
+        end
+
+        function ImPlot.ShowStyleSelector(label)
+            local changed
+            S.style_idx, changed = ImGui.Combo(label, S.style_idx, "Auto\0Classic\0Dark\0Light\0")
+            if changed then
+                if S.style_idx == 0 then ImPlot.StyleColorsAuto()
+                elseif S.style_idx == 1 then ImPlot.StyleColorsClassic()
+                elseif S.style_idx == 2 then ImPlot.StyleColorsDark()
+                elseif S.style_idx == 3 then ImPlot.StyleColorsLight()
+                end
+                return true
+            end
+            return false
+        end
+
+        function ImPlot.ShowColormapSelector(label)
+            local gp = GImPlot
+            local set = false
+            if ImGui.BeginCombo(label, gp.ColormapData:GetName(gp.Style.Colormap)) then
+                for i = 0, gp.ColormapData.Count - 1 do
+                    local name = gp.ColormapData:GetName(i)
+                    if ImGui.Selectable(name, gp.Style.Colormap == i) then
+                        gp.Style.Colormap = i
+                        internal.BustItemCache()
+                        set = true
+                    end
+                end
+                ImGui.EndCombo()
+            end
+            return set
+        end
+
+        function ImPlot.ShowInputMapSelector(label)
+            local changed
+            S.map_idx, changed = ImGui.Combo(label, S.map_idx, "Default\0Reversed\0")
+            if changed then
+                if S.map_idx == 0 then ImPlot.MapInputDefault()
+                elseif S.map_idx == 1 then ImPlot.MapInputReverse()
+                end
+                return true
+            end
+            return false
+        end
+
+        local function Slider2(label, v, v_min, v_max, fmt) ImGui.SliderFloat2(label, v, v_min, v_max, fmt) end
+
+        function ImPlot.ShowStyleEditor(ref)
+            local gp = GImPlot
+            local style = ImPlot.GetStyle()
+            -- Default to using internal storage as reference
+            if S.ref_saved_style == nil then
+                S.ref_saved_style = CopyStyle({}, style)
+            end
+            if ref == nil then
+                ref = S.ref_saved_style
+            end
+
+            if ImPlot.ShowStyleSelector("Colors##Selector") then
+                CopyStyle(S.ref_saved_style, style)
+            end
+
+            -- Save/Revert button
+            if ImGui.Button("Save Ref") then
+                CopyStyle(ref, style)
+                CopyStyle(S.ref_saved_style, style)
+            end
+            ImGui.SameLine()
+            if ImGui.Button("Revert Ref") then
+                CopyStyle(style, ref)
+            end
+            ImGui.SameLine()
+            HelpMarker("Save/Revert in local non-persistent storage. Default Colors definition are not affected. " ..
+                       "Use \"Export\" below to save them somewhere.")
+            local _
+            if ImGui.BeginTabBar("##StyleEditor") then
+                if ImGui.BeginTabItem("Variables") then
+                    ImGui.Text("Plot Styling")
+                    Slider2("PlotDefaultSize", style.PlotDefaultSize, 0.0, 1000, "%.0f")
+                    Slider2("PlotMinSize", style.PlotMinSize, 0.0, 300, "%.0f")
+                    style.PlotBorderSize = ImGui.SliderFloat("PlotBorderSize", style.PlotBorderSize, 0.0, 2.0, "%.0f")
+                    style.MinorAlpha = ImGui.SliderFloat("MinorAlpha", style.MinorAlpha, 0.0, 1.0, "%.2f")
+                    Slider2("MajorTickLen", style.MajorTickLen, 0.0, 20.0, "%.0f")
+                    Slider2("MinorTickLen", style.MinorTickLen, 0.0, 20.0, "%.0f")
+                    Slider2("MajorTickSize", style.MajorTickSize, 0.0, 2.0, "%.1f")
+                    Slider2("MinorTickSize", style.MinorTickSize, 0.0, 2.0, "%.1f")
+                    Slider2("MajorGridSize", style.MajorGridSize, 0.0, 2.0, "%.1f")
+                    Slider2("MinorGridSize", style.MinorGridSize, 0.0, 2.0, "%.1f")
+                    ImGui.Text("Plot Padding")
+                    Slider2("PlotPadding", style.PlotPadding, 0.0, 20.0, "%.0f")
+                    Slider2("LabelPadding", style.LabelPadding, 0.0, 20.0, "%.0f")
+                    Slider2("LegendPadding", style.LegendPadding, 0.0, 20.0, "%.0f")
+                    Slider2("LegendInnerPadding", style.LegendInnerPadding, 0.0, 10.0, "%.0f")
+                    Slider2("LegendSpacing", style.LegendSpacing, 0.0, 5.0, "%.0f")
+                    Slider2("MousePosPadding", style.MousePosPadding, 0.0, 20.0, "%.0f")
+                    Slider2("AnnotationPadding", style.AnnotationPadding, 0.0, 5.0, "%.0f")
+                    Slider2("FitPadding", style.FitPadding, 0, 0.2, "%.2f")
+                    style.DigitalPadding = ImGui.SliderFloat("DigitalPadding", style.DigitalPadding, 0.0, 20.0, "%.1f")
+                    style.DigitalSpacing = ImGui.SliderFloat("DigitalSpacing", style.DigitalSpacing, 0.0, 10.0, "%.1f")
+                    ImGui.EndTabItem()
+                end
+                if ImGui.BeginTabItem("Colors") then
+                    if ImGui.Button("Export", ImVec2(75, 0)) then
+                        if S.colors_output_dest == 0 then ImGui.LogToClipboard() else ImGui.LogToTTY() end
+                        ImGui.LogText("ImVec4* colors = ImPlot::GetStyle().Colors;\n")
+                        for i = 0, ImPlotCol.COUNT - 1 do
+                            local col = style.Colors[i]
+                            local name = ImPlot.GetStyleColorName(i)
+                            if not S.output_only_modified or ColorsDiffer(col, ref.Colors[i]) then
+                                local padding = string.rep(" ", math.max(0, 14 - #name))
+                                if internal.IsColorAuto(i) then
+                                    ImGui.LogText("colors[ImPlotCol_%s]%s= IMPLOT_AUTO_COL;\n", name, padding)
+                                else
+                                    ImGui.LogText("colors[ImPlotCol_%s]%s= ImVec4(%.2ff, %.2ff, %.2ff, %.2ff);\n", name, padding, col.x, col.y, col.z, col.w)
+                                end
+                            end
+                        end
+                        ImGui.LogFinish()
+                    end
+                    ImGui.SameLine(); ImGui.SetNextItemWidth(120); S.colors_output_dest = ImGui.Combo("##output_type", S.colors_output_dest, "To Clipboard\0To TTY\0")
+                    ImGui.SameLine(); _, S.output_only_modified = ImGui.Checkbox("Only Modified Colors", S.output_only_modified)
+
+                    if S.filter == nil then S.filter = G.ImGuiTextFilter() end
+                    ImGui.SetNextItemWidth(ImGui.GetFontSize() * 16)
+                    S.filter:Draw("Filter colors")
+
+                    local CEF = G.ImGuiColorEditFlags
+                    if S.alpha_flags == nil then S.alpha_flags = CEF.AlphaPreviewHalf end
+                    if ImGui.RadioButtonEx("Opaque", S.alpha_flags == CEF.AlphaOpaque) then S.alpha_flags = CEF.AlphaOpaque end; ImGui.SameLine()
+                    if ImGui.RadioButtonEx("Alpha", S.alpha_flags == CEF.None) then S.alpha_flags = CEF.None end; ImGui.SameLine()
+                    if ImGui.RadioButtonEx("Both", S.alpha_flags == CEF.AlphaPreviewHalf) then S.alpha_flags = CEF.AlphaPreviewHalf end; ImGui.SameLine()
+                    HelpMarker("In the color list:\n" ..
+                               "Left-click on colored square to open color picker,\n" ..
+                               "Right-click to open edit options menu.")
+                    ImGui.Separator()
+                    ImGui.PushItemWidth(-160)
+                    for i = 0, ImPlotCol.COUNT - 1 do
+                        local name = ImPlot.GetStyleColorName(i)
+                        if S.filter:PassFilter(name) then
+                            ImGui.PushID(i)
+                            local temp = internal.GetStyleColorVec4(i)
+                            temp = ImVec4(temp.x, temp.y, temp.z, temp.w)
+                            local is_auto = internal.IsColorAuto(i)
+                            if not is_auto then ImGui.PushStyleVar(G.ImGuiStyleVar.Alpha, 0.25) end
+                            if ImGui.Button("Auto") then
+                                if is_auto then
+                                    style.Colors[i] = temp
+                                else
+                                    style.Colors[i] = ImPlot.IMPLOT_AUTO_COL()
+                                end
+                                internal.BustItemCache()
+                            end
+                            if not is_auto then ImGui.PopStyleVar() end
+                            ImGui.SameLine()
+                            if ImGui.ColorEdit4(name, temp, bit32.bor(CEF.NoInputs, S.alpha_flags)) then
+                                style.Colors[i] = temp
+                                internal.BustItemCache()
+                            end
+                            if ColorsDiffer(style.Colors[i], ref.Colors[i]) then
+                                ImGui.SameLine(175)
+                                if ImGui.Button("Save") then
+                                    local c = style.Colors[i]
+                                    ref.Colors[i] = ImVec4(c.x, c.y, c.z, c.w)
+                                end
+                                ImGui.SameLine()
+                                if ImGui.Button("Revert") then
+                                    local c = ref.Colors[i]
+                                    style.Colors[i] = ImVec4(c.x, c.y, c.z, c.w)
+                                    internal.BustItemCache()
+                                end
+                            end
+                            ImGui.PopID()
+                        end
+                    end
+                    ImGui.PopItemWidth()
+                    ImGui.Separator()
+                    ImGui.Text("Colors that are set to Auto (i.e. IMPLOT_AUTO_COL) will\n" ..
+                               "be automatically deduced from your ImGui style.")
+                    ImGui.EndTabItem()
+                end
+                if ImGui.BeginTabItem("Colormaps") then
+                    if ImGui.Button("Export", ImVec2(75, 0)) then
+                        if S.cmap_output_dest == 0 then ImGui.LogToClipboard() else ImGui.LogToTTY() end
+                        local size = ImPlot.GetColormapSize()
+                        local name = ImPlot.GetColormapName(gp.Style.Colormap)
+                        ImGui.LogText("static const ImU32 %s_Data[%d] = {\n", name, size)
+                        for i = 0, size - 1 do
+                            local col = ImPlot.GetColormapColorU32(i, gp.Style.Colormap)
+                            ImGui.LogText("    %d%s\n", col, i == size - 1 and "" or ",")
+                        end
+                        ImGui.LogText("};\nImPlotColormap %s = ImPlot::AddColormap(\"%s\", %s_Data, %d);", name, name, name, size)
+                        ImGui.LogFinish()
+                    end
+                    ImGui.SameLine(); ImGui.SetNextItemWidth(120); S.cmap_output_dest = ImGui.Combo("##output_type", S.cmap_output_dest, "To Clipboard\0To TTY\0")
+                    ImGui.SameLine()
+                    _, S.edit = ImGui.Checkbox("Edit Mode", S.edit)
+
+                    -- built-in/added
+                    ImGui.Separator()
+                    for i = 0, gp.ColormapData.Count - 1 do
+                        ImGui.PushID(i)
+                        local size = gp.ColormapData:GetKeyCount(i)
+                        local selected = i == gp.Style.Colormap
+                        local name = ImPlot.GetColormapName(i)
+                        if not selected then ImGui.PushStyleVar(G.ImGuiStyleVar.Alpha, 0.25) end
+                        if ImGui.Button(name, ImVec2(100, 0)) then
+                            gp.Style.Colormap = i
+                            internal.BustItemCache()
+                        end
+                        if not selected then ImGui.PopStyleVar() end
+                        ImGui.SameLine()
+                        ImGui.BeginGroup()
+                        if S.edit then
+                            for c = 0, size - 1 do
+                                ImGui.PushID(c)
+                                local col4 = ImGui.ColorConvertU32ToFloat4(gp.ColormapData:GetKeyColor(i, c))
+                                if ImGui.ColorEdit4("", col4, G.ImGuiColorEditFlags.NoInputs) then
+                                    gp.ColormapData:SetKeyColor(i, c, ImGui.ColorConvertFloat4ToU32(col4))
+                                    internal.BustItemCache()
+                                end
+                                if (c + 1) % 12 ~= 0 and c ~= size - 1 then ImGui.SameLine() end
+                                ImGui.PopID()
+                            end
+                        else
+                            if ImPlot.ColormapButton("##", ImVec2(-1, 0), i) then
+                                S.edit = true
+                            end
+                        end
+                        ImGui.EndGroup()
+                        ImGui.PopID()
+                    end
+                    -- [Port] TODO: custom colormap builder (needs AddColormap)
+                    ImGui.EndTabItem()
+                end
+                ImGui.EndTabBar()
+            end
+        end
+
+        function ImPlot.ShowUserGuide()
+            ImGui.BulletText("Left-click drag within the plot area to pan X and Y axes.")
+            ImGui.Indent()
+            ImGui.BulletText("Left-click drag on axis labels to pan an individual axis.")
+            ImGui.Unindent()
+            ImGui.BulletText("Scroll in the plot area to zoom both X and Y axes.")
+            ImGui.Indent()
+            ImGui.BulletText("Scroll on axis labels to zoom an individual axis.")
+            ImGui.Unindent()
+            ImGui.BulletText("Right-click drag to box select data.")
+            ImGui.Indent()
+            ImGui.BulletText("Hold Alt to expand box selection horizontally.")
+            ImGui.BulletText("Hold Shift to expand box selection vertically.")
+            ImGui.BulletText("Left-click while box selecting to cancel the selection.")
+            ImGui.Unindent()
+            ImGui.BulletText("Double left-click to fit all visible data.")
+            ImGui.Indent()
+            ImGui.BulletText("Double left-click axis labels to fit the individual axis.")
+            ImGui.Unindent()
+            ImGui.BulletText("Right-click open the full plot context menu.")
+            ImGui.Indent()
+            ImGui.BulletText("Right-click axis labels to open an individual axis context menu.")
+            ImGui.Unindent()
+            ImGui.BulletText("Click legend label icons to show/hide plot items.")
         end
     end
 
