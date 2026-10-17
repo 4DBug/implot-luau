@@ -874,6 +874,8 @@ return function(G)
                 CurrentAlignmentV = nil,
                 -- Temp data for general use
                 OpenContextThisFrame = false,
+                DigitalPlotItemCnt = 0,
+                DigitalPlotOffset = 0,
                 -- [Port] TODO: Annotations, Tags, Subplots (later milestones)
                 -- [Port] ctor resolved lazily (defined in the items section)
                 NextItemData = nil,
@@ -1751,6 +1753,9 @@ return function(G)
             ctx.NextItemData:Reset()
             ctx.NextPlotData:Reset()
             ctx.OpenContextThisFrame = false
+            -- reset digital plot items count
+            ctx.DigitalPlotItemCnt = 0
+            ctx.DigitalPlotOffset = 0
             -- nullify plot
             ctx.CurrentPlot  = nil
             ctx.CurrentItem  = nil
@@ -4835,6 +4840,476 @@ return function(G)
                         local slice = { Indexer = indexer, Base = i * group_count, At = SliceAt }
                         PlotBarsIdx(label_ids[i + 1], slice, group_count, subsize, subshift + shift, spec_bars)
                     end
+                end
+            end
+        end
+
+        -----------------------------------------------------------------------
+        -- PlotBubbles, PlotErrorBars, PlotStems, PlotInfLines, PlotDigital, PlotText, PlotDummy
+        -----------------------------------------------------------------------
+        do
+            local ImPlotErrorBarsFlags = ImPlot.ImPlotErrorBarsFlags
+            local ImPlotStemsFlags = ImPlot.ImPlotStemsFlags
+            local ImPlotInfLinesFlags = ImPlot.ImPlotInfLinesFlags
+            local ImPlotTextFlags = ImPlot.ImPlotTextFlags
+            local SetupLock, AddLineH, AddLineV = internal.SetupLock, internal.AddLineH, internal.AddLineV
+            local ImNanOrInf = internal.ImNanOrInf
+            local DBL_MAX = 1.7976931348623157e308
+            -- [Port] ImConstrainNan(ImConstrainInf(v)) inlined (the helpers are local to the Utils section)
+            local function ImConstrainNanInf(val)
+                if val ~= val then return 0 end
+                return math.clamp(val, -DBL_MAX, DBL_MAX)
+            end
+
+            local function IsArray(t)
+                return type(t) == "table" and getmetatable(t) ~= SpecMT and (t[1] ~= nil or next(t) == nil)
+            end
+
+            -- [Port] IndexerAdd<I1,I2>(i1, i2, s1, s2)
+            local function AddAt(self, i) local a, b = self.Indexer1, self.Indexer2; return self.Scale1 * a.At(a, i) + self.Scale2 * b.At(b, i) end
+            function internal.IndexerAdd(i1, i2, s1, s2) return { Indexer1 = i1, Indexer2 = i2, Scale1 = s1, Scale2 = s2, At = AddAt } end
+
+            -- [Port] GetterXYZ: Get returns (x, y, z)
+            local function XYZGet(self, i)
+                local ix, iy, iz = self.IndexerX, self.IndexerY, self.IndexerZ
+                return ix.At(ix, i), iy.At(iy, i), iz.At(iz, i)
+            end
+            function internal.GetterXYZ(ix, iy, iz, count) return { IndexerX = ix, IndexerY = iy, IndexerZ = iz, Count = count, Get = XYZGet } end
+
+            local function FitterBubbles1Fit(self, x_axis, y_axis)
+                local g = self.Getter
+                for i = 0, g.Count - 1 do
+                    local x, y, half_size = g.Get(g, i)
+                    -- Fit left and right edges
+                    x_axis:ExtendFitWith(y_axis, x - half_size, y)
+                    x_axis:ExtendFitWith(y_axis, x + half_size, y)
+                    -- Fit top and bottom edges
+                    y_axis:ExtendFitWith(x_axis, y - half_size, x)
+                    y_axis:ExtendFitWith(x_axis, y + half_size, x)
+                end
+            end
+            function internal.FitterBubbles1(getter) return { Getter = getter, Fit = FitterBubbles1Fit } end
+
+            -------------------------------------------------------------------
+            -- PlotBubbles
+            -------------------------------------------------------------------
+
+            -- [Port] RendererCircleFill/RendererCircleLine reserve 64 segments and PrimUnreserve the rest mid-batch;
+            -- here each visible bubble reserves exactly what it uses instead (same output, no write-ptr rewind).
+            local circle_state = {}
+            @native
+            local function RenderCircles(getter, line, cols, col, alpha, weight)
+                UseCurrentTransformer()
+                local plot = GImPlot.CurrentPlot
+                local dl, cr = internal.GetPlotDrawList(), plot.PlotRect
+                local m = plot.Axes[plot.CurrentX].ScaleToPixel
+                local r = SetColors(circle_state, cols, getter.Count, col, alpha)
+                local hw, u0, v0, u1, v1
+                if line then
+                    hw, u0, v0, u1, v1 = GetLineRenderProps(dl, max(1.0, weight) * 0.5)
+                else
+                    local uv = dl._Data.TexUvWhitePixel
+                    u0, v0 = uv.x, uv.y
+                end
+                local a_max = math.pi * 2.0
+                for prim = 0, getter.Count - 1 do
+                    local x, y, rad = getter.Get(getter, prim)
+                    -- Compute approximate radius in pixels for LOD
+                    local num_segments = G.ImClamp(floor(math.abs(rad * m)), 10, 64)
+                    -- Compute bounding box of the bubble in pixel coordinates (handle axis inversion)
+                    local p1x, p1y = TransformX(x - rad), TransformY(y - rad)
+                    local p2x, p2y = TransformX(x + rad), TransformY(y + rad)
+                    if Overlaps(cr, p1x, p1y, p2x, p2y) then
+                        local c = GetCol(r, prim)
+                        local a_step = a_max / num_segments
+                        if line then
+                            dl:PrimReserve(num_segments * 6, num_segments * 4)
+                            local qx, qy = TransformX(x + rad), TransformY(y)
+                            for i = 1, num_segments do
+                                local a = a_step * (i % num_segments)
+                                local nx, ny = TransformX(x + math.cos(a) * rad), TransformY(y + math.sin(a) * rad)
+                                PrimLine(dl, qx, qy, nx, ny, hw, c, u0, v0, u1, v1)
+                                qx, qy = nx, ny
+                            end
+                        else
+                            dl:PrimReserve((num_segments - 2) * 3, num_segments)
+                            local b = dl.VtxBuffer.Buf
+                            local vw = dl._VtxWritePtr
+                            local o = (vw - 1) * VTX_STRIDE
+                            for i = 0, num_segments - 1 do
+                                local a = a_step * i
+                                WV(b, o + i * VTX_STRIDE, TransformX(x + math.cos(a) * rad), TransformY(y + math.sin(a) * rad), u0, v0, c)
+                            end
+                            local vtx_base = dl._VtxCurrentIdx
+                            local id, iw = dl.IdxBuffer.Data, dl._IdxWritePtr
+                            for i = 2, num_segments - 1 do
+                                id[iw] = vtx_base; id[iw + 1] = vtx_base + i - 1; id[iw + 2] = vtx_base + i
+                                iw += 3
+                            end
+                            dl._VtxWritePtr = vw + num_segments; dl._IdxWritePtr = iw; dl._VtxCurrentIdx = vtx_base + num_segments
+                        end
+                    end
+                end
+            end
+
+            function internal.PlotBubblesEx(label_id, getter, spec)
+                if BeginItemEx(label_id, internal.FitterBubbles1(getter), spec, spec.FillColor, spec.Marker) then
+                    if getter.Count <= 0 then
+                        EndItem()
+                        return
+                    end
+                    local s = GetItemData()
+                    local sp = s.Spec
+                    if s.RenderFill then
+                        RenderCircles(getter, false, sp.FillColors, ImGui.GetColorU32(sp.FillColor), sp.FillColors and sp.FillAlpha or 1)
+                    end
+                    if s.RenderLine then
+                        RenderCircles(getter, true, sp.LineColors, ImGui.GetColorU32(sp.LineColor), 1, sp.LineWeight)
+                    end
+                    EndItem()
+                end
+            end
+
+            -- [Port] overloads dispatched on argument types:
+            --   PlotBubbles(label_id, values, szs, count?, xscale = 1, x0 = 0, spec?)
+            --   PlotBubbles(label_id, xs, ys, szs, count?, spec?)
+            function ImPlot.PlotBubbles(label_id, a, b, c, d, e, f)
+                if IsArray(c) then
+                    local count, sp = d, e
+                    if type(count) == "table" then sp, count = count, nil end
+                    count = count or min(#a, #b, #c)
+                    local spec = ResolveSpec(sp)
+                    internal.PlotBubblesEx(label_id, internal.GetterXYZ(internal.IndexerIdx(a, count, spec.Offset, spec.Stride),
+                        internal.IndexerIdx(b, count, spec.Offset, spec.Stride), internal.IndexerIdx(c, count, spec.Offset, spec.Stride), count), spec)
+                else
+                    local count, xscale, x0, sp = c, d, e, f
+                    if type(count) == "table" then sp, count, xscale, x0 = count, nil, nil, nil
+                    elseif type(xscale) == "table" then sp, xscale, x0 = xscale, nil, nil
+                    elseif type(x0) == "table" then sp, x0 = x0, nil end
+                    count = count or min(#a, #b)
+                    local spec = ResolveSpec(sp)
+                    internal.PlotBubblesEx(label_id, internal.GetterXYZ(internal.IndexerLin(xscale or 1, x0 or 0),
+                        internal.IndexerIdx(a, count, spec.Offset, spec.Stride), internal.IndexerIdx(b, count, spec.Offset, spec.Stride), count), spec)
+                end
+            end
+
+            -------------------------------------------------------------------
+            -- PlotErrorBars
+            -------------------------------------------------------------------
+
+            -- [Port] PlotErrorBarsVEx/PlotErrorBarsHEx merged; horz selects vertical whiskers
+            local function PlotErrorBarsEx(label_id, getter_pos, getter_neg, spec, horz)
+                if BeginItemEx(label_id, internal.Fitter2(getter_pos, getter_neg), spec, IMPLOT_AUTO_COL()) then
+                    if getter_pos.Count <= 0 or getter_neg.Count <= 0 then
+                        EndItem()
+                        return
+                    end
+                    local s = GetItemData()
+                    local sp = s.Spec
+                    local draw_list = internal.GetPlotDrawList()
+                    local col
+                    if IsColorAuto(spec.LineColor) then col = ImGui.GetColorU32(ImGui.GetStyleColorVec4(G.ImGuiCol.Text)) else col = ImGui.GetColorU32(sp.LineColor) end
+                    local rend_whisker = sp.Size > 0
+                    local half_whisker = sp.Size * 0.5
+                    local weight = sp.LineWeight
+                    local plot = GImPlot.CurrentPlot
+                    local x_axis, y_axis = plot.Axes[plot.CurrentX], plot.Axes[plot.CurrentY]
+                    local p1, p2 = ImVec2(0, 0), ImVec2(0, 0)
+                    for i = 0, getter_pos.Count - 1 do
+                        local nx, ny = getter_neg.Get(getter_neg, i)
+                        local px, py = getter_pos.Get(getter_pos, i)
+                        p1.x, p1.y = x_axis:PlotToPixels(nx), y_axis:PlotToPixels(ny)
+                        p2.x, p2.y = x_axis:PlotToPixels(px), y_axis:PlotToPixels(py)
+                        draw_list:AddLine(p1, p2, col, weight)
+                        if rend_whisker then
+                            if horz then
+                                AddLineV(draw_list, p1.x, p1.y - half_whisker, p1.y + half_whisker, col, weight)
+                                AddLineV(draw_list, p2.x, p2.y - half_whisker, p2.y + half_whisker, col, weight)
+                            else
+                                AddLineH(draw_list, p1.x - half_whisker, p1.x + half_whisker, p1.y, col, weight)
+                                AddLineH(draw_list, p2.x - half_whisker, p2.x + half_whisker, p2.y, col, weight)
+                            end
+                        end
+                    end
+                    EndItem()
+                end
+            end
+            function internal.PlotErrorBarsVEx(label_id, getter_pos, getter_neg, spec) PlotErrorBarsEx(label_id, getter_pos, getter_neg, spec, false) end
+            function internal.PlotErrorBarsHEx(label_id, getter_pos, getter_neg, spec) PlotErrorBarsEx(label_id, getter_pos, getter_neg, spec, true) end
+
+            -- [Port] overloads dispatched on argument types:
+            --   PlotErrorBars(label_id, xs, ys, err, count?, spec?)
+            --   PlotErrorBars(label_id, xs, ys, neg, pos, count?, spec?)
+            function ImPlot.PlotErrorBars(label_id, xs, ys, neg, pos, count, sp)
+                if not IsArray(pos) then
+                    count, sp = pos, count
+                    pos = neg
+                end
+                if type(count) == "table" then sp, count = count, nil end
+                count = count or min(#xs, #ys, #neg, #pos)
+                local spec = ResolveSpec(sp)
+                local indexer_x = internal.IndexerIdx(xs, count, spec.Offset, spec.Stride)
+                local indexer_y = internal.IndexerIdx(ys, count, spec.Offset, spec.Stride)
+                local indexer_n = internal.IndexerIdx(neg, count, spec.Offset, spec.Stride)
+                local indexer_p = internal.IndexerIdx(pos, count, spec.Offset, spec.Stride)
+                if ImHasFlag(spec.Flags, ImPlotErrorBarsFlags.Horizontal) then
+                    local getter_p = internal.GetterXY(internal.IndexerAdd(indexer_x, indexer_p, 1, 1), indexer_y, count)
+                    local getter_n = internal.GetterXY(internal.IndexerAdd(indexer_x, indexer_n, 1, -1), indexer_y, count)
+                    PlotErrorBarsEx(label_id, getter_p, getter_n, spec, true)
+                else
+                    local getter_p = internal.GetterXY(indexer_x, internal.IndexerAdd(indexer_y, indexer_p, 1, 1), count)
+                    local getter_n = internal.GetterXY(indexer_x, internal.IndexerAdd(indexer_y, indexer_n, 1, -1), count)
+                    PlotErrorBarsEx(label_id, getter_p, getter_n, spec, false)
+                end
+            end
+
+            -------------------------------------------------------------------
+            -- PlotStems
+            -------------------------------------------------------------------
+
+            function internal.PlotStemsEx(label_id, getter_mark, getter_base, spec)
+                if BeginItemEx(label_id, internal.Fitter2(getter_mark, getter_base), spec, spec.LineColor, spec.Marker) then
+                    if getter_mark.Count <= 0 or getter_base.Count <= 0 then
+                        EndItem()
+                        return
+                    end
+                    local s = GetItemData()
+                    local sp = s.Spec
+                    -- render stems
+                    if s.RenderLine then
+                        UseCurrentTransformer()
+                        Render(internal.RendererLineSegments2(getter_mark, getter_base, sp.LineWeight), sp.LineColors, getter_mark.Count, ImGui.GetColorU32(sp.LineColor), 1)
+                    end
+                    -- render markers
+                    if s.RenderMarkers then
+                        PopPlotClipRect()
+                        PushPlotClipRect(sp.MarkerSize)
+                        internal.RenderColoredMarkers(getter_mark, s)
+                    end
+                    EndItem()
+                end
+            end
+
+            -- [Port] overloads dispatched on argument types:
+            --   PlotStems(label_id, values, count?, ref = 0, scale = 1, start = 0, spec?)
+            --   PlotStems(label_id, xs, ys, count?, ref = 0, spec?)
+            function ImPlot.PlotStems(label_id, a, b, c, d, e, f)
+                if IsArray(b) then
+                    local count, ref, sp = c, d, e
+                    if type(count) == "table" then sp, count, ref = count, nil, nil
+                    elseif type(ref) == "table" then sp, ref = ref, nil end
+                    count = count or min(#a, #b)
+                    local spec = ResolveSpec(sp)
+                    local ix = internal.IndexerIdx(a, count, spec.Offset, spec.Stride)
+                    local iy = internal.IndexerIdx(b, count, spec.Offset, spec.Stride)
+                    local iref = internal.IndexerConst(ref or 0)
+                    if ImHasFlag(spec.Flags, ImPlotStemsFlags.Horizontal) then
+                        internal.PlotStemsEx(label_id, internal.GetterXY(ix, iy, count), internal.GetterXY(iref, iy, count), spec)
+                    else
+                        internal.PlotStemsEx(label_id, internal.GetterXY(ix, iy, count), internal.GetterXY(ix, iref, count), spec)
+                    end
+                else
+                    local count, ref, scale, start, sp = b, c, d, e, f
+                    if type(count) == "table" then sp, count, ref, scale, start = count, nil, nil, nil, nil
+                    elseif type(ref) == "table" then sp, ref, scale, start = ref, nil, nil, nil
+                    elseif type(scale) == "table" then sp, scale, start = scale, nil, nil
+                    elseif type(start) == "table" then sp, start = start, nil end
+                    count = count or #a
+                    local spec = ResolveSpec(sp)
+                    local iv = internal.IndexerIdx(a, count, spec.Offset, spec.Stride)
+                    local lin = internal.IndexerLin(scale or 1, start or 0)
+                    local iref = internal.IndexerConst(ref or 0)
+                    if ImHasFlag(spec.Flags, ImPlotStemsFlags.Horizontal) then
+                        internal.PlotStemsEx(label_id, internal.GetterXY(iv, lin, count), internal.GetterXY(iref, lin, count), spec)
+                    else
+                        internal.PlotStemsEx(label_id, internal.GetterXY(lin, iv, count), internal.GetterXY(lin, iref, count), spec)
+                    end
+                end
+            end
+
+            -------------------------------------------------------------------
+            -- PlotInfLines
+            -------------------------------------------------------------------
+
+            -- [Port] the horizontal/vertical branches differ only in getters + fitter; merged
+            function ImPlot.PlotInfLines(label_id, values, count, sp)
+                if type(count) == "table" then sp, count = count, nil end
+                count = count or #values
+                local spec = ResolveSpec(sp)
+                local lims = ImPlot.GetPlotLimits(IMPLOT_AUTO, IMPLOT_AUTO)
+                local iv = internal.IndexerIdx(values, count, spec.Offset, spec.Stride)
+                local getter_min, getter_max, fitter
+                if ImHasFlag(spec.Flags, ImPlotInfLinesFlags.Horizontal) then
+                    getter_min = internal.GetterXY(internal.IndexerConst(lims.X.Min), iv, count)
+                    getter_max = internal.GetterXY(internal.IndexerConst(lims.X.Max), iv, count)
+                    fitter = internal.FitterY(getter_min)
+                else
+                    getter_min = internal.GetterXY(iv, internal.IndexerConst(lims.Y.Min), count)
+                    getter_max = internal.GetterXY(iv, internal.IndexerConst(lims.Y.Max), count)
+                    fitter = internal.FitterX(getter_min)
+                end
+                if BeginItemEx(label_id, fitter, spec, spec.LineColor) then
+                    if count <= 0 then
+                        EndItem()
+                        return
+                    end
+                    local s = GetItemData()
+                    local sp_ = s.Spec
+                    if s.RenderLine then
+                        UseCurrentTransformer()
+                        Render(internal.RendererLineSegments2(getter_min, getter_max, sp_.LineWeight), sp_.LineColors, count, ImGui.GetColorU32(sp_.LineColor), 1)
+                    end
+                    EndItem()
+                end
+            end
+
+            -------------------------------------------------------------------
+            -- PlotDigital
+            -------------------------------------------------------------------
+
+            -- TODO: Make this behave like all the other plot types (.e. not fixed in y axis)
+            -- TODO: Currently broken if x or y axis is inverted! (what should happen in this case, anyway?)
+            local digital_min, digital_max = ImVec2(0, 0), ImVec2(0, 0)
+            function internal.PlotDigitalEx(label_id, getter, spec)
+                if BeginItem(label_id, spec, spec.FillColor) then
+                    local gp = GImPlot
+                    local draw_list = internal.GetPlotDrawList()
+                    local s = GetItemData()
+                    if getter.Count > 1 and s.RenderFill then
+                        local plot   = gp.CurrentPlot
+                        local x_axis = plot.Axes[plot.CurrentX]
+                        local y_axis = plot.Axes[plot.CurrentY]
+                        local pr     = plot.PlotRect
+                        local col    = ImGui.GetColorU32(s.Spec.FillColor)
+                        local size   = s.Spec.Size
+                        local pMin, pMax = digital_min, digital_max
+
+                        local pixYMax = 0
+                        local x1, y1 = getter.Get(getter, 0)
+                        local i = 0
+                        while i < getter.Count do
+                            local x2, y2 = getter.Get(getter, i)
+                            if ImNanOrInf(y1) then
+                                x1, y1 = x2, y2
+                            else
+                                if ImNanOrInf(y2) then
+                                    y2 = ImConstrainNanInf(y2)
+                                end
+                                local pixY_0 = floor(s.Spec.LineWeight)
+                                y1 = max(0.0, y1)
+                                local pixY_1 = size * y1
+                                local pixY_chPosOffset = floor(max(size, pixY_1) + gp.Style.DigitalSpacing)
+                                pixYMax = max(pixYMax, pixY_chPosOffset)
+                                pMin.x = x_axis:PlotToPixels(x1)
+                                pMax.x = x_axis:PlotToPixels(x2)
+                                local pixY_Offset = floor(gp.Style.DigitalPadding)
+                                local y_ref
+                                if y_axis:IsInverted() then y_ref = y_axis.PixelMax else y_ref = y_axis.PixelMin end
+                                pMin.y = y_ref - (gp.DigitalPlotOffset + pixY_Offset)
+                                pMax.y = y_ref - (gp.DigitalPlotOffset + pixY_0 + floor(pixY_1) + pixY_Offset)
+                                --plot only one rectangle for same digital state
+                                while (i + 2) < getter.Count and y1 == y2 do
+                                    local in_ = i + 1
+                                    x2, y2 = getter.Get(getter, in_)
+                                    if ImNanOrInf(y2) then break end
+                                    pMax.x = x_axis:PlotToPixels(x2)
+                                    i += 1
+                                end
+                                -- do not extend plot outside plot range
+                                local lo, hi
+                                if not x_axis:IsInverted() then lo, hi = x_axis.PixelMin, x_axis.PixelMax - 1 else lo, hi = x_axis.PixelMax, x_axis.PixelMin - 1 end
+                                pMin.x = G.ImClamp(pMin.x, lo, hi)
+                                pMax.x = G.ImClamp(pMax.x, lo, hi)
+                                --plot a rectangle that extends up to x2 with y1 height
+                                if pr:Contains(pMin) or pr:Contains(pMax) then
+                                    draw_list:AddRectFilled(pMin, pMax, col)
+                                end
+                                x1, y1 = x2, y2
+                            end
+                            i += 1
+                        end
+                        gp.DigitalPlotItemCnt += 1
+                        gp.DigitalPlotOffset += pixYMax
+                    end
+                    EndItem()
+                end
+            end
+
+            function ImPlot.PlotDigital(label_id, xs, ys, count, sp)
+                if type(count) == "table" then sp, count = count, nil end
+                count = count or min(#xs, #ys)
+                local spec = ResolveSpec(sp)
+                internal.PlotDigitalEx(label_id, internal.GetterXY(internal.IndexerIdx(xs, count, spec.Offset, spec.Stride), internal.IndexerIdx(ys, count, spec.Offset, spec.Stride), count), spec)
+            end
+
+            -- custom
+            function ImPlot.PlotDigitalG(label_id, getter_func, data, count, spec)
+                internal.PlotDigitalEx(label_id, internal.GetterFuncPtr(getter_func, data, count), ResolveSpec(spec))
+            end
+
+            -------------------------------------------------------------------
+            -- PlotText
+            -------------------------------------------------------------------
+
+            local function FitPoint(x, y)
+                local plot = GImPlot.CurrentPlot
+                local x_axis, y_axis = plot.Axes[plot.CurrentX], plot.Axes[plot.CurrentY]
+                x_axis:ExtendFitWith(y_axis, x, y)
+                y_axis:ExtendFitWith(x_axis, y, x)
+            end
+            local function FitPixel(px, py)
+                local plot = GImPlot.CurrentPlot
+                FitPoint(plot.Axes[plot.CurrentX]:PixelsToPlot(px), plot.Axes[plot.CurrentY]:PixelsToPlot(py))
+            end
+
+            -- PlotText(text, x, y, pixel_offset?, spec?)
+            function ImPlot.PlotText(text, x, y, pixel_offset, sp)
+                IM_ASSERT(GImPlot.CurrentPlot ~= nil, "PlotText() needs to be called between BeginPlot() and EndPlot()!")
+                if type(pixel_offset) == "table" and pixel_offset.x == nil then sp, pixel_offset = pixel_offset, nil end
+                local offx, offy = 0, 0
+                if pixel_offset ~= nil then offx, offy = pixel_offset.x, pixel_offset.y end
+                local spec = ResolveSpec(sp)
+                SetupLock()
+                local draw_list = internal.GetPlotDrawList()
+                PushPlotClipRect()
+                local colTxt = GetStyleColorU32(ImPlotCol.InlayText)
+                local plot = GImPlot.CurrentPlot
+                local fit = plot.FitThisFrame and not ImHasFlag(spec.Flags, ImPlotItemFlags.NoFit)
+                local px, py = plot.Axes[plot.CurrentX]:PlotToPixels(x), plot.Axes[plot.CurrentY]:PlotToPixels(y)
+                if ImHasFlag(spec.Flags, ImPlotTextFlags.Vertical) then
+                    local siz = internal.CalcTextSizeVertical(text)
+                    local sizx, sizy = siz.x * 0.5, siz.y * 0.5
+                    local posx, posy = px - sizx * 0.5 + offx, py + sizy * 0.5 + offy
+                    if fit then
+                        FitPixel(posx, posy)
+                        FitPixel(posx + sizx, posy - sizy)
+                    end
+                    internal.AddTextVertical(draw_list, ImVec2(posx, posy), colTxt, text)
+                else
+                    local siz = ImGui.CalcTextSize(text)
+                    local posx, posy = px - siz.x * 0.5 + offx, py - siz.y * 0.5 + offy
+                    if fit then
+                        FitPixel(posx, posy)
+                        FitPixel(posx + siz.x, posy + siz.y)
+                    end
+                    draw_list:AddText(nil, 0.0, ImVec2(posx, posy), colTxt, text, 1, #text + 1)
+                end
+                PopPlotClipRect()
+            end
+
+            -------------------------------------------------------------------
+            -- PlotDummy
+            -------------------------------------------------------------------
+
+            function ImPlot.PlotDummy(label_id, sp)
+                local spec = ResolveSpec(sp)
+                -- Pick the first non-auto color from the spec to override the legend icon color
+                local item_col = spec.LineColor
+                if IsColorAuto(item_col) then item_col = spec.FillColor end
+                if IsColorAuto(item_col) then item_col = spec.MarkerLineColor end
+                if IsColorAuto(item_col) then item_col = spec.MarkerFillColor end
+                if BeginItem(label_id, spec, item_col, spec.Marker) then
+                    EndItem()
                 end
             end
         end
