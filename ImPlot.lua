@@ -877,7 +877,10 @@ return function(G)
                 OpenContextThisFrame = false,
                 DigitalPlotItemCnt = 0,
                 DigitalPlotOffset = 0,
-                -- [Port] TODO: Annotations, Tags, Subplots (later milestones)
+                -- [Port] ImPlotAnnotationCollection / ImPlotTagCollection: plain arrays of records with the text stored inline
+                Annotations = {},
+                Tags = {},
+                -- [Port] TODO: Subplots (later milestones)
                 -- [Port] ctor resolved lazily (defined in the items section)
                 NextItemData = nil,
                 NextPlotData = internal.ImPlotNextPlotData(),
@@ -2441,7 +2444,9 @@ return function(G)
         end
 
         function internal.ResetCtxForNextPlot(ctx)
-            -- [Port] TODO: Annotations/Tags/digital counters (later milestones)
+            -- reset annotations
+            table.clear(ctx.Annotations)
+            table.clear(ctx.Tags)
             -- reset legend items
             ctx.NextItemData:Reset()
             ctx.NextPlotData:Reset()
@@ -3389,7 +3394,13 @@ return function(G)
             axis.ConstraintZoom.Max = z_max
         end
 
-        -- [Port] TODO: SetupMouseText
+        function ImPlot.SetupMouseText(location, flags)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil and not gp.CurrentPlot.SetupLocked,
+                "Setup needs to be called after BeginPlot and before any setup locking functions (e.g. PlotX)!")
+            gp.CurrentPlot.MouseTextLocation = location
+            gp.CurrentPlot.MouseTextFlags = flags or ImPlot.ImPlotMouseTextFlags.None
+        end
 
         function ImPlot.SetupAxes(x_label, y_label, x_flags, y_flags)
             ImPlot.SetupAxis(ImAxis.X1, x_label, x_flags)
@@ -3814,6 +3825,56 @@ return function(G)
         end
         local SetupLock = internal.SetupLock
 
+        local function AxisPrecision(axis)
+            local ticker = axis.Ticker
+            local range
+            if ticker:TickCount() > 1 then
+                range = ticker.Ticks[2].PlotPos - ticker.Ticks[1].PlotPos
+            else
+                range = axis.Range:Size()
+            end
+            -- Precision(range)
+            local order = 0
+            if range ~= 0 then order = math.floor(math.log10(math.abs(range))) end
+            if order > 0 then return 0 end
+            return 1 - order
+        end
+
+        local function RoundAxisValue(axis, value)
+            local p = 10 ^ AxisPrecision(axis)
+            return math.floor(value * p + 0.5) / p
+        end
+
+        -- [Port] returns the label string instead of writing into buff
+        function internal.LabelAxisValue(axis, value, round)
+            local gp = GImPlot
+            -- TODO: We shouldn't explicitly check that the axis is Time here. Ideally,
+            -- Formatter_Time would handle the formatting for us, but the code below
+            -- needs additional arguments which are not currently available in ImPlotFormatter
+            if axis.Locator == internal.Locator_Time then
+                local unit
+                if axis.Vertical then
+                    unit = internal.GetUnitForRange(axis.Range:Size() / (gp.CurrentPlot.PlotRect:GetHeight() / 100)) -- TODO: magic value!
+                else
+                    unit = internal.GetUnitForRange(axis.Range:Size() / (gp.CurrentPlot.PlotRect:GetWidth() / 100)) -- TODO: magic value!
+                end
+                return internal.FormatDateTime(internal.ImPlotTimeFromDouble(value), internal.GetDateTimeFmt(internal.TimeFormatMouseCursor, unit))
+            end
+            if round then
+                value = RoundAxisValue(axis, value)
+            end
+            return axis.Formatter(value, axis.FormatterData)
+        end
+        local LabelAxisValue = internal.LabelAxisValue
+
+        local function ClampLabelPos(pos, size, Min, Max)
+            if pos.x < Min.x then pos.x = Min.x end
+            if pos.y < Min.y then pos.y = Min.y end
+            if (pos.x + size.x) > Max.x then pos.x = Max.x - size.x end
+            if (pos.y + size.y) > Max.y then pos.y = Max.y - size.y end
+            return pos
+        end
+
         -----------------------------------------------------------------------
         -- EndPlot()
         -----------------------------------------------------------------------
@@ -3924,7 +3985,100 @@ return function(G)
                 internal.RenderSelectionRect(DrawList, ImVec2(sr.Min.x + pr.Min.x, sr.Min.y + pr.Min.y), ImVec2(sr.Max.x + pr.Min.x, sr.Max.y + pr.Min.y), GetStyleColorVec4(ImPlotCol.Selection))
             end
 
-            -- [Port] TODO: annotations, crosshairs, mouse text, axis side switch (later milestones)
+            -- render annotations
+            internal.PushPlotClipRect()
+            for i = 1, #gp.Annotations do
+                local an       = gp.Annotations[i]
+                local txt      = an.Text
+                local txt_size = ImGui.CalcTextSize(txt)
+                local size     = ImVec2(txt_size.x + gs.AnnotationPadding.x * 2, txt_size.y + gs.AnnotationPadding.y * 2)
+                local pos      = ImVec2(an.Pos.x, an.Pos.y)
+                if an.Offset.x == 0 then
+                    pos.x -= size.x / 2
+                elseif an.Offset.x > 0 then
+                    pos.x += an.Offset.x
+                else
+                    pos.x -= size.x - an.Offset.x
+                end
+                if an.Offset.y == 0 then
+                    pos.y -= size.y / 2
+                elseif an.Offset.y > 0 then
+                    pos.y += an.Offset.y
+                else
+                    pos.y -= size.y - an.Offset.y
+                end
+                if an.Clamp then
+                    pos = ClampLabelPos(pos, size, pr.Min, pr.Max)
+                end
+                local rect = ImRect(pos.x, pos.y, pos.x + size.x, pos.y + size.y)
+                if an.Offset.x ~= 0 or an.Offset.y ~= 0 then
+                    local corners = { rect:GetTL(), rect:GetTR(), rect:GetBR(), rect:GetBL() }
+                    local min_corner = 1
+                    local min_len = math.huge
+                    for c = 1, 4 do
+                        local dx, dy = an.Pos.x - corners[c].x, an.Pos.y - corners[c].y
+                        local len = dx * dx + dy * dy
+                        if len < min_len then
+                            min_corner = c
+                            min_len = len
+                        end
+                    end
+                    DrawList:AddLine(an.Pos, corners[min_corner], an.ColorBg)
+                end
+                DrawList:AddRectFilled(rect.Min, rect.Max, an.ColorBg)
+                DrawList:AddText(SetTmp(pos.x + gs.AnnotationPadding.x, pos.y + gs.AnnotationPadding.y), an.ColorFg, txt)
+            end
+
+            -- [Port] TODO: crosshairs
+
+            -- render mouse pos
+            if not ImHasFlag(plot.Flags, ImPlotFlags.NoMouseText) and (plot.Hovered or ImHasFlag(plot.MouseTextFlags, ImPlot.ImPlotMouseTextFlags.ShowAlways)) then
+                local no_aux = ImHasFlag(plot.MouseTextFlags, ImPlot.ImPlotMouseTextFlags.NoAuxAxes)
+                local no_fmt = ImHasFlag(plot.MouseTextFlags, ImPlot.ImPlotMouseTextFlags.NoFormat)
+                local mouse_pos = ImGui.GetIO().MousePos
+                -- [Port] ImGuiTextBuffer builder -> table of string parts
+                local builder = {}
+                local num_x = IMPLOT_NUM_X_AXES
+                if no_aux then num_x = 1 end
+                for i = 0, num_x - 1 do
+                    local x_axis = plot:XAxis(i)
+                    if x_axis.Enabled then
+                        if i > 0 then table.insert(builder, ", (") end
+                        local v = x_axis:PixelsToPlot(mouse_pos.x)
+                        if no_fmt then
+                            table.insert(builder, internal.Formatter_Default(v, internal.IMPLOT_LABEL_FORMAT))
+                        else
+                            table.insert(builder, LabelAxisValue(x_axis, v, true))
+                        end
+                        if i > 0 then table.insert(builder, ")") end
+                    end
+                end
+                table.insert(builder, ", ")
+                local num_y = IMPLOT_NUM_Y_AXES
+                if no_aux then num_y = 1 end
+                for i = 0, num_y - 1 do
+                    local y_axis = plot:YAxis(i)
+                    if y_axis.Enabled then
+                        if i > 0 then table.insert(builder, ", (") end
+                        local v = y_axis:PixelsToPlot(mouse_pos.y)
+                        if no_fmt then
+                            table.insert(builder, internal.Formatter_Default(v, internal.IMPLOT_LABEL_FORMAT))
+                        else
+                            table.insert(builder, LabelAxisValue(y_axis, v, true))
+                        end
+                        if i > 0 then table.insert(builder, ")") end
+                    end
+                end
+                local str = table.concat(builder)
+                if str ~= "" then
+                    local size = ImGui.CalcTextSize(str)
+                    local pos = internal.GetLocationPos(pr, size, plot.MouseTextLocation, gs.MousePosPadding)
+                    DrawList:AddText(pos, GetStyleColorU32(ImPlotCol.InlayText), str)
+                end
+            end
+            internal.PopPlotClipRect()
+
+            -- [Port] TODO: axis side switch
 
             -- render legend
             internal.RenderPlotLegend(plot, DrawList)
@@ -3934,7 +4088,38 @@ return function(G)
                 DrawList:AddRect(pr.Min, pr.Max, GetStyleColorU32(ImPlotCol.PlotBorder), 0, gs.PlotBorderSize, G.ImDrawFlags.None)
             end
 
-            -- [Port] TODO: tags
+            -- render tags
+            for i = 1, #gp.Tags do
+                local tag  = gp.Tags[i]
+                local axis = plot.Axes[tag.Axis]
+                if axis.Enabled and axis.Range:Contains(tag.Value) then
+                    local txt = tag.Text
+                    local text_size = ImGui.CalcTextSize(txt)
+                    local size = ImVec2(text_size.x + gs.AnnotationPadding.x * 2, text_size.y + gs.AnnotationPadding.y * 2)
+                    local pos
+                    axis.Ticker:OverrideSizeLate(size)
+                    local pix = math.floor(axis:PlotToPixels(tag.Value) + 0.5) -- IM_ROUND
+                    if axis.Vertical then
+                        if axis:IsOpposite() then
+                            pos = ImVec2(axis.Datum1 + gs.LabelPadding.x, pix - size.y * 0.5)
+                            DrawList:AddTriangleFilled(ImVec2(axis.Datum1, pix), pos, ImVec2(pos.x, pos.y + size.y), tag.ColorBg)
+                        else
+                            pos = ImVec2(axis.Datum1 - size.x - gs.LabelPadding.x, pix - size.y * 0.5)
+                            DrawList:AddTriangleFilled(ImVec2(pos.x + size.x, pos.y), ImVec2(axis.Datum1, pix), ImVec2(pos.x + size.x, pos.y + size.y), tag.ColorBg)
+                        end
+                    else
+                        if axis:IsOpposite() then
+                            pos = ImVec2(pix - size.x * 0.5, axis.Datum1 - size.y - gs.LabelPadding.y)
+                            DrawList:AddTriangleFilled(ImVec2(pos.x, pos.y + size.y), ImVec2(pos.x + size.x, pos.y + size.y), ImVec2(pix, axis.Datum1), tag.ColorBg)
+                        else
+                            pos = ImVec2(pix - size.x * 0.5, axis.Datum1 + gs.LabelPadding.y)
+                            DrawList:AddTriangleFilled(pos, ImVec2(pix, axis.Datum1), ImVec2(pos.x + size.x, pos.y), tag.ColorBg)
+                        end
+                    end
+                    DrawList:AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), tag.ColorBg)
+                    DrawList:AddText(SetTmp(pos.x + gs.AnnotationPadding.x, pos.y + gs.AnnotationPadding.y), tag.ColorFg, txt)
+                end
+            end
 
             -- FIT DATA --------------------------------------------------------------
             -- [Port] TODO: ImPlotFlags_Equal aspect handling during fit
@@ -7257,6 +7442,436 @@ return function(G)
                 end
                 ImGui.EndPopup()
             end
+        end
+    end
+
+
+    --------------------------------------------------------------------------
+    -- [SECTION] Plot Tools
+    -- [Port] double* / bool* args: scalars are passed by value and returned, following the core
+    --        (ImGui.DragFloat returns (v, changed)). Drag tools return the new values first, then
+    --        modified, clicked, hovered, held (replacing out_clicked/out_hovered/out_held).
+    --        DragRect(id, ImPlotRect, ...) edits the ImPlotRect in place (struct pointer).
+    -- [Port] Printf-style overloads: pass a format string + varargs where upstream takes fmt, ...
+    --------------------------------------------------------------------------
+    do
+        local ImPlotCol = ImPlot.ImPlotCol
+        local ImPlotDragToolFlags = ImPlot.ImPlotDragToolFlags
+        local IMPLOT_AUTO = ImPlot.IMPLOT_AUTO
+        local ImHasFlag = internal.ImHasFlag
+        local GetStyleColorU32 = internal.GetStyleColorU32
+        local ImRect = G.ImRect
+        local ImGuiMouseCursor = G.ImGuiMouseCursor
+
+        local function ImGuiFormat(fmt, ...)
+            if select("#", ...) == 0 then return fmt end
+            return string.format(fmt, ...)
+        end
+
+        local function ResolveColor(col)
+            if col == nil or internal.IsColorAuto(col) then
+                return ImGui.GetStyleColorVec4(ImGuiCol.Text)
+            end
+            return col
+        end
+
+        local function FitThisFrame()
+            return GImPlot.CurrentPlot.FitThisFrame
+        end
+
+        local function FitPoint(x, y)
+            local plot = GImPlot.CurrentPlot
+            local x_axis, y_axis = plot.Axes[plot.CurrentX], plot.Axes[plot.CurrentY]
+            x_axis:ExtendFitWith(y_axis, x, y)
+            y_axis:ExtendFitWith(x_axis, y, x)
+        end
+
+        function ImPlot.GetPlotMousePos(x_idx, y_idx)
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "GetPlotMousePos() needs to be called between BeginPlot() and EndPlot()!")
+            return ImPlot.PixelsToPlot(ImGui.GetIO().MousePos, x_idx, y_idx)
+        end
+
+        -- Annotation(x, y, col, offset, clamp, round = false)
+        -- Annotation(x, y, col, offset, clamp, fmt, ...)
+        function ImPlot.Annotation(x, y, col, offset, clamp, fmt, ...)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil, "Annotation() needs to be called between BeginPlot() and EndPlot()!")
+            internal.SetupLock()
+            local txt
+            if type(fmt) == "string" then
+                txt = ImGuiFormat(fmt, ...)
+            else
+                local x_axis = gp.CurrentPlot.Axes[gp.CurrentPlot.CurrentX]
+                local y_axis = gp.CurrentPlot.Axes[gp.CurrentPlot.CurrentY]
+                txt = internal.LabelAxisValue(x_axis, x, fmt == true) .. ", " .. internal.LabelAxisValue(y_axis, y, fmt == true)
+            end
+            local pos = ImPlot.PlotToPixels(x, y, IMPLOT_AUTO, IMPLOT_AUTO)
+            local bg = ImGui.GetColorU32(col)
+            local fg
+            if col.w == 0 then fg = GetStyleColorU32(ImPlotCol.InlayText) else fg = internal.CalcTextColor(col) end
+            table.insert(gp.Annotations, { Pos = pos, Offset = ImVec2(offset.x, offset.y), ColorBg = bg, ColorFg = fg, Clamp = clamp or false, Text = txt })
+        end
+
+        -- Tag(axis, v, col, round = false) / Tag(axis, v, col, fmt, ...)
+        function internal.Tag(axis, v, col, fmt, ...)
+            local gp = GImPlot
+            internal.SetupLock()
+            local txt
+            if type(fmt) == "string" then
+                txt = ImGuiFormat(fmt, ...)
+            else
+                txt = internal.LabelAxisValue(gp.CurrentPlot.Axes[axis], v, fmt == true)
+            end
+            local bg = ImGui.GetColorU32(col)
+            local fg
+            if col.w == 0 then fg = GetStyleColorU32(ImPlotCol.AxisText) else fg = internal.CalcTextColor(col) end
+            table.insert(gp.Tags, { Axis = axis, Value = v, ColorBg = bg, ColorFg = fg, Text = txt })
+        end
+
+        function ImPlot.TagX(x, color, fmt, ...)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil, "TagX() needs to be called between BeginPlot() and EndPlot()!")
+            internal.Tag(gp.CurrentPlot.CurrentX, x, color, fmt, ...)
+        end
+
+        function ImPlot.TagY(y, color, fmt, ...)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil, "TagY() needs to be called between BeginPlot() and EndPlot()!")
+            internal.Tag(gp.CurrentPlot.CurrentY, y, color, fmt, ...)
+        end
+
+        local DRAG_GRAB_HALF_SIZE = 4.0
+
+        -- DragPoint(id, x, y, col, size = 4, flags = 0) -> x, y, modified, clicked, hovered, held
+        function ImPlot.DragPoint(n_id, x, y, col, radius, flags)
+            radius = radius or 4
+            flags = flags or 0
+            ImGui.PushID("#IMPLOT_DRAG_POINT")
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "DragPoint() needs to be called between BeginPlot() and EndPlot()!")
+            internal.SetupLock()
+
+            if not ImHasFlag(flags, ImPlotDragToolFlags.NoFit) and FitThisFrame() then
+                FitPoint(x, y)
+            end
+
+            local input = not ImHasFlag(flags, ImPlotDragToolFlags.NoInputs)
+            local show_curs = not ImHasFlag(flags, ImPlotDragToolFlags.NoCursors)
+            local no_delay = not ImHasFlag(flags, ImPlotDragToolFlags.Delayed)
+            local grab_half_size = math.max(DRAG_GRAB_HALF_SIZE, radius)
+            local col32 = ImGui.ColorConvertFloat4ToU32(ResolveColor(col))
+
+            local pos = ImPlot.PlotToPixels(x, y, IMPLOT_AUTO, IMPLOT_AUTO)
+            local id = ImGui.GetCurrentWindow():GetID(n_id)
+            local rect = ImRect(pos.x - grab_half_size, pos.y - grab_half_size, pos.x + grab_half_size, pos.y + grab_half_size)
+            local clicked, hovered, held = false, false, false
+
+            ImGui.KeepAliveID(id)
+            if input then
+                clicked, hovered, held = ImGui.ButtonBehavior(rect, id)
+            end
+
+            local modified = false
+            if held and ImGui.IsMouseDragging(0) then
+                local mp = ImPlot.GetPlotMousePos(IMPLOT_AUTO, IMPLOT_AUTO)
+                x = mp.x
+                y = mp.y
+                modified = true
+            end
+
+            internal.PushPlotClipRect()
+            local DrawList = internal.GetPlotDrawList()
+            if (hovered or held) and show_curs then
+                ImGui.SetMouseCursor(ImGuiMouseCursor.Hand)
+            end
+            if modified and no_delay then
+                pos = ImPlot.PlotToPixels(x, y, IMPLOT_AUTO, IMPLOT_AUTO)
+            end
+            DrawList:AddCircleFilled(pos, radius, col32)
+            internal.PopPlotClipRect()
+
+            ImGui.PopID()
+            return x, y, modified, clicked, hovered, held
+        end
+
+        -- [Port] DragLineX/DragLineY share one body (is_y selects DragLineY)
+        local function DragLine(n_id, value, col, thickness, flags, is_y)
+            thickness = thickness or 1
+            flags = flags or 0
+            local gp = GImPlot
+            local plot = gp.CurrentPlot
+            local pr = plot.PlotRect
+
+            if not ImHasFlag(flags, ImPlotDragToolFlags.NoFit) and FitThisFrame() then
+                if is_y then
+                    plot.Axes[plot.CurrentY]:ExtendFit(value) -- FitPointY
+                else
+                    plot.Axes[plot.CurrentX]:ExtendFit(value) -- FitPointX
+                end
+            end
+
+            local input = not ImHasFlag(flags, ImPlotDragToolFlags.NoInputs)
+            local show_curs = not ImHasFlag(flags, ImPlotDragToolFlags.NoCursors)
+            local no_delay = not ImHasFlag(flags, ImPlotDragToolFlags.Delayed)
+            local grab_half_size = math.max(DRAG_GRAB_HALF_SIZE, thickness / 2)
+            local function ToPix(v)
+                if is_y then
+                    return math.floor(ImPlot.PlotToPixels(0, v, IMPLOT_AUTO, IMPLOT_AUTO).y + 0.5)
+                end
+                return math.floor(ImPlot.PlotToPixels(v, 0, IMPLOT_AUTO, IMPLOT_AUTO).x + 0.5)
+            end
+            local p = ToPix(value)
+            local id = ImGui.GetCurrentWindow():GetID(n_id)
+            local rect
+            if is_y then
+                rect = ImRect(pr.Min.x, p - grab_half_size, pr.Max.x, p + grab_half_size)
+            else
+                rect = ImRect(p - grab_half_size, pr.Min.y, p + grab_half_size, pr.Max.y)
+            end
+            local clicked, hovered, held = false, false, false
+
+            ImGui.KeepAliveID(id)
+            if input then
+                clicked, hovered, held = ImGui.ButtonBehavior(rect, id)
+            end
+
+            if (hovered or held) and show_curs then
+                if is_y then
+                    ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeNS)
+                else
+                    ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeEW)
+                end
+            end
+
+            local col32 = ImGui.ColorConvertFloat4ToU32(ResolveColor(col))
+
+            local modified = false
+            if held and ImGui.IsMouseDragging(0) then
+                local mp = ImPlot.GetPlotMousePos(IMPLOT_AUTO, IMPLOT_AUTO)
+                if is_y then value = mp.y else value = mp.x end
+                modified = true
+            end
+
+            internal.PushPlotClipRect()
+            local DrawList = internal.GetPlotDrawList()
+            if modified and no_delay then
+                p = ToPix(value)
+            end
+            if is_y then
+                local len = gp.Style.MajorTickLen.y
+                local xl, xr = pr.Min.x, pr.Max.x
+                internal.AddLineH(DrawList, xl, xr, p, col32, thickness)
+                internal.AddLineH(DrawList, xl, xl + len, p, col32, 3 * thickness)
+                internal.AddLineH(DrawList, xr, xr - len, p, col32, 3 * thickness)
+            else
+                local len = gp.Style.MajorTickLen.x
+                local yt, yb = pr.Min.y, pr.Max.y
+                internal.AddLineV(DrawList, p, yt, yb, col32, thickness)
+                internal.AddLineV(DrawList, p, yt, yt + len, col32, 3 * thickness)
+                internal.AddLineV(DrawList, p, yb, yb - len, col32, 3 * thickness)
+            end
+            internal.PopPlotClipRect()
+
+            return value, modified, clicked, hovered, held
+        end
+
+        -- DragLineX(id, x, col, thickness = 1, flags = 0) -> x, modified, clicked, hovered, held
+        function ImPlot.DragLineX(n_id, value, col, thickness, flags)
+            -- ImGui::PushID("#IMPLOT_DRAG_LINE_X");
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "DragLineX() needs to be called between BeginPlot() and EndPlot()!")
+            internal.SetupLock()
+            -- ImGui::PopID();
+            return DragLine(n_id, value, col, thickness, flags, false)
+        end
+
+        -- DragLineY(id, y, col, thickness = 1, flags = 0) -> y, modified, clicked, hovered, held
+        function ImPlot.DragLineY(n_id, value, col, thickness, flags)
+            ImGui.PushID("#IMPLOT_DRAG_LINE_Y")
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "DragLineY() needs to be called between BeginPlot() and EndPlot()!")
+            internal.SetupLock()
+            local v, modified, clicked, hovered, held = DragLine(n_id, value, col, thickness, flags, true)
+            ImGui.PopID()
+            return v, modified, clicked, hovered, held
+        end
+
+        -- DragRect(id, x_min, y_min, x_max, y_max, col, flags = 0) -> x_min, y_min, x_max, y_max, modified, clicked, hovered, held
+        -- DragRect(id, ImPlotRect bounds, col, flags = 0) -> modified, clicked, hovered, held (bounds edited in place)
+        function ImPlot.DragRect(n_id, x_min, y_min, x_max, y_max, col, flags)
+            if type(x_min) == "table" then
+                local bounds = x_min
+                local m, c, h, hd
+                bounds.X.Min, bounds.Y.Min, bounds.X.Max, bounds.Y.Max, m, c, h, hd =
+                    ImPlot.DragRect(n_id, bounds.X.Min, bounds.Y.Min, bounds.X.Max, bounds.Y.Max, y_min, x_max)
+                return m, c, h, hd
+            end
+            flags = flags or 0
+            ImGui.PushID("#IMPLOT_DRAG_RECT")
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "DragRect() needs to be called between BeginPlot() and EndPlot()!")
+            internal.SetupLock()
+
+            if not ImHasFlag(flags, ImPlotDragToolFlags.NoFit) and FitThisFrame() then
+                FitPoint(x_min, y_min)
+                FitPoint(x_max, y_max)
+            end
+
+            local input = not ImHasFlag(flags, ImPlotDragToolFlags.NoInputs)
+            local show_curs = not ImHasFlag(flags, ImPlotDragToolFlags.NoCursors)
+            local no_delay = not ImHasFlag(flags, ImPlotDragToolFlags.Delayed)
+            local h = { true, false, true, false }
+            -- [Port] double* x[]/y[] -> index maps into v = { x_min, y_min, x_max, y_max }
+            local v = { x_min, y_min, x_max, y_max }
+            local xi = { 1, 3, 3, 1 }
+            local yi = { 2, 2, 4, 4 }
+            local p = {}
+            for i = 1, 4 do
+                p[i] = ImPlot.PlotToPixels(v[xi[i]], v[yi[i]], IMPLOT_AUTO, IMPLOT_AUTO)
+            end
+            local pc = ImPlot.PlotToPixels((v[1] + v[3]) / 2, (v[2] + v[4]) / 2, IMPLOT_AUTO, IMPLOT_AUTO)
+            local rect = ImRect(math.min(p[1].x, p[3].x), math.min(p[1].y, p[3].y), math.max(p[1].x, p[3].x), math.max(p[1].y, p[3].y))
+            local rect_grab = ImRect(rect.Min.x - DRAG_GRAB_HALF_SIZE, rect.Min.y - DRAG_GRAB_HALF_SIZE, rect.Max.x + DRAG_GRAB_HALF_SIZE, rect.Max.y + DRAG_GRAB_HALF_SIZE)
+
+            local cur = {}
+            if show_curs then
+                local NWSE, NESW = ImGuiMouseCursor.ResizeNWSE, ImGuiMouseCursor.ResizeNESW
+                if (rect.Min.x == p[1].x and rect.Min.y == p[1].y) or (rect.Max.x == p[1].x and rect.Max.y == p[1].y) then
+                    cur[1] = NWSE
+                else
+                    cur[1] = NESW
+                end
+                for i = 2, 4 do
+                    if cur[i - 1] == NWSE then cur[i] = NESW else cur[i] = NWSE end
+                end
+            end
+
+            local color = ResolveColor(col)
+            local col32 = ImGui.ColorConvertFloat4ToU32(color)
+            local col32_a = ImGui.ColorConvertFloat4ToU32(ImVec4(color.x, color.y, color.z, color.w * 0.25))
+            local id = ImGui.GetCurrentWindow():GetID(n_id)
+
+            local modified = false
+            local clicked, hovered, held = false, false, false
+            local out_clicked, out_hovered, out_held = false, false, false
+
+            local is_movable = x_min ~= x_max or y_min ~= y_max
+            if is_movable then
+                ImGui.KeepAliveID(id)
+                if input then
+                    -- middle point
+                    local b_rect = ImRect(pc.x - DRAG_GRAB_HALF_SIZE, pc.y - DRAG_GRAB_HALF_SIZE, pc.x + DRAG_GRAB_HALF_SIZE, pc.y + DRAG_GRAB_HALF_SIZE)
+                    clicked, hovered, held = ImGui.ButtonBehavior(b_rect, id)
+                    out_clicked, out_hovered, out_held = clicked, hovered, held
+                end
+
+                if (hovered or held) and show_curs then
+                    ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeAll)
+                end
+                if held and ImGui.IsMouseDragging(0) then
+                    local delta = ImGui.GetIO().MouseDelta
+                    for i = 1, 4 do
+                        local pp = ImPlot.PixelsToPlot(p[i].x + delta.x, p[i].y + delta.y, IMPLOT_AUTO, IMPLOT_AUTO)
+                        v[yi[i]] = pp.y
+                        v[xi[i]] = pp.x
+                    end
+                    modified = true
+                end
+            end
+
+            for i = 1, 4 do
+                -- points
+                local b_rect = ImRect(p[i].x - DRAG_GRAB_HALF_SIZE, p[i].y - DRAG_GRAB_HALF_SIZE, p[i].x + DRAG_GRAB_HALF_SIZE, p[i].y + DRAG_GRAB_HALF_SIZE)
+                local p_id = (id + i) % 0x100000000
+                ImGui.KeepAliveID(p_id)
+                if input then
+                    clicked, hovered, held = ImGui.ButtonBehavior(b_rect, p_id)
+                    out_clicked = out_clicked or clicked
+                    out_hovered = out_hovered or hovered
+                    out_held    = out_held or held
+                end
+                if (hovered or held) and show_curs then
+                    ImGui.SetMouseCursor(cur[i])
+                end
+
+                if held and ImGui.IsMouseDragging(0) then
+                    local mp = ImPlot.GetPlotMousePos(IMPLOT_AUTO, IMPLOT_AUTO)
+                    v[xi[i]] = mp.x
+                    v[yi[i]] = mp.y
+                    modified = true
+                end
+
+                -- edges
+                local q = p[i % 4 + 1]
+                local e_min_x, e_min_y = math.min(p[i].x, q.x), math.min(p[i].y, q.y)
+                local e_max_x, e_max_y = math.max(p[i].x, q.x), math.max(p[i].y, q.y)
+                if h[i] then
+                    b_rect = ImRect(e_min_x + DRAG_GRAB_HALF_SIZE, e_min_y - DRAG_GRAB_HALF_SIZE, e_max_x - DRAG_GRAB_HALF_SIZE, e_max_y + DRAG_GRAB_HALF_SIZE)
+                else
+                    b_rect = ImRect(e_min_x - DRAG_GRAB_HALF_SIZE, e_min_y + DRAG_GRAB_HALF_SIZE, e_max_x + DRAG_GRAB_HALF_SIZE, e_max_y - DRAG_GRAB_HALF_SIZE)
+                end
+                local e_id = (id + i + 4) % 0x100000000
+                ImGui.KeepAliveID(e_id)
+                if input then
+                    clicked, hovered, held = ImGui.ButtonBehavior(b_rect, e_id)
+                    out_clicked = out_clicked or clicked
+                    out_hovered = out_hovered or hovered
+                    out_held    = out_held or held
+                end
+                if (hovered or held) and show_curs then
+                    if h[i] then
+                        ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeNS)
+                    else
+                        ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeEW)
+                    end
+                end
+                if held and ImGui.IsMouseDragging(0) then
+                    local mp = ImPlot.GetPlotMousePos(IMPLOT_AUTO, IMPLOT_AUTO)
+                    if h[i] then
+                        v[yi[i]] = mp.y
+                    else
+                        v[xi[i]] = mp.x
+                    end
+                    modified = true
+                end
+                if hovered and ImGui.IsMouseDoubleClicked(0) then
+                    local b = ImPlot.GetPlotLimits(IMPLOT_AUTO, IMPLOT_AUTO)
+                    if h[i] then
+                        local k = yi[i]
+                        if (k == 2 and v[2] < v[4]) or (k == 4 and v[4] < v[2]) then v[k] = b.Y.Min else v[k] = b.Y.Max end
+                    else
+                        local k = xi[i]
+                        if (k == 1 and v[1] < v[3]) or (k == 3 and v[3] < v[1]) then v[k] = b.X.Min else v[k] = b.X.Max end
+                    end
+                    modified = true
+                end
+            end
+
+            local mouse_inside = rect_grab:Contains(ImGui.GetMousePos())
+            local mouse_clicked = ImGui.IsMouseClicked(0)
+            local mouse_down = ImGui.IsMouseDown(0)
+            if input and mouse_inside then
+                out_clicked = out_clicked or mouse_clicked
+                out_hovered = true
+                out_held    = out_held or mouse_down
+            end
+
+            internal.PushPlotClipRect()
+            local DrawList = internal.GetPlotDrawList()
+            if modified and no_delay then
+                for i = 1, 4 do
+                    p[i] = ImPlot.PlotToPixels(v[xi[i]], v[yi[i]], IMPLOT_AUTO, IMPLOT_AUTO)
+                end
+                pc = ImPlot.PlotToPixels((v[1] + v[3]) / 2, (v[2] + v[4]) / 2, IMPLOT_AUTO, IMPLOT_AUTO)
+                rect = ImRect(math.min(p[1].x, p[3].x), math.min(p[1].y, p[3].y), math.max(p[1].x, p[3].x), math.max(p[1].y, p[3].y))
+            end
+            DrawList:AddRectFilled(rect.Min, rect.Max, col32_a)
+            DrawList:AddRect(rect.Min, rect.Max, col32)
+            if input and (modified or mouse_inside) then
+                DrawList:AddCircleFilled(pc, DRAG_GRAB_HALF_SIZE, col32)
+                for i = 1, 4 do
+                    DrawList:AddCircleFilled(p[i], DRAG_GRAB_HALF_SIZE, col32)
+                end
+            end
+            internal.PopPlotClipRect()
+            ImGui.PopID()
+            return v[1], v[2], v[3], v[4], modified, out_clicked, out_hovered, out_held
         end
     end
 
