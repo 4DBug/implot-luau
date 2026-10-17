@@ -5246,6 +5246,56 @@ return function(G)
             return true
         end
 
+        -- [Port] prims i0..i1 in one call when the getter reads two plain arrays (no axis transform functions, one
+        -- colour): LineStripRender + XYGet + TransformX/Y + Overlaps + PrimLine inlined, same math. Returns culled count.
+        @native
+        local function LineStripRange(r, dl, cr, i0, i1)
+            local g = r.Getter
+            local ix, iy = g.IndexerX, g.IndexerY
+            if g.Get ~= XYGet or ix.At ~= IdxAt3 or iy.At ~= IdxAt3 or tx_fwd ~= nil or ty_fwd ~= nil or r.Cols ~= nil then
+                local culled = 0
+                for i = i0, i1 do
+                    if not LineStripRender(r, dl, cr, i) then culled += 1 end
+                end
+                return culled
+            end
+            local xs, ys = ix.Data, iy.Data
+            local cminx, cminy, cmaxx, cmaxy = cr.Min.x, cr.Min.y, cr.Max.x, cr.Max.y
+            local xpm, xm, xpl, ypm, ym, ypl = tx_pixmin, tx_m, tx_pltmin, ty_pixmin, ty_m, ty_pltmin
+            local hw, col, u0, v0, u1, v1, skip = r.HalfWeight, r.Col, r.U0, r.V0, r.U1, r.V1, r.Skip
+            local b, id = dl.VtxBuffer.Buf, dl.IdxBuffer.Data
+            local vw, iw, idx = dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx
+            local p1x, p1y = r.P1x, r.P1y
+            local culled = 0
+            for i = i0, i1 do
+                local p2x, p2y = xpm + xm * (xs[i + 2] - xpl), ypm + ym * (ys[i + 2] - ypl)
+                local minx, maxx = p1x, p2x
+                if p2x < p1x then minx, maxx = p2x, p1x end
+                local miny, maxy = p1y, p2y
+                if p2y < p1y then miny, maxy = p2y, p1y end
+                if miny < cmaxy and maxy > cminy and minx < cmaxx and maxx > cminx then
+                    local dx, dy = p2x - p1x, p2y - p1y
+                    local d2 = dx * dx + dy * dy
+                    if d2 > 0 then local inv = 1 / sqrt(d2); dx *= inv; dy *= inv end
+                    dx *= hw; dy *= hw
+                    local o = (vw - 1) * VTX_STRIDE
+                    WV(b, o,                  p1x + dy, p1y - dx, u0, v0, col)
+                    WV(b, o + VTX_STRIDE,     p2x + dy, p2y - dx, u0, v0, col)
+                    WV(b, o + VTX_STRIDE * 2, p2x - dy, p2y + dx, u1, v1, col)
+                    WV(b, o + VTX_STRIDE * 3, p1x - dy, p1y + dx, u1, v1, col)
+                    id[iw] = idx; id[iw + 1] = idx + 1; id[iw + 2] = idx + 2
+                    id[iw + 3] = idx; id[iw + 4] = idx + 2; id[iw + 5] = idx + 3
+                    vw += 4; iw += 6; idx += 4
+                else
+                    culled += 1
+                end
+                if not skip or (p2x == p2x and p2y == p2y) then p1x, p1y = p2x, p2y end
+            end
+            dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx = vw, iw, idx
+            r.P1x, r.P1y = p1x, p1y
+            return culled
+        end
+
         -- RendererLineStrip / RendererLineStripSkip (skip = true skips NaNs)
         function internal.RendererLineStrip(getter, weight, skip)
             local x, y = getter.Get(getter, 0)
@@ -5253,7 +5303,7 @@ return function(G)
                 Prims = getter.Count - 1, IdxConsumed = 6, VtxConsumed = 4,
                 Getter = getter, HalfWeight = max(1.0, weight) * 0.5, Skip = skip or false,
                 P1x = TransformX(x), P1y = TransformY(y),
-                Init = LineInit, Render = LineStripRender,
+                Init = LineInit, Render = LineStripRender, RenderRange = LineStripRange,
             }
         end
 
@@ -5371,11 +5421,56 @@ return function(G)
             end
             return false
         end
+        -- [Port] plain-array getter, no axis transform functions, one colour: point read + transform inlined
+        local function PlainXY(r)
+            local g = r.Getter
+            return g.Get == XYGet and g.IndexerX.At == IdxAt3 and g.IndexerY.At == IdxAt3 and tx_fwd == nil
+                and ty_fwd == nil and r.Cols == nil
+        end
+
+        @native
+        local function MarkersFillRange(r, dl, cr, i0, i1)
+            if not PlainXY(r) then
+                local culled = 0
+                for i = i0, i1 do
+                    if not MarkersFillRender(r, dl, cr, i) then culled += 1 end
+                end
+                return culled
+            end
+            local g = r.Getter
+            local xs, ys = g.IndexerX.Data, g.IndexerY.Data
+            local cminx, cminy, cmaxx, cmaxy = cr.Min.x, cr.Min.y, cr.Max.x, cr.Max.y
+            local m, count, u, v, col, sizes, size = r.Marker, r.Count, r.U, r.V, r.Col, r.Sizes, r.Size
+            local b, id = dl.VtxBuffer.Buf, dl.IdxBuffer.Data
+            local vw, iw, idx = dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx
+            local culled = 0
+            for prim = i0, i1 do
+                local px, py = tx_pixmin + tx_m * (xs[prim + 1] - tx_pltmin), ty_pixmin + ty_m * (ys[prim + 1] - ty_pltmin)
+                if px >= cminx and py >= cminy and px <= cmaxx and py <= cmaxy then
+                    local sz = size
+                    if sizes then sz = sizes[prim + 1] end
+                    local o = (vw - 1) * VTX_STRIDE
+                    for i = 0, count - 1 do
+                        WV(b, o + i * VTX_STRIDE, px + m[i * 2 + 1] * sz, py + m[i * 2 + 2] * sz, u, v, col)
+                    end
+                    for i = 2, count - 1 do
+                        id[iw] = idx; id[iw + 1] = idx + i - 1; id[iw + 2] = idx + i
+                        iw += 3
+                    end
+                    vw += count; idx += count
+                else
+                    culled += 1
+                end
+            end
+            dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx = vw, iw, idx
+            return culled
+        end
+
         function internal.RendererMarkersFill(getter, marker, count)
             return {
                 Prims = getter.Count, IdxConsumed = (count - 2) * 3, VtxConsumed = count,
                 Getter = getter, Marker = marker, Count = count,
-                Init = WhiteInit, Render = MarkersFillRender,
+                Init = WhiteInit, Render = MarkersFillRender, RenderRange = MarkersFillRange,
             }
         end
 
@@ -5397,11 +5492,58 @@ return function(G)
             end
             return false
         end
+        @native
+        local function MarkersLineRange(r, dl, cr, i0, i1)
+            if not PlainXY(r) then
+                local culled = 0
+                for i = i0, i1 do
+                    if not MarkersLineRender(r, dl, cr, i) then culled += 1 end
+                end
+                return culled
+            end
+            local g = r.Getter
+            local xs, ys = g.IndexerX.Data, g.IndexerY.Data
+            local cminx, cminy, cmaxx, cmaxy = cr.Min.x, cr.Min.y, cr.Max.x, cr.Max.y
+            local m, count, col, sizes, size = r.Marker, r.Count, r.Col, r.Sizes, r.Size
+            local hw, u0, v0, u1, v1 = r.HalfWeight, r.U0, r.V0, r.U1, r.V1
+            local b, id = dl.VtxBuffer.Buf, dl.IdxBuffer.Data
+            local vw, iw, idx = dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx
+            local culled = 0
+            for prim = i0, i1 do
+                local px, py = tx_pixmin + tx_m * (xs[prim + 1] - tx_pltmin), ty_pixmin + ty_m * (ys[prim + 1] - ty_pltmin)
+                if px >= cminx and py >= cminy and px <= cmaxx and py <= cmaxy then
+                    local sz = size
+                    if sizes then sz = sizes[prim + 1] end
+                    for i = 0, count - 1, 2 do
+                        -- PrimLine inlined
+                        local x1, y1 = px + m[i * 2 + 1] * sz, py + m[i * 2 + 2] * sz
+                        local x2, y2 = px + m[i * 2 + 3] * sz, py + m[i * 2 + 4] * sz
+                        local dx, dy = x2 - x1, y2 - y1
+                        local d2 = dx * dx + dy * dy
+                        if d2 > 0 then local inv = 1 / sqrt(d2); dx *= inv; dy *= inv end
+                        dx *= hw; dy *= hw
+                        local o = (vw - 1) * VTX_STRIDE
+                        WV(b, o,                  x1 + dy, y1 - dx, u0, v0, col)
+                        WV(b, o + VTX_STRIDE,     x2 + dy, y2 - dx, u0, v0, col)
+                        WV(b, o + VTX_STRIDE * 2, x2 - dy, y2 + dx, u1, v1, col)
+                        WV(b, o + VTX_STRIDE * 3, x1 - dy, y1 + dx, u1, v1, col)
+                        id[iw] = idx; id[iw + 1] = idx + 1; id[iw + 2] = idx + 2
+                        id[iw + 3] = idx; id[iw + 4] = idx + 2; id[iw + 5] = idx + 3
+                        vw += 4; iw += 6; idx += 4
+                    end
+                else
+                    culled += 1
+                end
+            end
+            dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx = vw, iw, idx
+            return culled
+        end
+
         function internal.RendererMarkersLine(getter, marker, count, weight)
             return {
                 Prims = getter.Count, IdxConsumed = count // 2 * 6, VtxConsumed = count // 2 * 4,
                 Getter = getter, Marker = marker, Count = count, HalfWeight = max(1.0, weight) * 0.5,
-                Init = LineInit, Render = MarkersLineRender,
+                Init = LineInit, Render = MarkersLineRender, RenderRange = MarkersLineRange,
             }
         end
 
@@ -5411,7 +5553,7 @@ return function(G)
             local prims_culled = 0
             local idx          = 0
             local idx_c, vtx_c = renderer.IdxConsumed, renderer.VtxConsumed
-            local render       = renderer.Render
+            local render, range = renderer.Render, renderer.RenderRange
             renderer.Init(renderer, draw_list)
             while prims > 0 do
                 -- find how many can be reserved up to end of current draw command's limit
@@ -5435,9 +5577,13 @@ return function(G)
                     draw_list:PrimReserve(cnt * idx_c, cnt * vtx_c)
                 end
                 prims -= cnt
-                for i = idx, idx + cnt - 1 do
-                    if not render(renderer, draw_list, cull_rect, i) then
-                        prims_culled += 1
+                if range then
+                    prims_culled += range(renderer, draw_list, cull_rect, idx, idx + cnt - 1)
+                else
+                    for i = idx, idx + cnt - 1 do
+                        if not render(renderer, draw_list, cull_rect, i) then
+                            prims_culled += 1
+                        end
                     end
                 end
                 idx += cnt
