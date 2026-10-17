@@ -867,6 +867,7 @@ return function(G)
                 StyleModifiers = {},
                 ColormapData = internal.ImPlotColormapData(),
                 ColormapModifiers = {},
+                CTicker = nil, -- [Port] ImPlotTicker created lazily by ColormapScale (defined in a later section)
                 -- Plot States
                 -- [Port] ImPool<ImPlotPlot>; ctor resolved lazily since ImPlotPlot is defined in a later section
                 Plots = G.ImPool(function() return internal.ImPlotPlot() end),
@@ -5311,6 +5312,857 @@ return function(G)
                 if BeginItem(label_id, spec, item_col, spec.Marker) then
                     EndItem()
                 end
+            end
+        end
+
+        -----------------------------------------------------------------------
+        -- PlotPieChart, PlotHeatmap, PlotHistogram, PlotHistogram2D, PlotImage
+        -----------------------------------------------------------------------
+        do
+            local ImPlotPieChartFlags = ImPlot.ImPlotPieChartFlags
+            local ImPlotHeatmapFlags = ImPlot.ImPlotHeatmapFlags
+            local ImPlotHistogramFlags = ImPlot.ImPlotHistogramFlags
+            local ImPlotBarsFlags = ImPlot.ImPlotBarsFlags
+            local ImPlotBin = ImPlot.ImPlotBin
+            local IM_COL32_A_MASK = 0xFF000000
+
+            -- [Port] CalcTextColor(ImVec4) / CalcTextColor(ImU32) overloads (implot_internal.h)
+            local function CalcTextColorU32(c)
+                local r, g_, b = band(c, 0xFF) / 255, band(rshift(c, 8), 0xFF) / 255, band(rshift(c, 16), 0xFF) / 255
+                if (r * 0.299 + g_ * 0.587 + b * 0.114) > 0.5 then return G.IM_COL32_BLACK end
+                return G.IM_COL32_WHITE
+            end
+            function internal.CalcTextColor(bg)
+                if type(bg) == "number" then return CalcTextColorU32(bg) end
+                if (bg.x * 0.299 + bg.y * 0.587 + bg.z * 0.114) > 0.5 then return G.IM_COL32_BLACK end
+                return G.IM_COL32_WHITE
+            end
+
+            -- Returns true if a plot item legend entry is hovered.
+            function ImPlot.IsLegendEntryHovered(label_id)
+                IM_ASSERT(GImPlot.CurrentItems ~= nil, "IsPlotItemHighlight() needs to be called within an itemized context!")
+                local item = internal.GetItem(label_id)
+                return item ~= nil and item.LegendHovered
+            end
+
+            -- [Port] ImMinMaxIndexer -> returns (min, max)
+            local function ImMinMaxIndexer(indexer, count)
+                local min_out, max_out = indexer.At(indexer, 0), indexer.At(indexer, 0)
+                for i = 1, count - 1 do
+                    local v = indexer.At(indexer, i)
+                    if v < min_out then min_out = v end
+                    if v > max_out then max_out = v end
+                end
+                return min_out, max_out
+            end
+
+            local function ImStdDev(indexer, count)
+                local den = 1.0 / (count - 1.0)
+                local mu = 0
+                for i = 0, count - 1 do mu += indexer.At(indexer, i) * (1.0 / count) end
+                local x = 0
+                for i = 0, count - 1 do
+                    local d = indexer.At(indexer, i) - mu
+                    x += d * d * den
+                end
+                return sqrt(x)
+            end
+
+            -- Calculate histogram bin counts and widths
+            -- [Port] returns (bins_out, width_out)
+            local function CalculateBins(values, count, meth, range_min, range_max)
+                local bins_out, width_out = 0, 0
+                if meth == ImPlotBin.Sqrt then
+                    bins_out = math.ceil(sqrt(count))
+                elseif meth == ImPlotBin.Sturges then
+                    bins_out = math.ceil(1.0 + math.log(count, 2))
+                elseif meth == ImPlotBin.Rice then
+                    bins_out = math.ceil(2 * count ^ (1 / 3))
+                elseif meth == ImPlotBin.Scott then
+                    width_out = 3.49 * ImStdDev(values, count) / count ^ (1 / 3)
+                    bins_out = floor((range_max - range_min) / width_out + 0.5)
+                end
+                width_out = (range_max - range_min) / bins_out
+                return bins_out, width_out
+            end
+            internal.CalculateBins = CalculateBins
+
+            -------------------------------------------------------------------
+            -- PlotPieChart
+            -------------------------------------------------------------------
+
+            -- [Port] ImVec2 buffer[52] flattened to {x1, y1, x2, y2, ...}, reused across calls
+            local pie_buf = table.create(104, 0)
+
+            local function RenderPieSliceFill(dl, buf, count, col)
+                local uv = dl._Data.TexUvWhitePixel
+                -- Triangle fan: n-2 triangles for n vertices, so (n-2)*3 indices
+                dl:PrimReserve((count - 2) * 3, count)
+                local b = dl.VtxBuffer.Buf
+                local vw = dl._VtxWritePtr
+                local o = (vw - 1) * VTX_STRIDE
+                for i = 0, count - 1 do
+                    WV(b, o + i * VTX_STRIDE, buf[i * 2 + 1], buf[i * 2 + 2], uv.x, uv.y, col)
+                end
+                local vtx_base = dl._VtxCurrentIdx
+                local id, iw = dl.IdxBuffer.Data, dl._IdxWritePtr
+                for i = 2, count - 1 do
+                    id[iw] = vtx_base; id[iw + 1] = vtx_base + i - 1; id[iw + 2] = vtx_base + i
+                    iw += 3
+                end
+                dl._VtxWritePtr = vw + count; dl._IdxWritePtr = iw; dl._VtxCurrentIdx = vtx_base + count
+            end
+
+            local function RenderPieSliceLine(dl, buf, count, col)
+                local half_weight = 1.0 -- Weight of 2.0f -> half_weight of 1.0f
+                local hw, u0, v0, u1, v1 = GetLineRenderProps(dl, half_weight)
+                -- Polyline with n points has n-1 segments, each needs 4 vertices and 6 indices
+                local segments = count - 1
+                dl:PrimReserve(segments * 6, segments * 4)
+                for i = 0, segments - 1 do
+                    PrimLine(dl, buf[i * 2 + 1], buf[i * 2 + 2], buf[i * 2 + 3], buf[i * 2 + 4], hw, col, u0, v0, u1, v1)
+                end
+            end
+
+            local function RenderPieSlice(dl, cx, cy, radius, a0, a1, col, flags, detached)
+                local resolution = 50 / (2 * math.pi)
+                local buf = pie_buf
+                local plot = GImPlot.CurrentPlot
+                local x_axis, y_axis = plot.Axes[plot.CurrentX], plot.Axes[plot.CurrentY]
+                local n = max(3, floor((a1 - a0) * resolution))
+                local da = (a1 - a0) / (n - 1)
+                if detached then
+                    local offset = 0.08 -- Offset of the detached slice
+                    local width_scale = 0.95 -- Scale factor for the width of the detached slice
+                    local a_mid = (a0 + a1) / 2
+                    local new_a0 = a_mid - (a1 - a0) * width_scale / 2
+                    local new_a1 = a_mid + (a1 - a0) * width_scale / 2
+                    local new_da = (new_a1 - new_a0) / (n - 1)
+                    local ocx, ocy = cx + offset * math.cos(a_mid), cy + offset * math.sin(a_mid)
+                    -- Start point (center of the offset)
+                    buf[1], buf[2] = x_axis:PlotToPixels(ocx), y_axis:PlotToPixels(ocy)
+                    for i = 0, n - 1 do
+                        local a = new_a0 + i * new_da
+                        buf[i * 2 + 3] = x_axis:PlotToPixels(ocx + (radius + offset / 2) * math.cos(a))
+                        buf[i * 2 + 4] = y_axis:PlotToPixels(ocy + (radius + offset / 2) * math.sin(a))
+                    end
+                else
+                    buf[1], buf[2] = x_axis:PlotToPixels(cx), y_axis:PlotToPixels(cy)
+                    for i = 0, n - 1 do
+                        local a = a0 + i * da
+                        buf[i * 2 + 3] = x_axis:PlotToPixels(cx + radius * math.cos(a))
+                        buf[i * 2 + 4] = y_axis:PlotToPixels(cy + radius * math.sin(a))
+                    end
+                end
+                -- Close the shape
+                buf[n * 2 + 3], buf[n * 2 + 4] = buf[1], buf[2]
+                -- fill
+                RenderPieSliceFill(dl, buf, n + 2, col)
+                -- border (for AA)
+                if not ImHasFlag(flags, ImPlotPieChartFlags.NoSliceBorder) then
+                    RenderPieSliceLine(dl, buf, n + 2, col)
+                end
+            end
+
+            local function PieChartSum(indexer, ignore_hidden)
+                local sum = 0
+                if ignore_hidden then
+                    local Items = GImPlot.CurrentItems
+                    for i = 0, indexer.Count - 1 do
+                        if i >= Items:GetItemCount() then
+                            break
+                        end
+                        local item = Items:GetItemByIndex(i)
+                        IM_ASSERT(item ~= nil)
+                        if item.Show then
+                            sum += indexer.At(indexer, i)
+                        end
+                    end
+                else
+                    for i = 0, indexer.Count - 1 do
+                        sum += indexer.At(indexer, i)
+                    end
+                end
+                return sum
+            end
+
+            -- [Port] label_ids is a 1-based array of strings
+            function internal.PlotPieChartEx(label_ids, indexer, cx, cy, radius, angle0, spec)
+                local draw_list = internal.GetPlotDrawList()
+                local ignore_hidden = ImHasFlag(spec.Flags, ImPlotPieChartFlags.IgnoreHidden)
+                local sum = PieChartSum(indexer, ignore_hidden)
+                local normalize = ImHasFlag(spec.Flags, ImPlotPieChartFlags.Normalize) or sum > 1.0
+                local a0 = angle0 * 2 * math.pi / 360.0
+                local a1 = angle0 * 2 * math.pi / 360.0
+                for i = 0, indexer.Count - 1 do
+                    local label = label_ids[i + 1]
+                    local item = internal.GetItem(label)
+                    local v = indexer.At(indexer, i)
+                    local percent = v
+                    if normalize then percent = v / sum end
+                    local skip = sum <= 0.0 or (ignore_hidden and item ~= nil and not item.Show)
+                    if not skip then
+                        a1 = a0 + 2 * math.pi * percent
+                    end
+                    if BeginItemEx(label, internal.FitterRect(cx - radius, cy - radius, cx + radius, cy + radius), spec) then
+                        local hovered = ImPlot.IsLegendEntryHovered(label) and ImHasFlag(spec.Flags, ImPlotPieChartFlags.Exploding)
+                        if sum > 0.0 then
+                            local col = internal.GetCurrentItem().Color
+                            if percent < 0.5 then
+                                RenderPieSlice(draw_list, cx, cy, radius, a0, a1, col, spec.Flags, hovered)
+                            else
+                                RenderPieSlice(draw_list, cx, cy, radius, a0, a0 + (a1 - a0) * 0.5, col, spec.Flags, hovered)
+                                RenderPieSlice(draw_list, cx, cy, radius, a0 + (a1 - a0) * 0.5, a1, col, spec.Flags, hovered)
+                            end
+                        end
+                        EndItem()
+                    end
+                    if not skip then
+                        a0 = a1
+                    end
+                end
+            end
+
+            local function PieChartFormatter(value, data)
+                return string.format(data, value)
+            end
+
+            -- [Port] PlotPieChart(label_ids, values, count, x, y, radius, fmt = "%.1f", angle0 = 90, spec?) and
+            --        PlotPieChart(label_ids, values, count, x, y, radius, formatter, fmt_data, angle0 = 90, spec?) overloads,
+            --        dispatched on type(fmt). Pass fmt = false to disable labels (upstream nullptr).
+            --        Formatters return the label string (see Formatter_Default).
+            function ImPlot.PlotPieChart(label_ids, values, count, x, y, radius, fmt, a, b, c)
+                IM_ASSERT(GImPlot.CurrentPlot ~= nil, "PlotPieChart() needs to be called between BeginPlot() and EndPlot()!")
+                local fmt_data, angle0, sp
+                if type(fmt) == "function" then
+                    fmt_data, angle0, sp = a, b, c
+                else
+                    angle0, sp = a, b
+                    if fmt == nil then fmt = "%.1f" end
+                    if fmt ~= false then
+                        fmt_data = fmt
+                        fmt = PieChartFormatter
+                    end
+                end
+                if type(angle0) == "table" then sp, angle0 = angle0, nil end
+                angle0 = angle0 or 90
+                count = count or #values
+                local spec = ResolveSpec(sp)
+                local draw_list = internal.GetPlotDrawList()
+                local indexer = internal.IndexerIdx(values, count, spec.Offset, spec.Stride)
+                local ignore_hidden = ImHasFlag(spec.Flags, ImPlotPieChartFlags.IgnoreHidden)
+                local sum = PieChartSum(indexer, ignore_hidden)
+                local normalize = ImHasFlag(spec.Flags, ImPlotPieChartFlags.Normalize) or sum > 1.0
+
+                PushPlotClipRect()
+                internal.PlotPieChartEx(label_ids, indexer, x, y, radius, angle0, spec)
+                if fmt then
+                    local a0 = angle0 * 2 * math.pi / 360.0
+                    local a1 = angle0 * 2 * math.pi / 360.0
+                    local plot = GImPlot.CurrentPlot
+                    local x_axis, y_axis = plot.Axes[plot.CurrentX], plot.Axes[plot.CurrentY]
+                    for i = 0, count - 1 do
+                        local item = internal.GetItem(label_ids[i + 1])
+                        IM_ASSERT(item ~= nil)
+                        local v = indexer.At(indexer, i)
+                        local percent = v
+                        if normalize then percent = v / sum end
+                        local skip = ignore_hidden and item ~= nil and not item.Show
+                        if not skip then
+                            a1 = a0 + 2 * math.pi * percent
+                            if item.Show then
+                                local buffer = fmt(v, fmt_data)
+                                local size = ImGui.CalcTextSize(buffer)
+                                local angle = a0 + (a1 - a0) * 0.5
+                                local hovered = ImPlot.IsLegendEntryHovered(label_ids[i + 1]) and ImHasFlag(spec.Flags, ImPlotPieChartFlags.Exploding)
+                                local offset = 0.5 * radius
+                                if hovered then offset = 0.6 * radius end
+                                local px = x_axis:PlotToPixels(x + offset * math.cos(angle))
+                                local py = y_axis:PlotToPixels(y + offset * math.sin(angle))
+                                local col = CalcTextColorU32(item.Color)
+                                draw_list:AddText(nil, 0.0, ImVec2(px - size.x * 0.5, py - size.y * 0.5), col, buffer, 1, #buffer + 1)
+                            end
+                            a0 = a1
+                        end
+                    end
+                end
+                PopPlotClipRect()
+            end
+
+            -------------------------------------------------------------------
+            -- PlotHeatmap
+            -------------------------------------------------------------------
+
+            -- [Port] GetterHeatmapRowMaj/ColMaj + RendererRectC fused into one renderer; the RectC is computed in Render
+            -- (renderer table reused across calls, so nothing is allocated per cell)
+            @native
+            local function HeatmapRender(r, dl, cr, prim)
+                local ix = r.Indexer
+                local val = ix.At(ix, prim)
+                local row, c
+                if r.ColMaj then
+                    row, c = prim % r.Rows, prim // r.Rows
+                else
+                    row, c = prim // r.Cols, prim % r.Cols
+                end
+                local hx, hy = r.Width * 0.5, r.Height * 0.5
+                local px = r.XRef + hx + c * r.Width
+                local py = r.YRef + r.YDir * (hy + row * r.Height)
+                local t = math.clamp((val - r.ScaleMin) / (r.ScaleMax - r.ScaleMin), 0.0, 1.0)
+                local col = r.Colormaps:LerpTable(r.Cmap, t)
+                local p1x, p1y = TransformX(px - hx), TransformY(py - hy)
+                local p2x, p2y = TransformX(px + hx), TransformY(py + hy)
+                if band(col, IM_COL32_A_MASK) == 0 or not Overlaps(cr, p1x, p1y, p2x, p2y) then
+                    return false
+                end
+                PrimRectFill(dl, p1x, p1y, p2x, p2y, col, r.U, r.V)
+                return true
+            end
+            local heat_r = { IdxConsumed = 6, VtxConsumed = 4, Init = WhiteInit, Render = HeatmapRender }
+
+            local label_pos = ImVec2(0, 0)
+
+            -- [Port] bounds passed as (min_x, min_y, max_x, max_y); fmt = nil -> no labels
+            function internal.RenderHeatmap(draw_list, indexer, rows, cols, scale_min, scale_max, fmt, bmin_x, bmin_y, bmax_x, bmax_y, reverse_y, col_maj)
+                local gp = GImPlot
+                UseCurrentTransformer()
+                if scale_min == 0 and scale_max == 0 then
+                    scale_min, scale_max = ImMinMaxIndexer(indexer, rows * cols)
+                end
+                if scale_min == scale_max then
+                    local col = ImPlot.GetColormapColorU32(0, gp.Style.Colormap)
+                    draw_list:AddRectFilled(ImVec2(TransformX(bmin_x), TransformY(bmin_y)), ImVec2(TransformX(bmax_x), TransformY(bmax_y)), col)
+                    return
+                end
+                local yref, ydir = bmin_y, 1
+                if reverse_y then yref, ydir = bmax_y, -1 end
+                local r = heat_r
+                r.Indexer, r.Prims, r.Rows, r.Cols, r.ColMaj = indexer, rows * cols, rows, cols, col_maj
+                r.ScaleMin, r.ScaleMax = scale_min, scale_max
+                r.Width, r.Height = (bmax_x - bmin_x) / cols, (bmax_y - bmin_y) / rows
+                r.XRef, r.YRef, r.YDir = bmin_x, yref, ydir
+                r.Colormaps, r.Cmap = gp.ColormapData, gp.Style.Colormap
+                RenderPrimitivesEx(r, draw_list, gp.CurrentPlot.PlotRect)
+                r.Indexer = nil
+                -- labels
+                if fmt ~= nil then
+                    local w = (bmax_x - bmin_x) / cols
+                    local h = (bmax_y - bmin_y) / rows
+                    local i = 0
+                    -- [Port] row/col-major loops merged; (r, c) derived from the loop order
+                    local outer, inner = rows, cols
+                    if col_maj then outer, inner = cols, rows end
+                    for o = 0, outer - 1 do
+                        for n = 0, inner - 1 do
+                            local row, c = o, n
+                            if col_maj then row, c = n, o end
+                            local px = TransformX(bmin_x + 0.5 * w + c * w)
+                            local py = TransformY(yref + ydir * (0.5 * h + row * h))
+                            local v = indexer.At(indexer, i)
+                            local buff = string.format(fmt, v)
+                            local size = ImGui.CalcTextSize(buff)
+                            local t = math.clamp((v - scale_min) / (scale_max - scale_min), 0.0, 1.0)
+                            local col = CalcTextColorU32(ImPlot.SampleColormapU32(t))
+                            label_pos.x, label_pos.y = px - size.x * 0.5, py - size.y * 0.5
+                            draw_list:AddText(nil, 0.0, label_pos, col, buff, 1, #buff + 1)
+                            i += 1
+                        end
+                    end
+                end
+            end
+
+            -- PlotHeatmap(label_id, values, rows, cols, scale_min = 0, scale_max = 0, fmt = "%.1f", bounds_min = (0,0), bounds_max = (1,1), spec?)
+            -- [Port] pass fmt = false to disable labels (upstream nullptr)
+            function ImPlot.PlotHeatmap(label_id, values, rows, cols, scale_min, scale_max, fmt, bounds_min, bounds_max, sp)
+                if type(scale_min) == "table" then sp, scale_min = scale_min, nil end
+                if fmt == nil then fmt = "%.1f" end
+                if fmt == false then fmt = nil end
+                local bminx, bminy, bmaxx, bmaxy = 0, 0, 1, 1
+                if bounds_min ~= nil then bminx, bminy = bounds_min.x, bounds_min.y end
+                if bounds_max ~= nil then bmaxx, bmaxy = bounds_max.x, bounds_max.y end
+                local spec = ResolveSpec(sp)
+                if BeginItemEx(label_id, internal.FitterRect(bminx, bminy, bmaxx, bmaxy), spec) then
+                    if rows <= 0 or cols <= 0 then
+                        EndItem()
+                        return
+                    end
+                    local draw_list = internal.GetPlotDrawList()
+                    local col_maj = ImHasFlag(spec.Flags, ImPlotHeatmapFlags.ColMajor)
+                    local indexer = internal.IndexerIdx(values, rows * cols, spec.Offset, spec.Stride)
+                    internal.RenderHeatmap(draw_list, indexer, rows, cols, scale_min or 0, scale_max or 0, fmt, bminx, bminy, bmaxx, bmaxy, true, col_maj)
+                    EndItem()
+                end
+            end
+
+            -------------------------------------------------------------------
+            -- PlotHistogram
+            -------------------------------------------------------------------
+
+            -- [Port] gp.TempDouble1/TempDouble2 -> reused module arrays
+            local bin_centers, bin_counts = {}, {}
+            local hist_spec = SpecDefaults({})
+
+            -- PlotHistogram(label_id, values, count?, bins = ImPlotBin.Sturges, bar_scale = 1.0, range = ImPlotRange(), spec?)
+            function ImPlot.PlotHistogram(label_id, values, count, bins, bar_scale, range, sp)
+                count = count or #values
+                bins = bins or ImPlotBin.Sturges
+                bar_scale = bar_scale or 1.0
+                local spec = ResolveSpec(sp)
+                local cumulative = ImHasFlag(spec.Flags, ImPlotHistogramFlags.Cumulative)
+                local density    = ImHasFlag(spec.Flags, ImPlotHistogramFlags.Density)
+                local outliers   = not ImHasFlag(spec.Flags, ImPlotHistogramFlags.NoOutliers)
+
+                local indexer = internal.IndexerIdx(values, count, spec.Offset, spec.Stride)
+
+                if count <= 0 or bins == 0 then
+                    return 0
+                end
+
+                -- [Port] range copied into locals (ImPlotRange passed by value)
+                local rmin, rmax = 0, 0
+                if range ~= nil then rmin, rmax = range.Min, range.Max end
+                if rmin == 0 and rmax == 0 then
+                    rmin, rmax = ImMinMaxIndexer(indexer, count)
+                end
+
+                local width
+                if bins < 0 then
+                    bins, width = CalculateBins(indexer, count, bins, rmin, rmax)
+                else
+                    width = (rmax - rmin) / bins
+                end
+
+                local below = 0
+                for b = 1, bins do
+                    bin_centers[b] = rmin + (b - 1) * width + width * 0.5
+                    bin_counts[b] = 0
+                end
+                local counted = 0
+                local max_count = 0
+                for i = 0, count - 1 do
+                    local val = indexer.At(indexer, i)
+                    if val >= rmin and val <= rmax then
+                        local b = math.clamp(floor((val - rmin) / width), 0, bins - 1) + 1
+                        bin_counts[b] += 1.0
+                        if bin_counts[b] > max_count then
+                            max_count = bin_counts[b]
+                        end
+                        counted += 1
+                    elseif val < rmin then
+                        below += 1
+                    end
+                end
+                if cumulative and density then
+                    if outliers then
+                        bin_counts[1] += below
+                    end
+                    for b = 2, bins do
+                        bin_counts[b] += bin_counts[b - 1]
+                    end
+                    local n_total = counted
+                    if outliers then n_total = count end
+                    local scale = 1.0 / n_total
+                    for b = 1, bins do
+                        bin_counts[b] *= scale
+                    end
+                    max_count = bin_counts[bins]
+                elseif cumulative then
+                    if outliers then
+                        bin_counts[1] += below
+                    end
+                    for b = 2, bins do
+                        bin_counts[b] += bin_counts[b - 1]
+                    end
+                    max_count = bin_counts[bins]
+                elseif density then
+                    local n_total = counted
+                    if outliers then n_total = count end
+                    local scale = 1.0 / (n_total * width)
+                    for b = 1, bins do
+                        bin_counts[b] *= scale
+                    end
+                    max_count *= scale
+                end
+                local spec_bars = SpecDefaults(hist_spec)
+                for _, fld in VEC4_FIELDS do CopyVec4(spec_bars[fld], spec[fld]) end
+                for _, fld in SCALAR_FIELDS do spec_bars[fld] = spec[fld] end
+                -- [Port] bins are read from the reused arrays directly (Offset/Stride already applied to values)
+                spec_bars.Offset, spec_bars.Stride = 0, IMPLOT_AUTO
+                local ic = internal.IndexerIdx(bin_centers, bins)
+                local in_ = internal.IndexerIdx(bin_counts, bins)
+                local zero = internal.IndexerConst(0)
+                if ImHasFlag(spec.Flags, ImPlotHistogramFlags.Horizontal) then
+                    spec_bars.Flags = ImPlotBarsFlags.Horizontal
+                    internal.PlotBarsHEx(label_id, internal.GetterXY(in_, ic, bins), internal.GetterXY(zero, ic, bins), bar_scale * width, spec_bars)
+                else
+                    spec_bars.Flags = 0
+                    internal.PlotBarsVEx(label_id, internal.GetterXY(ic, in_, bins), internal.GetterXY(ic, zero, bins), bar_scale * width, spec_bars)
+                end
+                return max_count
+            end
+
+            -------------------------------------------------------------------
+            -- PlotHistogram2D
+            -------------------------------------------------------------------
+
+            local bin_counts_2d = {}
+
+            -- PlotHistogram2D(label_id, xs, ys, count?, x_bins = ImPlotBin.Sturges, y_bins = ImPlotBin.Sturges, range = ImPlotRect(), spec?)
+            function ImPlot.PlotHistogram2D(label_id, xs, ys, count, x_bins, y_bins, range, sp)
+                count = count or min(#xs, #ys)
+                x_bins = x_bins or ImPlotBin.Sturges
+                y_bins = y_bins or ImPlotBin.Sturges
+                local spec = ResolveSpec(sp)
+                -- const bool cumulative = ImHasFlag(flags, ImPlotHistogramFlags_Cumulative); NOT SUPPORTED
+                local density  = ImHasFlag(spec.Flags, ImPlotHistogramFlags.Density)
+                local outliers = not ImHasFlag(spec.Flags, ImPlotHistogramFlags.NoOutliers)
+                local col_maj  = ImHasFlag(spec.Flags, ImPlotHistogramFlags.ColMajor)
+
+                local indexer_x = internal.IndexerIdx(xs, count, spec.Offset, spec.Stride)
+                local indexer_y = internal.IndexerIdx(ys, count, spec.Offset, spec.Stride)
+
+                if count <= 0 or x_bins == 0 or y_bins == 0 then
+                    return 0
+                end
+
+                local xmin, xmax, ymin, ymax = 0, 0, 0, 0
+                if range ~= nil then xmin, xmax, ymin, ymax = range.X.Min, range.X.Max, range.Y.Min, range.Y.Max end
+                if xmin == 0 and xmax == 0 then
+                    -- [Port] upstream writes &range.X.Min twice here (leaving X.Max = 0); fixed to fill X.Max
+                    xmin, xmax = ImMinMaxIndexer(indexer_x, count)
+                end
+                if ymin == 0 and ymax == 0 then
+                    ymin, ymax = ImMinMaxIndexer(indexer_y, count)
+                end
+
+                local width, height
+                if x_bins < 0 then
+                    x_bins, width = CalculateBins(indexer_x, count, x_bins, xmin, xmax)
+                else
+                    width = (xmax - xmin) / x_bins
+                end
+                if y_bins < 0 then
+                    y_bins, height = CalculateBins(indexer_y, count, y_bins, ymin, ymax)
+                else
+                    height = (ymax - ymin) / y_bins
+                end
+
+                local bins = x_bins * y_bins
+                local counts = bin_counts_2d
+                for b = 1, bins do
+                    counts[b] = 0
+                end
+
+                local counted = 0
+                local max_count = 0
+                for i = 0, count - 1 do
+                    local x, y = indexer_x.At(indexer_x, i), indexer_y.At(indexer_y, i)
+                    if x >= xmin and x <= xmax and y >= ymin and y <= ymax then
+                        local xb = math.clamp(floor((x - xmin) / width), 0, x_bins - 1)
+                        local yb = math.clamp(floor((y - ymin) / height), 0, y_bins - 1)
+                        local b  = yb * x_bins + xb + 1
+                        counts[b] += 1.0
+                        if counts[b] > max_count then
+                            max_count = counts[b]
+                        end
+                        counted += 1
+                    end
+                end
+                if density then
+                    local n_total = counted
+                    if outliers then n_total = count end
+                    local scale = 1.0 / (n_total * width * height)
+                    for b = 1, bins do
+                        counts[b] *= scale
+                    end
+                    max_count *= scale
+                end
+
+                if BeginItemEx(label_id, internal.FitterRect(xmin, ymin, xmax, ymax), spec) then
+                    if y_bins <= 0 or x_bins <= 0 then
+                        EndItem()
+                        return max_count
+                    end
+                    local draw_list = internal.GetPlotDrawList()
+                    local indexer_bin = internal.IndexerIdx(counts, y_bins * x_bins)
+                    internal.RenderHeatmap(draw_list, indexer_bin, y_bins, x_bins, 0, max_count, nil, xmin, ymin, xmax, ymax, false, col_maj)
+                    EndItem()
+                end
+                return max_count
+            end
+
+            -------------------------------------------------------------------
+            -- PlotImage
+            -------------------------------------------------------------------
+
+            local IMAGE_UV0, IMAGE_UV1, IMAGE_TINT = ImVec2(0, 0), ImVec2(1, 1), ImVec4(1, 1, 1, 1)
+
+            -- PlotImage(label_id, tex_ref, bmin, bmax, uv0 = (0,0), uv1 = (1,1), tint_col = (1,1,1,1), spec?)
+            -- [Port] tex_ref is passed through unchanged to ImDrawList:AddImage
+            function ImPlot.PlotImage(label_id, tex_ref, bmin, bmax, uv0, uv1, tint_col, sp)
+                uv0 = uv0 or IMAGE_UV0
+                uv1 = uv1 or IMAGE_UV1
+                tint_col = tint_col or IMAGE_TINT
+                local spec = ResolveSpec(sp)
+                if BeginItemEx(label_id, internal.FitterRect(bmin.x, bmin.y, bmax.x, bmax.y), spec) then
+                    local tint_col32 = ImGui.ColorConvertFloat4ToU32(tint_col)
+                    internal.GetCurrentItem().Color = tint_col32
+                    local draw_list = internal.GetPlotDrawList()
+                    local p1 = ImPlot.PlotToPixels(bmin.x, bmax.y, IMPLOT_AUTO, IMPLOT_AUTO)
+                    local p2 = ImPlot.PlotToPixels(bmax.x, bmin.y, IMPLOT_AUTO, IMPLOT_AUTO)
+                    PushPlotClipRect()
+                    draw_list:AddImage(tex_ref, p1, p2, uv0, uv1, tint_col32)
+                    PopPlotClipRect()
+                    EndItem()
+                end
+            end
+        end
+
+        -----------------------------------------------------------------------
+        -- RenderColorBar, ColormapScale, ColormapSlider, ColormapButton, ColormapIcon (implot.cpp)
+        -----------------------------------------------------------------------
+        do
+            local ImPlotColormapScaleFlags = ImPlot.ImPlotColormapScaleFlags
+            local ImGuiCol, ImGuiStyleVar = G.ImGuiCol, G.ImGuiStyleVar
+            local cb_min, cb_max = ImVec2(0, 0), ImVec2(0, 0)
+
+            local function CalcTextColorU32(c) return internal.CalcTextColor(c) end
+
+            -- [Port] colors passed as (array, 0-based offset) as returned by ImPlotColormapData:GetKeys; bounds as ImRect
+            function internal.RenderColorBar(colors, offset, size, DrawList, bounds, vert, reversed, continuous)
+                local n = size
+                if continuous then n = size - 1 end
+                local col1, col2
+                if vert then
+                    local step = bounds:GetHeight() / n
+                    cb_min.x, cb_min.y, cb_max.x, cb_max.y = bounds.Min.x, bounds.Min.y, bounds.Max.x, bounds.Min.y + step
+                    for i = 0, n - 1 do
+                        if reversed then
+                            col1 = colors[offset + size - i]
+                            col2 = col1
+                            if continuous then col2 = colors[offset + size - i - 1] end
+                        else
+                            col1 = colors[offset + i + 1]
+                            col2 = col1
+                            if continuous then col2 = colors[offset + i + 2] end
+                        end
+                        DrawList:AddRectFilledMultiColor(cb_min, cb_max, col1, col1, col2, col2)
+                        cb_min.y += step; cb_max.y += step
+                    end
+                else
+                    local step = bounds:GetWidth() / n
+                    cb_min.x, cb_min.y, cb_max.x, cb_max.y = bounds.Min.x, bounds.Min.y, bounds.Min.x + step, bounds.Max.y
+                    for i = 0, n - 1 do
+                        if reversed then
+                            col1 = colors[offset + size - i]
+                            col2 = col1
+                            if continuous then col2 = colors[offset + size - i - 1] end
+                        else
+                            col1 = colors[offset + i + 1]
+                            col2 = col1
+                            if continuous then col2 = colors[offset + i + 2] end
+                        end
+                        DrawList:AddRectFilledMultiColor(cb_min, cb_max, col1, col2, col2, col1)
+                        cb_min.x += step; cb_max.x += step
+                    end
+                end
+            end
+            local RenderColorBar = internal.RenderColorBar
+
+            local function ResolveCmap(gp, cmap)
+                if cmap == nil or cmap == IMPLOT_AUTO then cmap = gp.Style.Colormap end
+                IM_ASSERT(cmap >= 0 and cmap < gp.ColormapData.Count, "Invalid colormap index!")
+                return cmap
+            end
+
+            -- ColormapScale(label, scale_min, scale_max, size = (0,0), format = "%g", flags = 0, cmap = IMPLOT_AUTO)
+            function ImPlot.ColormapScale(label, scale_min, scale_max, size, format, flags, cmap)
+                size = size or ImVec2(0, 0)
+                format = format or "%g"
+                flags = flags or 0
+                local Window = ImGui.GetCurrentWindow()
+                if Window.SkipItems then
+                    return
+                end
+
+                local ID = Window:GetID(label)
+                local label_size = ImVec2(0, 0)
+                if not ImHasFlag(flags, ImPlotColormapScaleFlags.NoLabel) then
+                    label_size = ImGui.CalcTextSize(label, nil, true)
+                end
+
+                local gp = GImPlot
+                cmap = ResolveCmap(gp, cmap)
+                local style = gp.Style
+
+                local frame_size = ImGui.CalcItemSize(size, 0, style.PlotDefaultSize.y)
+                if frame_size.y < style.PlotMinSize.y and size.y < 0.0 then
+                    frame_size.y = style.PlotMinSize.y
+                end
+
+                local range = ImPlot.ImPlotRange(min(scale_min, scale_max), max(scale_min, scale_max))
+                if gp.CTicker == nil then gp.CTicker = internal.ImPlotTicker() end
+                local ticker = gp.CTicker
+                ticker:Reset()
+                internal.Locator_Default(ticker, range, frame_size.y, true, internal.Formatter_Default, format)
+
+                local rend_label = label_size.x > 0
+                local txt_off = style.LabelPadding.x
+                local pad = txt_off + ticker.MaxSize.x
+                if rend_label then pad += txt_off + label_size.y end
+                local bar_w = 20
+                if frame_size.x == 0 then
+                    frame_size.x = bar_w + pad + 2 * style.PlotPadding.x
+                else
+                    bar_w = frame_size.x - (pad + 2 * style.PlotPadding.x)
+                    if bar_w < style.MajorTickLen.y then
+                        bar_w = style.MajorTickLen.y
+                    end
+                end
+
+                local DrawList = Window.DrawList
+                local cp = Window.DC.CursorPos
+                local bb_frame = G.ImRect(cp.x, cp.y, cp.x + frame_size.x, cp.y + frame_size.y)
+                ImGui.ItemSize(bb_frame)
+                if not ImGui.ItemAdd(bb_frame, ID, bb_frame) then
+                    return
+                end
+
+                ImGui.RenderFrame(bb_frame.Min, bb_frame.Max, GetStyleColorU32(ImPlotCol.FrameBg), true, ImGui.GetStyle().FrameRounding)
+
+                local opposite = ImHasFlag(flags, ImPlotColormapScaleFlags.Opposite)
+                local inverted = ImHasFlag(flags, ImPlotColormapScaleFlags.Invert)
+                local reversed = scale_min > scale_max
+
+                local bb_grad_shift = 0
+                if opposite then bb_grad_shift = pad end
+                local bb_grad = G.ImRect(bb_frame.Min.x + style.PlotPadding.x + bb_grad_shift, bb_frame.Min.y + style.PlotPadding.y,
+                    bb_frame.Min.x + bar_w + style.PlotPadding.x + bb_grad_shift, bb_frame.Min.y + frame_size.y - style.PlotPadding.y)
+
+                ImGui.PushClipRect(bb_frame.Min, bb_frame.Max, true)
+                local col_text = ImGui.GetColorU32(ImGuiCol.Text)
+
+                local invert_scale = inverted ~= reversed
+                local y_min, y_max = bb_grad.Min.y, bb_grad.Max.y
+                if invert_scale then y_min, y_max = bb_grad.Max.y, bb_grad.Min.y end
+
+                local keys, keys_off = gp.ColormapData:GetKeys(cmap)
+                RenderColorBar(keys, keys_off, gp.ColormapData:GetKeyCount(cmap), DrawList, bb_grad, true, not inverted, not gp.ColormapData:IsQual(cmap))
+                for i = 0, ticker:TickCount() - 1 do
+                    local tick = ticker.Ticks[i + 1]
+                    local y_pos_plt = tick.PlotPos
+                    -- ImRemap(y_pos_plt, range.Max, range.Min, y_min, y_max)
+                    local y_pos = y_min + (y_max - y_min) * (y_pos_plt - range.Max) / (range.Min - range.Max)
+                    local tick_width = style.MinorTickLen.y
+                    local tick_thick = style.MinorTickSize.y
+                    if tick.Major then tick_width, tick_thick = style.MajorTickLen.y, style.MajorTickSize.y end
+                    local tick_t = (y_pos_plt - scale_min) / (scale_max - scale_min)
+                    local tick_col = CalcTextColorU32(gp.ColormapData:LerpTable(cmap, tick_t))
+                    if y_pos < bb_grad.Max.y - 2 and y_pos > bb_grad.Min.y + 2 then
+                        if opposite then
+                            internal.AddLineH(DrawList, bb_grad.Min.x + 1, bb_grad.Min.x + tick_width, y_pos, tick_col, tick_thick)
+                        else
+                            internal.AddLineH(DrawList, bb_grad.Max.x - 1, bb_grad.Max.x - tick_width, y_pos, tick_col, tick_thick)
+                        end
+                    end
+                    local txt_x = bb_grad.Max.x + txt_off
+                    if opposite then txt_x = bb_grad.Min.x - txt_off - tick.LabelSize.x end
+                    local txt_y = y_pos - tick.LabelSize.y * 0.5
+                    local text = ticker:GetText(i)
+                    if text ~= nil then
+                        DrawList:AddText(nil, 0.0, ImVec2(txt_x, txt_y), col_text, text, 1, #text + 1)
+                    end
+                end
+
+                if rend_label then
+                    local pos_x = bb_grad.Max.x + 2 * txt_off + ticker.MaxSize.x
+                    if opposite then pos_x = bb_frame.Min.x + style.PlotPadding.x end
+                    local pos_y = (bb_grad.Min.y + bb_grad.Max.y) * 0.5 + label_size.x * 0.5
+                    local label_end = ImGui.FindRenderedTextEnd(label)
+                    internal.AddTextVertical(DrawList, ImVec2(pos_x, pos_y), col_text, string.sub(label, 1, label_end - 1))
+                end
+                DrawList:AddRect(bb_grad.Min, bb_grad.Max, GetStyleColorU32(ImPlotCol.PlotBorder))
+                ImGui.PopClipRect()
+            end
+
+            -- [Port] float* t / ImVec4* out: takes t by value and returns (t, changed) like ImGui.SliderFloat;
+            --        if `out` (ImVec4) is given it is filled in place with the sampled color.
+            function ImPlot.ColormapSlider(label, t, out, format, cmap)
+                format = format or ""
+                t = math.clamp(t, 0.0, 1.0)
+                local Window = ImGui.GetCurrentWindow()
+                if Window.SkipItems then
+                    return t, false
+                end
+                local gp = GImPlot
+                cmap = ResolveCmap(gp, cmap)
+                local keys, keys_off = gp.ColormapData:GetKeys(cmap)
+                local count = gp.ColormapData:GetKeyCount(cmap)
+                local qual = gp.ColormapData:IsQual(cmap)
+                local pos = Window.DC.CursorPos
+                local w = ImGui.CalcItemWidth()
+                local h = ImGui.GetFrameHeight()
+                local rect = G.ImRect(pos.x, pos.y, pos.x + w, pos.y + h)
+                RenderColorBar(keys, keys_off, count, ImGui.GetWindowDrawList(), rect, false, false, not qual)
+                local grab = CalcTextColorU32(gp.ColormapData:LerpTable(cmap, t))
+                -- const ImU32 text = CalcTextColor(gp.ColormapData.LerpTable(cmap,0.5f));
+                ImGui.PushStyleColor(ImGuiCol.FrameBg, G.IM_COL32_BLACK_TRANS)
+                ImGui.PushStyleColor(ImGuiCol.FrameBgActive, G.IM_COL32_BLACK_TRANS)
+                ImGui.PushStyleColor(ImGuiCol.FrameBgHovered, ImVec4(1, 1, 1, 0.1))
+                ImGui.PushStyleColor(ImGuiCol.SliderGrab, grab)
+                ImGui.PushStyleColor(ImGuiCol.SliderGrabActive, grab)
+                ImGui.PushStyleVar(ImGuiStyleVar.GrabMinSize, 2)
+                ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 0)
+                local changed
+                t, changed = ImGui.SliderFloat(label, t, 0, 1, format)
+                ImGui.PopStyleColor(5)
+                ImGui.PopStyleVar(2)
+                if out ~= nil then
+                    local c = ImGui.ColorConvertU32ToFloat4(gp.ColormapData:LerpTable(cmap, t))
+                    out.x, out.y, out.z, out.w = c.x, c.y, c.z, c.w
+                end
+                return t, changed
+            end
+
+            -- ColormapButton(label, size_arg = (0,0), cmap = IMPLOT_AUTO)
+            function ImPlot.ColormapButton(label, size_arg, cmap)
+                size_arg = size_arg or ImVec2(0, 0)
+                local style = ImGui.GetStyle()
+                local Window = ImGui.GetCurrentWindow()
+                if Window.SkipItems then
+                    return false
+                end
+                local gp = GImPlot
+                cmap = ResolveCmap(gp, cmap)
+                local keys, keys_off = gp.ColormapData:GetKeys(cmap)
+                local count = gp.ColormapData:GetKeyCount(cmap)
+                local qual = gp.ColormapData:IsQual(cmap)
+                local pos = Window.DC.CursorPos
+                local label_size = ImGui.CalcTextSize(label, nil, true)
+                local size = ImGui.CalcItemSize(size_arg, label_size.x + style.FramePadding.x * 2.0, label_size.y + style.FramePadding.y * 2.0)
+                local rect = G.ImRect(pos.x, pos.y, pos.x + size.x, pos.y + size.y)
+                RenderColorBar(keys, keys_off, count, ImGui.GetWindowDrawList(), rect, false, false, not qual)
+                local text = CalcTextColorU32(gp.ColormapData:LerpTable(cmap, style.ButtonTextAlign.x))
+                ImGui.PushStyleColor(ImGuiCol.Button, G.IM_COL32_BLACK_TRANS)
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, ImVec4(1, 1, 1, 0.1))
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive, ImVec4(1, 1, 1, 0.2))
+                ImGui.PushStyleColor(ImGuiCol.Text, text)
+                ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 0)
+                local pressed = ImGui.Button(label, size)
+                ImGui.PopStyleColor(4)
+                ImGui.PopStyleVar(1)
+                return pressed
+            end
+
+            function ImPlot.ColormapIcon(cmap)
+                local gp = GImPlot
+                local txt_size = ImGui.GetTextLineHeight()
+                local size = ImVec2(txt_size - 4, txt_size)
+                local pos = ImGui.GetCurrentWindow().DC.CursorPos
+                local rect = G.ImRect(pos.x, pos.y + 2, pos.x + size.x, pos.y + size.y - 2)
+                local keys, keys_off = gp.ColormapData:GetKeys(cmap)
+                RenderColorBar(keys, keys_off, gp.ColormapData:GetKeyCount(cmap), ImGui.GetWindowDrawList(), rect, false, false, not gp.ColormapData:IsQual(cmap))
+                ImGui.Dummy(size)
             end
         end
 
