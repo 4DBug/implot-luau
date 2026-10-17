@@ -1,0 +1,11 @@
+{
+	"name": "implot-luau",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"ImGui": { "$path": "tools/core/build/ImGuiTyped.luau", "Impl": { "$path": "tools/core/build/ImGui.luau" } },
+			"ImPlot": { "$path": "ImPlot.lua" }
+		},
+		"StarterPlayer": { "StarterPlayerScripts": { "ImPlotExample": { "$path": "examples/roblox/main.client.luau" } } }
+	}
+}

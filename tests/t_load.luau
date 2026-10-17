@@ -1,0 +1,5 @@
+local RS = game:GetService("ReplicatedStorage")
+local G = require(RS:WaitForChild("ImGui"))
+local ImPlot = require(RS:WaitForChild("ImPlot"))(G)
+assert(type(ImPlot) == "table", "module did not return a table")
+print("OK")
