@@ -28,7 +28,7 @@ ImGui.End()
 ImPlot.ShowDemoWindow(true)
 ```
 
-Full LocalScript: `examples/roblox/main.client.luau` (live scrolling sine wave + demo windows).
+Full LocalScript: `examples/roblox/main.client.luau` (ImPlot demo window).
 
 ## API differences from C++
 
