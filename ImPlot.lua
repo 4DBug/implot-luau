@@ -874,7 +874,9 @@ return function(G)
                 CurrentAlignmentV = nil,
                 -- Temp data for general use
                 OpenContextThisFrame = false,
-                -- [Port] TODO: NextItemData, Annotations, Tags, Subplots (later milestones)
+                -- [Port] TODO: Annotations, Tags, Subplots (later milestones)
+                -- [Port] ctor resolved lazily (defined in the items section)
+                NextItemData = nil,
                 NextPlotData = internal.ImPlotNextPlotData(),
                 InputMap = ImPlot.ImPlotInputMap(),
             }
@@ -948,6 +950,7 @@ return function(G)
 
         function ImPlot.CreateContext()
             local ctx = internal.ImPlotContext()
+            ctx.NextItemData = internal.ImPlotNextItemData()
             internal.Initialize(ctx)
             if GImPlot == nil then
                 ImPlot.SetCurrentContext(ctx)
@@ -1503,8 +1506,7 @@ return function(G)
                 p.Axes[i] = internal.ImPlotAxis()
                 p.Axes[i].Vertical = i >= ImAxis.Y1
             end
-            -- [Port] TODO: ImPlotItemGroup (items/legend milestone); only the ID is needed for now
-            p.Items             = { ID = 0 }
+            p.Items             = internal.ImPlotItemGroup()
             p.CurrentX          = ImAxis.X1
             p.CurrentY          = ImAxis.Y1
             p.FrameRect         = G.ImRect()
@@ -1744,8 +1746,9 @@ return function(G)
         end
 
         function internal.ResetCtxForNextPlot(ctx)
-            -- [Port] TODO: NextItemData/Annotations/Tags/digital counters (later milestones)
+            -- [Port] TODO: Annotations/Tags/digital counters (later milestones)
             -- reset legend items
+            ctx.NextItemData:Reset()
             ctx.NextPlotData:Reset()
             ctx.OpenContextThisFrame = false
             -- nullify plot
@@ -2054,8 +2057,10 @@ return function(G)
             ImGui.PopItemWidth()
         end
 
-        -- [Port] TODO: Legend and Subplots menus (legend / subplots milestones)
+        -- [Port] TODO: Subplots menu (subplots milestone)
         function internal.ShowPlotContextMenu(plot)
+            local gp = GImPlot
+            local owns_legend = gp.CurrentItems == plot.Items
             local equal = ImHasFlag(plot.Flags, ImPlotFlags.Equal)
 
             for i = 0, IMPLOT_NUM_X_AXES - 1 do
@@ -2089,6 +2094,16 @@ return function(G)
             end
 
             ImGui.Separator()
+            if not ImHasFlag(gp.CurrentItems.Legend.Flags, ImPlot.ImPlotLegendFlags.NoMenus) then
+                if ImGui.BeginMenu("Legend") then
+                    if owns_legend then
+                        if internal.ShowLegendContextMenu(plot.Items.Legend, not ImHasFlag(plot.Flags, ImPlotFlags.NoLegend)) then
+                            plot.Flags = ImFlipFlag(plot.Flags, ImPlotFlags.NoLegend)
+                        end
+                    end
+                    ImGui.EndMenu()
+                end
+            end
             if ImGui.BeginMenu("Settings") then
                 if ImGui.MenuItem("Equal", nil, ImHasFlag(plot.Flags, ImPlotFlags.Equal)) then
                     plot.Flags = ImFlipFlag(plot.Flags, ImPlotFlags.Equal)
@@ -2577,7 +2592,7 @@ return function(G)
             axis:PullLinks()
         end
 
-        -- [Port] TODO: SetupAxisTicks, SetupAxisScale, SetupAxisLimitsConstraints, SetupAxisZoomConstraints, SetupLegend, SetupMouseText
+        -- [Port] TODO: SetupAxisTicks, SetupAxisScale, SetupAxisLimitsConstraints, SetupAxisZoomConstraints, SetupMouseText
 
         function ImPlot.SetupAxes(x_label, y_label, x_flags, y_flags)
             ImPlot.SetupAxis(ImAxis.X1, x_label, x_flags)
@@ -2765,7 +2780,7 @@ return function(G)
             SetRect(plot.AxesRect, fr.Min.x, fr.Min.y, fr.Max.x, fr.Max.y)
 
             -- outside legend adjustments
-            -- [Port] TODO: legend milestone
+            internal.AdjustForOutsideLegend(plot)
 
             -- plot bb
             local pad_top, pad_bot, pad_left, pad_right = 0, 0, 0, 0
@@ -2988,7 +3003,7 @@ return function(G)
             end
 
             -- clear legend (TODO: put elsewhere)
-            -- [Port] TODO: plot.Items.Legend:Reset() (legend milestone)
+            plot.Items.Legend:Reset()
             -- push ID to set item hashes (NB: !!!THIS PROBABLY NEEDS TO BE IN BEGIN PLOT!!!!)
             ImGui.PushOverrideID(gp.CurrentItems.ID)
         end
@@ -3112,7 +3127,10 @@ return function(G)
                 internal.RenderSelectionRect(DrawList, ImVec2(sr.Min.x + pr.Min.x, sr.Min.y + pr.Min.y), ImVec2(sr.Max.x + pr.Min.x, sr.Max.y + pr.Min.y), GetStyleColorVec4(ImPlotCol.Selection))
             end
 
-            -- [Port] TODO: annotations, crosshairs, mouse text, axis side switch, legend (later milestones)
+            -- [Port] TODO: annotations, crosshairs, mouse text, axis side switch (later milestones)
+
+            -- render legend
+            internal.RenderPlotLegend(plot, DrawList)
 
             -- render border
             if render_border then
@@ -3140,8 +3158,7 @@ return function(G)
             -- CONTEXT MENUS -----------------------------------------------------------
             ImGui.PushOverrideID(plot.ID)
 
-            -- [Port] TODO: && !plot.Items.Legend.Hovered (legend milestone)
-            local can_ctx = gp.OpenContextThisFrame and not ImHasFlag(plot.Flags, ImPlotFlags.NoMenus)
+            local can_ctx = gp.OpenContextThisFrame and not ImHasFlag(plot.Flags, ImPlotFlags.NoMenus) and not plot.Items.Legend.Hovered
             local axis_equal = ImHasFlag(plot.Flags, ImPlotFlags.Equal)
 
             -- main ctx menu
@@ -3190,6 +3207,11 @@ return function(G)
             -- remove items
             if gp.CurrentItems == plot.Items then
                 gp.CurrentItems = nil
+            end
+            -- reset the plot items for the next frame
+            for i = 0, plot.Items:GetItemCount() - 1 do
+                local it = plot.Items:GetItemByIndex(i)
+                if it then it.SeenThisFrame = false end
             end
 
             -- mark the plot as initialized, i.e. having made it through one frame completely
@@ -3256,6 +3278,1375 @@ return function(G)
             IM_ASSERT(GImPlot.CurrentPlot ~= nil, "IsPlotHovered() needs to be called between BeginPlot() and EndPlot()!")
             SetupLock()
             return GImPlot.CurrentPlot.Hovered
+        end
+    end
+
+    --------------------------------------------------------------------------
+    -- [SECTION] Items, Legend, Getters, Fitters, Transformers, Renderers, PlotLine, PlotScatter
+    -- (implot_items.cpp + item/legend parts of implot.cpp / implot_internal.h)
+    -- [Port] Data arrays are 1-based Lua arrays; indices passed to getters/indexers stay 0-based like upstream.
+    -- [Port] Spec.Stride is measured in elements (IMPLOT_AUTO -> 1) instead of bytes.
+    -- [Port] Getters return (x, y) numbers instead of an ImPlotPoint so hot loops never allocate.
+    --------------------------------------------------------------------------
+    do
+        local ImAxis = ImPlot.ImAxis
+        local ImPlotCol = ImPlot.ImPlotCol
+        local ImPlotMarker = ImPlot.ImPlotMarker
+        local ImPlotItemFlags = ImPlot.ImPlotItemFlags
+        local ImPlotLineFlags = ImPlot.ImPlotLineFlags
+        local ImPlotScatterFlags = ImPlot.ImPlotScatterFlags
+        local ImPlotLegendFlags = ImPlot.ImPlotLegendFlags
+        local ImPlotLocation = ImPlot.ImPlotLocation
+        local ImPlotFlags = ImPlot.ImPlotFlags
+        local IMPLOT_AUTO = ImPlot.IMPLOT_AUTO
+        local ImHasFlag = internal.ImHasFlag
+        local GetStyleColorU32 = internal.GetStyleColorU32
+        local band, bor, bnot, lshift, rshift = bit32.band, bit32.bor, bit32.bnot, bit32.lshift, bit32.rshift
+        local writef64, writeu32 = buffer.writef64, buffer.writeu32
+        local sqrt, floor, min, max = math.sqrt, math.floor, math.min, math.max
+        local ImPlotMarker_Invalid = -3
+        internal.ImPlotMarker_Invalid = ImPlotMarker_Invalid
+
+        local SQRT_1_2 = 0.70710678118
+        local SQRT_3_2 = 0.86602540378
+        -- [Port] ImDrawIdx is unsigned int in the core
+        local MAX_IDX = 4294967295
+
+        local function IsColorAuto(col) return col.w == -1 end
+
+        local function ImAlphaU32(col, alpha)
+            return band(col, bnot(lshift(floor((1 - alpha) * 255), 24)))
+        end
+        internal.ImAlphaU32 = ImAlphaU32
+
+        -- [Port] scalar alpha multiply on a packed color (replaces ColorConvertU32ToFloat4 + GetColorU32 per point)
+        local function MulAlphaU32(col, alpha)
+            local a = floor(rshift(col, 24) * alpha + 0.5)
+            if a > 255 then a = 255 elseif a < 0 then a = 0 end
+            return bor(band(col, 0x00FFFFFF), lshift(a, 24))
+        end
+
+        local function CopyVec4(dst, src) dst.x, dst.y, dst.z, dst.w = src.x, src.y, src.z, src.w end
+
+        -----------------------------------------------------------------------
+        -- ImPlotSpec
+        -----------------------------------------------------------------------
+
+        local ImPlotProp = ImPlot.ImPlotProp
+        local PROP_FIELD = {}
+        for name, v in ImPlotProp do PROP_FIELD[v] = name end
+        local VEC4_FIELDS = { "LineColor", "FillColor", "MarkerLineColor", "MarkerFillColor" }
+        local SCALAR_FIELDS = { "LineColors", "LineWeight", "FillColors", "FillAlpha", "Marker", "MarkerSize", "MarkerSizes",
+                                "MarkerLineColors", "MarkerFillColors", "Size", "Offset", "Stride", "Flags" }
+
+        local function SpecDefaults(s)
+            for _, f in VEC4_FIELDS do
+                local c = s[f]
+                if c then c.x, c.y, c.z, c.w = 0, 0, 0, -1 else s[f] = IMPLOT_AUTO_COL() end
+            end
+            s.LineColors = nil; s.LineWeight = 1.0
+            s.FillColors = nil; s.FillAlpha = 1.0
+            s.Marker = ImPlotMarker.None; s.MarkerSize = 4; s.MarkerSizes = nil
+            s.MarkerLineColors = nil; s.MarkerFillColors = nil
+            s.Size = 4; s.Offset = 0; s.Stride = IMPLOT_AUTO; s.Flags = ImPlotItemFlags.None
+            return s
+        end
+
+        local SpecMT = {}
+        SpecMT.__index = SpecMT
+        -- Set properties from (ImPlotProp, value) pairs in any order. Colors may be ImVec4 or ImU32.
+        function SpecMT:SetProp(...)
+            local n = select("#", ...)
+            IM_ASSERT(n % 2 == 0, "Odd number of arguments! You must provide (ImPlotProp,value) pairs!")
+            for i = 1, n, 2 do
+                local prop, v = select(i, ...)
+                local f = PROP_FIELD[prop]
+                IM_ASSERT(f ~= nil, "Invalid ImPlotProp")
+                if type(v) == "number" and (f == "LineColor" or f == "FillColor" or f == "MarkerLineColor" or f == "MarkerFillColor") then
+                    v = ImGui.ColorConvertU32ToFloat4(v)
+                end
+                self[f] = v
+            end
+            return self
+        end
+
+        -- [Port] ImPlotSpec(): ImPlotSpec(), ImPlotSpec(prop, value, ...) or ImPlotSpec({ LineWeight = 2, ... })
+        function ImPlot.ImPlotSpec(...)
+            local s = setmetatable(SpecDefaults({}), SpecMT)
+            local first = ...
+            if type(first) == "table" then
+                for k, v in first do s[k] = v end
+            elseif first ~= nil then
+                s:SetProp(...)
+            end
+            return s
+        end
+
+        local function CopySpec(dst, src)
+            for _, f in VEC4_FIELDS do CopyVec4(dst[f], src[f]) end
+            for _, f in SCALAR_FIELDS do dst[f] = src[f] end
+        end
+
+        -----------------------------------------------------------------------
+        -- ImPlotItem, ImPlotLegend, ImPlotItemGroup, ImPlotNextItemData
+        -----------------------------------------------------------------------
+
+        -- State information for Plot items
+        -- [Port] NameOffset into Legend.Labels -> Label string stored on the item
+        function internal.ImPlotItem()
+            return {
+                ID              = 0,
+                Color           = G.IM_COL32_WHITE,
+                Marker          = ImPlotMarker.None,
+                LegendHoverRect = G.ImRect(),
+                Label           = nil,
+                Show            = true,
+                LegendHovered   = false,
+                SeenThisFrame   = false,
+            }
+        end
+
+        -- Holds Legend state
+        local LegendMT = {}
+        LegendMT.__index = LegendMT
+        function internal.ImPlotLegend()
+            return setmetatable({
+                Flags = ImPlotLegendFlags.None, PreviousFlags = ImPlotLegendFlags.None,
+                Location = ImPlotLocation.NorthWest, PreviousLocation = ImPlotLocation.NorthWest,
+                Scroll = ImVec2(0, 0),
+                Indices = {}, -- [Port] 1-based array of 0-based ItemPool indices
+                Rect = G.ImRect(), RectClamped = G.ImRect(),
+                Hovered = false, Held = false, CanGoInside = true,
+            }, LegendMT)
+        end
+        function LegendMT:Reset() table.clear(self.Indices) end
+
+        -- Holds Items and Legend data
+        local GroupMT = {}
+        GroupMT.__index = GroupMT
+        function internal.ImPlotItemGroup()
+            return setmetatable({
+                ID = 0,
+                Legend = internal.ImPlotLegend(),
+                ItemPool = G.ImPool(internal.ImPlotItem),
+                ColormapIdx = 0,
+                MarkerIdx = 0,
+            }, GroupMT)
+        end
+        function GroupMT:GetItemCount()          return self.ItemPool:GetMapSize() end
+        function GroupMT:GetItemID(label_id)     return ImGui.GetID(label_id) end
+        function GroupMT:GetItem(id)
+            if type(id) == "string" then id = self:GetItemID(id) end
+            return self.ItemPool:GetByKey(id)
+        end
+        function GroupMT:GetOrAddItem(id)        return self.ItemPool:GetOrAddByKey(id) end
+        function GroupMT:GetItemByIndex(i)       return self.ItemPool:GetByIndex(i) end
+        function GroupMT:GetItemIndex(item)      return self.ItemPool:GetIndex(item) end
+        function GroupMT:GetLegendCount()        return #self.Legend.Indices end
+        function GroupMT:GetLegendItem(i)        return self.ItemPool:GetByIndex(self.Legend.Indices[i + 1]) end
+        function GroupMT:GetLegendLabel(i)       return self:GetLegendItem(i).Label end
+        function GroupMT:Reset()
+            self.ItemPool:Clear(); self.Legend:Reset(); self.ColormapIdx = 0
+        end
+
+        -- Temporary data storage for upcoming item
+        -- [Port] Override holds values set by the obsolete SetNext*Style() helpers; applied on top of the spec passed to PlotX
+        local NextItemMT = {}
+        NextItemMT.__index = NextItemMT
+        function internal.ImPlotNextItemData()
+            local d = setmetatable({ Spec = SpecDefaults({}), Override = {} }, NextItemMT)
+            d:Reset()
+            return d
+        end
+        function NextItemMT:Reset()
+            SpecDefaults(self.Spec)
+            table.clear(self.Override)
+            self.HasHidden = false; self.Hidden = false
+            self.HiddenCond = ImPlot.ImPlotCond.None
+        end
+
+        local function GetItemData() return GImPlot.NextItemData end
+        internal.GetItemData = GetItemData
+
+        -- [Port] resolves the user spec (nil / plain table / ImPlotSpec) + SetNext*Style overrides into a reused scratch spec
+        local scratch_spec = SpecDefaults({})
+        local function ResolveSpec(spec)
+            SpecDefaults(scratch_spec)
+            if spec ~= nil then
+                for k, v in spec do
+                    if type(v) == "table" and scratch_spec[k] ~= nil and v.w ~= nil then CopyVec4(scratch_spec[k], v)
+                    else scratch_spec[k] = v end
+                end
+            end
+            for k, v in GImPlot.NextItemData.Override do
+                if type(v) == "table" then CopyVec4(scratch_spec[k], v) else scratch_spec[k] = v end
+            end
+            return scratch_spec
+        end
+        internal.ResolveSpec = ResolveSpec
+
+        -- [Port] obsolete upstream (v1.0) helpers, kept for compatibility: values apply to the next PlotX call only
+        local function SetOverride(field, v, is_col)
+            if v == nil then return end
+            if is_col then
+                if IsColorAuto(v) then return end
+                v = ImVec4(v.x, v.y, v.z, v.w)
+            elseif v == IMPLOT_AUTO then
+                return
+            end
+            GImPlot.NextItemData.Override[field] = v
+        end
+        function ImPlot.SetNextLineStyle(col, weight)
+            SetOverride("LineColor", col, true); SetOverride("LineWeight", weight)
+        end
+        function ImPlot.SetNextFillStyle(col, alpha_mod)
+            SetOverride("FillColor", col, true); SetOverride("FillAlpha", alpha_mod)
+        end
+        function ImPlot.SetNextMarkerStyle(marker, size, fill, weight, outline)
+            SetOverride("Marker", marker); SetOverride("MarkerSize", size)
+            SetOverride("MarkerFillColor", fill, true); SetOverride("LineWeight", weight)
+            SetOverride("MarkerLineColor", outline, true)
+        end
+        function ImPlot.SetNextErrorBarStyle(col, size, weight)
+            SetOverride("LineColor", col, true); SetOverride("Size", size); SetOverride("LineWeight", weight)
+        end
+
+        -----------------------------------------------------------------------
+        -- Item Utils
+        -----------------------------------------------------------------------
+
+        function ImPlot.NextMarker()
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentItems ~= nil, "NextMarker() needs to be called between BeginPlot() and EndPlot()!")
+            local idx = gp.CurrentItems.MarkerIdx % ImPlotMarker.COUNT
+            gp.CurrentItems.MarkerIdx += 1
+            return idx
+        end
+
+        -- [Port] just_created is returned as a second value
+        function internal.RegisterOrGetItem(label_id, flags)
+            local Items = GImPlot.CurrentItems
+            local id = Items:GetItemID(label_id)
+            local just_created = Items:GetItem(id) == nil
+            local item = Items:GetOrAddItem(id)
+            if item.SeenThisFrame then
+                return item, just_created
+            end
+            item.SeenThisFrame = true
+            local idx = Items:GetItemIndex(item)
+            item.ID = id
+            if not ImHasFlag(flags, ImPlotItemFlags.NoLegend) and ImGui.FindRenderedTextEnd(label_id) ~= 1 then
+                table.insert(Items.Legend.Indices, idx)
+                item.Label = label_id
+            else
+                item.Show = true
+            end
+            return item, just_created
+        end
+
+        function internal.GetItem(label_id)
+            return GImPlot.CurrentItems:GetItem(label_id)
+        end
+
+        function ImPlot.IsItemHidden(label_id)
+            local item = internal.GetItem(label_id)
+            return item ~= nil and not item.Show
+        end
+
+        function internal.GetCurrentItem() return GImPlot.CurrentItem end
+
+        function ImPlot.GetLastItemColor()
+            local gp = GImPlot
+            if gp.PreviousItem then
+                return ImGui.ColorConvertU32ToFloat4(gp.PreviousItem.Color)
+            end
+            return ImVec4(0, 0, 0, 0)
+        end
+
+        function internal.BustItemCache()
+            local gp = GImPlot
+            for p = 0, gp.Plots:GetMapSize() - 1 do
+                local plot = gp.Plots:GetByIndex(p)
+                if plot then plot.Items:Reset() end
+            end
+            -- [Port] TODO: subplots
+        end
+
+        function ImPlot.BustColorCache(plot_title_id)
+            if plot_title_id == nil then
+                internal.BustItemCache()
+            else
+                local plot = GImPlot.Plots:GetByKey(ImGui.GetCurrentWindow():GetID(plot_title_id))
+                if plot ~= nil then plot.Items:Reset() end
+            end
+        end
+
+        function internal.GetPlotDrawList() return ImGui.GetWindowDrawList() end
+
+        function internal.PushPlotClipRect(expand)
+            expand = expand or 0
+            local r = GImPlot.CurrentPlot.PlotRect
+            ImGui.PushClipRect(ImVec2(r.Min.x - expand, r.Min.y - expand), ImVec2(r.Max.x + expand, r.Max.y + expand), true)
+        end
+        function internal.PopPlotClipRect() ImGui.PopClipRect() end
+        local PushPlotClipRect, PopPlotClipRect = internal.PushPlotClipRect, internal.PopPlotClipRect
+
+        -----------------------------------------------------------------------
+        -- BeginItem / EndItem
+        -----------------------------------------------------------------------
+
+        local ITEM_HIGHLIGHT_LINE_SCALE = 2.0
+        local ITEM_HIGHLIGHT_MARK_SCALE = 1.25
+
+        -- Begins a new item. Returns false if the item should not be plotted.
+        function internal.BeginItem(label_id, spec, item_col, item_mkr)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil, "PlotX() needs to be called between BeginPlot() and EndPlot()!")
+            spec = spec or ResolveSpec(nil)
+            item_col = item_col or IMPLOT_AUTO_COL()
+            item_mkr = item_mkr or ImPlotMarker_Invalid
+            internal.SetupLock()
+            local item, just_created = internal.RegisterOrGetItem(label_id, spec.Flags)
+            -- set current item
+            gp.CurrentItem = item
+            local s = gp.NextItemData
+            -- set/override item color
+            if not IsColorAuto(item_col) then
+                item.Color = ImGui.ColorConvertFloat4ToU32(item_col)
+            elseif just_created then
+                item.Color = ImPlot.NextColormapColorU32()
+            end
+            if s.HasHidden then
+                if just_created or s.HiddenCond == G.ImGuiCond.Always then
+                    item.Show = not s.Hidden
+                end
+            end
+            -- set/override item marker
+            if item_mkr ~= ImPlotMarker_Invalid then
+                if item_mkr ~= ImPlotMarker.Auto then
+                    item.Marker = item_mkr
+                elseif just_created then
+                    item.Marker = ImPlot.NextMarker()
+                elseif item.Marker == ImPlotMarker.None then
+                    item.Marker = ImPlot.NextMarker()
+                end
+            end
+            -- return false if not shown
+            if not item.Show then
+                s:Reset()
+                gp.PreviousItem = item
+                gp.CurrentItem  = nil
+                return false
+            end
+            local ss = s.Spec
+            local c = item.Color
+            local r, g_, b, a = band(c, 0xFF) / 255, band(rshift(c, 8), 0xFF) / 255, band(rshift(c, 16), 0xFF) / 255, rshift(c, 24) / 255
+            -- stage next item spec
+            CopySpec(ss, spec)
+            if IsColorAuto(ss.LineColor) then ss.LineColor.x, ss.LineColor.y, ss.LineColor.z, ss.LineColor.w = r, g_, b, a end
+            if IsColorAuto(ss.FillColor) then ss.FillColor.x, ss.FillColor.y, ss.FillColor.z, ss.FillColor.w = r, g_, b, a end
+            ss.FillColor.w *= ss.FillAlpha
+            ss.Marker = item.Marker
+            if IsColorAuto(ss.MarkerLineColor) then CopyVec4(ss.MarkerLineColor, ss.LineColor) end
+            if IsColorAuto(ss.MarkerFillColor) then CopyVec4(ss.MarkerFillColor, ss.LineColor) end
+            ss.MarkerFillColor.w *= ss.FillAlpha
+            -- apply highlight mods
+            if item.LegendHovered then
+                local lflags = gp.CurrentItems.Legend.Flags
+                if not ImHasFlag(lflags, ImPlotLegendFlags.NoHighlightItem) then
+                    ss.LineWeight *= ITEM_HIGHLIGHT_LINE_SCALE
+                    ss.MarkerSize *= ITEM_HIGHLIGHT_MARK_SCALE
+                    ss.Size *= ITEM_HIGHLIGHT_MARK_SCALE
+                end
+                if not ImHasFlag(lflags, ImPlotLegendFlags.NoHighlightAxis) then
+                    local plot = gp.CurrentPlot
+                    if plot:EnabledAxesX() > 1 then plot.Axes[plot.CurrentX].ColorHiLi = item.Color end
+                    if plot:EnabledAxesY() > 1 then plot.Axes[plot.CurrentY].ColorHiLi = item.Color end
+                end
+            end
+            -- set render flags
+            s.RenderLine       = ss.LineColor.w > 0 and ss.LineWeight > 0
+            s.RenderFill       = ss.FillColor.w > 0
+            s.RenderMarkerLine = ss.MarkerLineColor.w > 0 and ss.LineWeight > 0
+            s.RenderMarkerFill = ss.MarkerFillColor.w > 0
+            s.RenderMarkers    = ss.Marker >= 0 and (s.RenderMarkerFill or s.RenderMarkerLine)
+            -- push rendering clip rect
+            PushPlotClipRect()
+            return true
+        end
+        local BeginItem = internal.BeginItem
+
+        -- Same as above but with fitting functionality. fitter: table with Fit(self, x_axis, y_axis)
+        function internal.BeginItemEx(label_id, fitter, spec, item_col, item_mkr)
+            if BeginItem(label_id, spec, item_col, item_mkr) then
+                local plot = GImPlot.CurrentPlot
+                if plot.FitThisFrame and not ImHasFlag(spec.Flags, ImPlotItemFlags.NoFit) then
+                    fitter:Fit(plot.Axes[plot.CurrentX], plot.Axes[plot.CurrentY])
+                end
+                return true
+            end
+            return false
+        end
+        local BeginItemEx = internal.BeginItemEx
+
+        -- Ends an item (call only if BeginItem returns true)
+        function internal.EndItem()
+            local gp = GImPlot
+            PopPlotClipRect()
+            gp.NextItemData:Reset()
+            gp.PreviousItem = gp.CurrentItem
+            gp.CurrentItem  = nil
+        end
+        local EndItem = internal.EndItem
+
+        -----------------------------------------------------------------------
+        -- Indexers
+        -----------------------------------------------------------------------
+
+        -- [Port] IndexData switch -> one At function per case, picked at construction
+        local function IdxAt3(self, i) return self.Data[i + 1] end
+        local function IdxAt2(self, i) return self.Data[(self.Offset + i) % self.Count + 1] end
+        local function IdxAt1(self, i) return self.Data[i * self.Stride + 1] end
+        local function IdxAt0(self, i) return self.Data[((self.Offset + i) % self.Count) * self.Stride + 1] end
+
+        function internal.IndexerIdx(data, count, offset, stride)
+            offset = offset or 0
+            if stride == nil or stride == IMPLOT_AUTO then stride = 1 end
+            if count ~= 0 then offset = offset % count else offset = 0 end
+            local at
+            if offset == 0 and stride == 1 then at = IdxAt3
+            elseif stride == 1 then at = IdxAt2
+            elseif offset == 0 then at = IdxAt1
+            else at = IdxAt0 end
+            return { Data = data, Count = count, Offset = offset, Stride = stride, At = at }
+        end
+
+        local function LinAt(self, i) return self.M * i + self.B end
+        function internal.IndexerLin(m, b) return { M = m, B = b, At = LinAt } end
+
+        local function ConstAt(self) return self.Ref end
+        function internal.IndexerConst(ref) return { Ref = ref, At = ConstAt } end
+
+        -----------------------------------------------------------------------
+        -- Getters
+        -----------------------------------------------------------------------
+
+        local function XYGet(self, i)
+            local ix, iy = self.IndexerX, self.IndexerY
+            return ix.At(ix, i), iy.At(iy, i)
+        end
+        function internal.GetterXY(ix, iy, count) return { IndexerX = ix, IndexerY = iy, Count = count, Get = XYGet } end
+
+        local function OverrideXGet(self, i) local g = self.Getter; local _, y = g.Get(g, i); return self.X, y end
+        function internal.GetterOverrideX(getter, x) return { Getter = getter, X = x, Count = getter.Count, Get = OverrideXGet } end
+
+        local function OverrideYGet(self, i) local g = self.Getter; local x = g.Get(g, i); return x, self.Y end
+        function internal.GetterOverrideY(getter, y) return { Getter = getter, Y = y, Count = getter.Count, Get = OverrideYGet } end
+
+        local function LoopGet(self, i) local g = self.Getter; return g.Get(g, i % (self.Count - 1)) end
+        function internal.GetterLoop(getter) return { Getter = getter, Count = getter.Count + 1, Get = LoopGet } end
+
+        -- [Port] getter(idx, data) may return an ImPlotPoint or (x, y)
+        local function FuncGet(self, i)
+            local x, y = self.Getter(i, self.Data)
+            if type(x) == "table" then return x.x, x.y end
+            return x, y
+        end
+        function internal.GetterFuncPtr(getter, data, count) return { Getter = getter, Data = data, Count = count, Get = FuncGet } end
+
+        -----------------------------------------------------------------------
+        -- Fitters
+        -----------------------------------------------------------------------
+
+        local function Fitter1Fit(self, x_axis, y_axis)
+            local g = self.Getter
+            local get = g.Get
+            for i = 0, g.Count - 1 do
+                local x, y = get(g, i)
+                x_axis:ExtendFitWith(y_axis, x, y)
+                y_axis:ExtendFitWith(x_axis, y, x)
+            end
+        end
+        function internal.Fitter1(getter) return { Getter = getter, Fit = Fitter1Fit } end
+
+        local function FitterXFit(self, x_axis)
+            local g = self.Getter
+            for i = 0, g.Count - 1 do local x = g.Get(g, i); x_axis:ExtendFit(x) end
+        end
+        function internal.FitterX(getter) return { Getter = getter, Fit = FitterXFit } end
+
+        local function FitterYFit(self, _, y_axis)
+            local g = self.Getter
+            for i = 0, g.Count - 1 do local _, y = g.Get(g, i); y_axis:ExtendFit(y) end
+        end
+        function internal.FitterY(getter) return { Getter = getter, Fit = FitterYFit } end
+
+        local function Fitter2Fit(self, x_axis, y_axis)
+            Fitter1Fit({ Getter = self.Getter1 }, x_axis, y_axis)
+            Fitter1Fit({ Getter = self.Getter2 }, x_axis, y_axis)
+        end
+        function internal.Fitter2(g1, g2) return { Getter1 = g1, Getter2 = g2, Fit = Fitter2Fit } end
+
+        local function FitterRectFit(self, x_axis, y_axis)
+            x_axis:ExtendFitWith(y_axis, self.MinX, self.MinY)
+            y_axis:ExtendFitWith(x_axis, self.MinY, self.MinX)
+            x_axis:ExtendFitWith(y_axis, self.MaxX, self.MaxY)
+            y_axis:ExtendFitWith(x_axis, self.MaxY, self.MaxX)
+        end
+        function internal.FitterRect(min_x, min_y, max_x, max_y)
+            return { MinX = min_x, MinY = min_y, MaxX = max_x, MaxY = max_y, Fit = FitterRectFit }
+        end
+
+        -----------------------------------------------------------------------
+        -- Transformers
+        -- [Port] Transformer2 state lives in upvalues (set per RenderPrimitives call) so transforms are plain calls.
+        -----------------------------------------------------------------------
+
+        local tx_pixmin, tx_pltmin, tx_pltmax, tx_m, tx_scamin, tx_scamax, tx_fwd, tx_data = 0, 0, 1, 1, 0, 1, nil, nil
+        local ty_pixmin, ty_pltmin, ty_pltmax, ty_m, ty_scamin, ty_scamax, ty_fwd, ty_data = 0, 0, 1, 1, 0, 1, nil, nil
+
+        local function TransformX(p)
+            if tx_fwd ~= nil then
+                local s = tx_fwd(p, tx_data)
+                local t = (s - tx_scamin) / (tx_scamax - tx_scamin)
+                p = tx_pltmin + (tx_pltmax - tx_pltmin) * t
+            end
+            return tx_pixmin + tx_m * (p - tx_pltmin)
+        end
+        local function TransformY(p)
+            if ty_fwd ~= nil then
+                local s = ty_fwd(p, ty_data)
+                local t = (s - ty_scamin) / (ty_scamax - ty_scamin)
+                p = ty_pltmin + (ty_pltmax - ty_pltmin) * t
+            end
+            return ty_pixmin + ty_m * (p - ty_pltmin)
+        end
+
+        function internal.SetTransformer(x_axis, y_axis)
+            tx_pixmin, tx_pltmin, tx_pltmax, tx_m = x_axis.PixelMin, x_axis.Range.Min, x_axis.Range.Max, x_axis.ScaleToPixel
+            tx_scamin, tx_scamax, tx_fwd, tx_data = x_axis.ScaleMin, x_axis.ScaleMax, x_axis.TransformForward, x_axis.TransformData
+            ty_pixmin, ty_pltmin, ty_pltmax, ty_m = y_axis.PixelMin, y_axis.Range.Min, y_axis.Range.Max, y_axis.ScaleToPixel
+            ty_scamin, ty_scamax, ty_fwd, ty_data = y_axis.ScaleMin, y_axis.ScaleMax, y_axis.TransformForward, y_axis.TransformData
+        end
+        internal.TransformX, internal.TransformY = TransformX, TransformY
+
+        -----------------------------------------------------------------------
+        -- Primitive writers (match ImDrawList: VtxBuffer.Buf, VTX_STRIDE = 36, 1-based write ptrs/_VtxCurrentIdx)
+        -----------------------------------------------------------------------
+
+        local VTX_STRIDE = G.VTX_STRIDE or 36
+
+        @native
+        local function WV(b, o, x, y, u, v, col)
+            writef64(b, o, x); writef64(b, o + 8, y); writef64(b, o + 16, u); writef64(b, o + 24, v); writeu32(b, o + 32, col)
+        end
+
+        @native
+        local function PrimLine(dl, x1, y1, x2, y2, hw, col, u0, v0, u1, v1)
+            local dx, dy = x2 - x1, y2 - y1
+            local d2 = dx * dx + dy * dy
+            if d2 > 0 then local inv = 1 / sqrt(d2); dx *= inv; dy *= inv end
+            dx *= hw; dy *= hw
+            local b = dl.VtxBuffer.Buf
+            local vw = dl._VtxWritePtr
+            local o = (vw - 1) * VTX_STRIDE
+            WV(b, o,                  x1 + dy, y1 - dx, u0, v0, col)
+            WV(b, o + VTX_STRIDE,     x2 + dy, y2 - dx, u0, v0, col)
+            WV(b, o + VTX_STRIDE * 2, x2 - dy, y2 + dx, u1, v1, col)
+            WV(b, o + VTX_STRIDE * 3, x1 - dy, y1 + dx, u1, v1, col)
+            local idx = dl._VtxCurrentIdx
+            local id, iw = dl.IdxBuffer.Data, dl._IdxWritePtr
+            id[iw] = idx; id[iw + 1] = idx + 1; id[iw + 2] = idx + 2
+            id[iw + 3] = idx; id[iw + 4] = idx + 2; id[iw + 5] = idx + 3
+            dl._VtxWritePtr = vw + 4; dl._IdxWritePtr = iw + 6; dl._VtxCurrentIdx = idx + 4
+        end
+        internal.PrimLine = PrimLine
+
+        @native
+        local function PrimRectFill(dl, x1, y1, x2, y2, col, u, v)
+            local b = dl.VtxBuffer.Buf
+            local vw = dl._VtxWritePtr
+            local o = (vw - 1) * VTX_STRIDE
+            WV(b, o,                  x1, y1, u, v, col)
+            WV(b, o + VTX_STRIDE,     x2, y2, u, v, col)
+            WV(b, o + VTX_STRIDE * 2, x1, y2, u, v, col)
+            WV(b, o + VTX_STRIDE * 3, x2, y1, u, v, col)
+            local idx = dl._VtxCurrentIdx
+            local id, iw = dl.IdxBuffer.Data, dl._IdxWritePtr
+            id[iw] = idx; id[iw + 1] = idx + 1; id[iw + 2] = idx + 2
+            id[iw + 3] = idx; id[iw + 4] = idx + 1; id[iw + 5] = idx + 3
+            dl._VtxWritePtr = vw + 4; dl._IdxWritePtr = iw + 6; dl._VtxCurrentIdx = idx + 4
+        end
+        internal.PrimRectFill = PrimRectFill
+
+        -- [Port] GetLineRenderProps returns (half_weight, u0, v0, u1, v1)
+        local function GetLineRenderProps(dl, half_weight)
+            local u0, v0, u1, v1, fringe = dl:_SelectLineTexture(half_weight * 2.0, dl.Flags)
+            return half_weight + fringe * 0.5, u0, v0, u1, v1
+        end
+
+        local function Overlaps(cr, x1, y1, x2, y2)
+            -- cull_rect.Overlaps(ImRect(ImMin(P1,P2), ImMax(P1,P2)))
+            local minx, maxx = x1, x2
+            if x2 < x1 then minx, maxx = x2, x1 end
+            local miny, maxy = y1, y2
+            if y2 < y1 then miny, maxy = y2, y1 end
+            return miny < cr.Max.y and maxy > cr.Min.y and minx < cr.Max.x and maxx > cr.Min.x
+        end
+
+        -- [Port] color/size getters collapsed into renderer fields: Cols (1-based U32 array or nil) + Col, Sizes or Size
+        local function GetCol(r, prim)
+            local cols = r.Cols
+            if cols == nil then return r.Col end
+            IM_ASSERT(prim >= 0 and prim < r.ColCount)
+            local c = cols[prim + 1]
+            if r.ColAlpha < 1 then c = MulAlphaU32(c, r.ColAlpha) end
+            return c
+        end
+
+        local function ConstColor(col, alpha)
+            if alpha ~= nil and alpha < 1 then return MulAlphaU32(col, alpha) end
+            return col
+        end
+
+        local function SetColors(r, cols, count, col, alpha)
+            r.Cols, r.ColCount, r.Col, r.ColAlpha = cols, count, ConstColor(col, alpha), alpha or 1
+            return r
+        end
+
+        -----------------------------------------------------------------------
+        -- Renderers
+        -- [Port] renderer = table { Prims, IdxConsumed, VtxConsumed, Init(r, dl), Render(r, dl, cull_rect, prim) -> bool }
+        -----------------------------------------------------------------------
+
+        local function LineInit(r, dl)
+            r.HalfWeight, r.U0, r.V0, r.U1, r.V1 = GetLineRenderProps(dl, r.HalfWeight)
+        end
+        local function WhiteInit(r, dl)
+            local uv = dl._Data.TexUvWhitePixel
+            r.U, r.V = uv.x, uv.y
+        end
+
+        @native
+        local function LineStripRender(r, dl, cr, prim)
+            local g = r.Getter
+            local x, y = g.Get(g, prim + 1)
+            local p2x, p2y = TransformX(x), TransformY(y)
+            local p1x, p1y = r.P1x, r.P1y
+            if not Overlaps(cr, p1x, p1y, p2x, p2y) then
+                if not r.Skip or (p2x == p2x and p2y == p2y) then r.P1x, r.P1y = p2x, p2y end
+                return false
+            end
+            PrimLine(dl, p1x, p1y, p2x, p2y, r.HalfWeight, GetCol(r, prim), r.U0, r.V0, r.U1, r.V1)
+            if not r.Skip or (p2x == p2x and p2y == p2y) then r.P1x, r.P1y = p2x, p2y end
+            return true
+        end
+
+        -- RendererLineStrip / RendererLineStripSkip (skip = true skips NaNs)
+        function internal.RendererLineStrip(getter, weight, skip)
+            local x, y = getter.Get(getter, 0)
+            return {
+                Prims = getter.Count - 1, IdxConsumed = 6, VtxConsumed = 4,
+                Getter = getter, HalfWeight = max(1.0, weight) * 0.5, Skip = skip or false,
+                P1x = TransformX(x), P1y = TransformY(y),
+                Init = LineInit, Render = LineStripRender,
+            }
+        end
+
+        @native
+        local function LineSegments1Render(r, dl, cr, prim)
+            local g = r.Getter
+            local x1, y1 = g.Get(g, prim * 2)
+            local x2, y2 = g.Get(g, prim * 2 + 1)
+            local p1x, p1y, p2x, p2y = TransformX(x1), TransformY(y1), TransformX(x2), TransformY(y2)
+            if not Overlaps(cr, p1x, p1y, p2x, p2y) then return false end
+            PrimLine(dl, p1x, p1y, p2x, p2y, r.HalfWeight, GetCol(r, prim * 2), r.U0, r.V0, r.U1, r.V1)
+            return true
+        end
+        function internal.RendererLineSegments1(getter, weight)
+            return {
+                Prims = getter.Count // 2, IdxConsumed = 6, VtxConsumed = 4,
+                Getter = getter, HalfWeight = max(1.0, weight) * 0.5,
+                Init = LineInit, Render = LineSegments1Render,
+            }
+        end
+
+        @native
+        local function LineSegments2Render(r, dl, cr, prim)
+            local g1, g2 = r.Getter1, r.Getter2
+            local x1, y1 = g1.Get(g1, prim)
+            local x2, y2 = g2.Get(g2, prim)
+            local p1x, p1y, p2x, p2y = TransformX(x1), TransformY(y1), TransformX(x2), TransformY(y2)
+            if not Overlaps(cr, p1x, p1y, p2x, p2y) then return false end
+            PrimLine(dl, p1x, p1y, p2x, p2y, r.HalfWeight, GetCol(r, prim), r.U0, r.V0, r.U1, r.V1)
+            return true
+        end
+        function internal.RendererLineSegments2(getter1, getter2, weight)
+            return {
+                Prims = min(getter1.Count, getter2.Count), IdxConsumed = 6, VtxConsumed = 4,
+                Getter1 = getter1, Getter2 = getter2, HalfWeight = max(1.0, weight) * 0.5,
+                Init = LineInit, Render = LineSegments2Render,
+            }
+        end
+
+        @native
+        local function ShadedRender(r, dl, cr, prim)
+            local g1, g2 = r.Getter1, r.Getter2
+            local ax, ay = g1.Get(g1, prim + 1)
+            local bx, by = g2.Get(g2, prim + 1)
+            local p21x, p21y, p22x, p22y = TransformX(ax), TransformY(ay), TransformX(bx), TransformY(by)
+            local p11x, p11y, p12x, p12y = r.P11x, r.P11y, r.P12x, r.P12y
+            local minx, miny = min(p11x, p12x, p21x, p22x), min(p11y, p12y, p21y, p22y)
+            local maxx, maxy = max(p11x, p12x, p21x, p22x), max(p11y, p12y, p21y, p22y)
+            r.P11x, r.P11y, r.P12x, r.P12y = p21x, p21y, p22x, p22y
+            if not (miny < cr.Max.y and maxy > cr.Min.y and minx < cr.Max.x and maxx > cr.Min.x) then
+                return false
+            end
+            local col = GetCol(r, prim)
+            local intersect = ((p11y > p12y and p22y > p21y) or (p12y > p11y and p21y > p22y)) and 1 or 0
+            local ix, iy = 0, 0
+            if intersect == 1 then
+                -- Intersection(P11,P21,P12,P22)
+                local v1 = p11x * p21y - p11y * p21x
+                local v2 = p12x * p22y - p12y * p22x
+                local v3 = (p11x - p21x) * (p12y - p22y) - (p11y - p21y) * (p12x - p22x)
+                ix = (v1 * (p12x - p22x) - v2 * (p11x - p21x)) / v3
+                iy = (v1 * (p12y - p22y) - v2 * (p11y - p21y)) / v3
+            end
+            local u, v = r.U, r.V
+            local b = dl.VtxBuffer.Buf
+            local vw = dl._VtxWritePtr
+            local o = (vw - 1) * VTX_STRIDE
+            WV(b, o,                  p11x, p11y, u, v, col)
+            WV(b, o + VTX_STRIDE,     p21x, p21y, u, v, col)
+            WV(b, o + VTX_STRIDE * 2, ix, iy, u, v, col)
+            WV(b, o + VTX_STRIDE * 3, p12x, p12y, u, v, col)
+            WV(b, o + VTX_STRIDE * 4, p22x, p22y, u, v, col)
+            local idx = dl._VtxCurrentIdx
+            local id, iw = dl.IdxBuffer.Data, dl._IdxWritePtr
+            id[iw] = idx; id[iw + 1] = idx + 1 + intersect; id[iw + 2] = idx + 3
+            id[iw + 3] = idx + 1; id[iw + 4] = idx + 4; id[iw + 5] = idx + 3 - intersect
+            dl._VtxWritePtr = vw + 5; dl._IdxWritePtr = iw + 6; dl._VtxCurrentIdx = idx + 5
+            return true
+        end
+        function internal.RendererShaded(getter1, getter2)
+            local ax, ay = getter1.Get(getter1, 0)
+            local bx, by = getter2.Get(getter2, 0)
+            return {
+                Prims = min(getter1.Count, getter2.Count) - 1, IdxConsumed = 6, VtxConsumed = 5,
+                Getter1 = getter1, Getter2 = getter2,
+                P11x = TransformX(ax), P11y = TransformY(ay), P12x = TransformX(bx), P12y = TransformY(by),
+                Init = WhiteInit, Render = ShadedRender,
+            }
+        end
+
+        @native
+        local function MarkersFillRender(r, dl, cr, prim)
+            local g = r.Getter
+            local x, y = g.Get(g, prim)
+            local px, py = TransformX(x), TransformY(y)
+            if px >= cr.Min.x and py >= cr.Min.y and px <= cr.Max.x and py <= cr.Max.y then
+                local col = GetCol(r, prim)
+                local size = r.Size
+                if r.Sizes then size = r.Sizes[prim + 1] end
+                local m, count, u, v = r.Marker, r.Count, r.U, r.V
+                local b = dl.VtxBuffer.Buf
+                local vw = dl._VtxWritePtr
+                local o = (vw - 1) * VTX_STRIDE
+                for i = 0, count - 1 do
+                    WV(b, o + i * VTX_STRIDE, px + m[i * 2 + 1] * size, py + m[i * 2 + 2] * size, u, v, col)
+                end
+                local idx = dl._VtxCurrentIdx
+                local id, iw = dl.IdxBuffer.Data, dl._IdxWritePtr
+                for i = 2, count - 1 do
+                    id[iw] = idx; id[iw + 1] = idx + i - 1; id[iw + 2] = idx + i
+                    iw += 3
+                end
+                dl._VtxWritePtr = vw + count; dl._IdxWritePtr = iw; dl._VtxCurrentIdx = idx + count
+                return true
+            end
+            return false
+        end
+        function internal.RendererMarkersFill(getter, marker, count)
+            return {
+                Prims = getter.Count, IdxConsumed = (count - 2) * 3, VtxConsumed = count,
+                Getter = getter, Marker = marker, Count = count,
+                Init = WhiteInit, Render = MarkersFillRender,
+            }
+        end
+
+        @native
+        local function MarkersLineRender(r, dl, cr, prim)
+            local g = r.Getter
+            local x, y = g.Get(g, prim)
+            local px, py = TransformX(x), TransformY(y)
+            if px >= cr.Min.x and py >= cr.Min.y and px <= cr.Max.x and py <= cr.Max.y then
+                local col = GetCol(r, prim)
+                local size = r.Size
+                if r.Sizes then size = r.Sizes[prim + 1] end
+                local m, hw, u0, v0, u1, v1 = r.Marker, r.HalfWeight, r.U0, r.V0, r.U1, r.V1
+                for i = 0, r.Count - 1, 2 do
+                    PrimLine(dl, px + m[i * 2 + 1] * size, py + m[i * 2 + 2] * size,
+                                 px + m[i * 2 + 3] * size, py + m[i * 2 + 4] * size, hw, col, u0, v0, u1, v1)
+                end
+                return true
+            end
+            return false
+        end
+        function internal.RendererMarkersLine(getter, marker, count, weight)
+            return {
+                Prims = getter.Count, IdxConsumed = count // 2 * 6, VtxConsumed = count // 2 * 4,
+                Getter = getter, Marker = marker, Count = count, HalfWeight = max(1.0, weight) * 0.5,
+                Init = LineInit, Render = MarkersLineRender,
+            }
+        end
+
+        @native
+        function internal.RenderPrimitivesEx(renderer, draw_list, cull_rect)
+            local prims        = renderer.Prims
+            local prims_culled = 0
+            local idx          = 0
+            local idx_c, vtx_c = renderer.IdxConsumed, renderer.VtxConsumed
+            local render       = renderer.Render
+            renderer.Init(renderer, draw_list)
+            while prims > 0 do
+                -- find how many can be reserved up to end of current draw command's limit
+                local cnt = min(prims, (MAX_IDX - draw_list._VtxCurrentIdx) // vtx_c)
+                -- make sure at least this many elements can be rendered to avoid situations where at the end of buffer this slow path is not taken all the time
+                if cnt >= min(64, prims) then
+                    if prims_culled >= cnt then
+                        prims_culled -= cnt -- reuse previous reservation
+                    else
+                        -- add more elements to previous reservation
+                        draw_list:PrimReserve((cnt - prims_culled) * idx_c, (cnt - prims_culled) * vtx_c)
+                        prims_culled = 0
+                    end
+                else
+                    if prims_culled > 0 then
+                        draw_list:PrimUnreserve(prims_culled * idx_c, prims_culled * vtx_c)
+                        prims_culled = 0
+                    end
+                    cnt = min(prims, MAX_IDX // vtx_c)
+                    -- reserve new draw command
+                    draw_list:PrimReserve(cnt * idx_c, cnt * vtx_c)
+                end
+                prims -= cnt
+                for i = idx, idx + cnt - 1 do
+                    if not render(renderer, draw_list, cull_rect, i) then
+                        prims_culled += 1
+                    end
+                end
+                idx += cnt
+            end
+            if prims_culled > 0 then
+                draw_list:PrimUnreserve(prims_culled * idx_c, prims_culled * vtx_c)
+            end
+        end
+        local RenderPrimitivesEx = internal.RenderPrimitivesEx
+
+        -- [Port] RenderPrimitives1/2/3 collapse to UseCurrentTransformer() + renderer ctor + Render()
+        -- builds the renderer, applies colors/sizes, renders
+        local function Render(r, cols, count, col, alpha)
+            if col ~= nil then SetColors(r, cols, count, col, alpha) end
+            RenderPrimitivesEx(r, internal.GetPlotDrawList(), GImPlot.CurrentPlot.PlotRect)
+        end
+        local function UseCurrentTransformer()
+            local plot = GImPlot.CurrentPlot
+            internal.SetTransformer(plot.Axes[plot.CurrentX], plot.Axes[plot.CurrentY])
+        end
+
+        -----------------------------------------------------------------------
+        -- Markers
+        -- [Port] ImVec2 arrays flattened to {x1, y1, x2, y2, ...}
+        -----------------------------------------------------------------------
+
+        local MARKER_FILL_CIRCLE  = {1.0, 0.0, 0.809017, 0.58778524, 0.30901697, 0.95105654, -0.30901703, 0.9510565, -0.80901706, 0.5877852, -1.0, 0.0, -0.80901694, -0.58778536, -0.3090171, -0.9510565, 0.30901712, -0.9510565, 0.80901694, -0.5877853}
+        local MARKER_FILL_SQUARE  = {SQRT_1_2, SQRT_1_2, SQRT_1_2, -SQRT_1_2, -SQRT_1_2, -SQRT_1_2, -SQRT_1_2, SQRT_1_2}
+        local MARKER_FILL_DIAMOND = {1, 0, 0, -1, -1, 0, 0, 1}
+        local MARKER_FILL_UP      = {SQRT_3_2, 0.5, 0, -1, -SQRT_3_2, 0.5}
+        local MARKER_FILL_DOWN    = {SQRT_3_2, -0.5, 0, 1, -SQRT_3_2, -0.5}
+        local MARKER_FILL_LEFT    = {-1, 0, 0.5, SQRT_3_2, 0.5, -SQRT_3_2}
+        local MARKER_FILL_RIGHT   = {1, 0, -0.5, SQRT_3_2, -0.5, -SQRT_3_2}
+
+        -- line markers are pairs of segment endpoints; circle built from the fill circle
+        local MARKER_LINE_CIRCLE = {}
+        for i = 0, 9 do
+            local j = (i + 1) % 10
+            table.insert(MARKER_LINE_CIRCLE, MARKER_FILL_CIRCLE[i * 2 + 1]); table.insert(MARKER_LINE_CIRCLE, MARKER_FILL_CIRCLE[i * 2 + 2])
+            table.insert(MARKER_LINE_CIRCLE, MARKER_FILL_CIRCLE[j * 2 + 1]); table.insert(MARKER_LINE_CIRCLE, MARKER_FILL_CIRCLE[j * 2 + 2])
+        end
+        local MARKER_LINE_SQUARE     = {SQRT_1_2, SQRT_1_2, SQRT_1_2, -SQRT_1_2, SQRT_1_2, -SQRT_1_2, -SQRT_1_2, -SQRT_1_2, -SQRT_1_2, -SQRT_1_2, -SQRT_1_2, SQRT_1_2, -SQRT_1_2, SQRT_1_2, SQRT_1_2, SQRT_1_2}
+        local MARKER_LINE_DIAMOND    = {1, 0, 0, -1, 0, -1, -1, 0, -1, 0, 0, 1, 0, 1, 1, 0}
+        local MARKER_LINE_UP         = {SQRT_3_2, 0.5, 0, -1, 0, -1, -SQRT_3_2, 0.5, -SQRT_3_2, 0.5, SQRT_3_2, 0.5}
+        local MARKER_LINE_DOWN       = {SQRT_3_2, -0.5, 0, 1, 0, 1, -SQRT_3_2, -0.5, -SQRT_3_2, -0.5, SQRT_3_2, -0.5}
+        local MARKER_LINE_LEFT       = {-1, 0, 0.5, SQRT_3_2, 0.5, SQRT_3_2, 0.5, -SQRT_3_2, 0.5, -SQRT_3_2, -1, 0}
+        local MARKER_LINE_RIGHT      = {1, 0, -0.5, SQRT_3_2, -0.5, SQRT_3_2, -0.5, -SQRT_3_2, -0.5, -SQRT_3_2, 1, 0}
+        local MARKER_LINE_ASTERISK   = {-SQRT_3_2, -0.5, SQRT_3_2, 0.5, -SQRT_3_2, 0.5, SQRT_3_2, -0.5, 0, -1, 0, 1}
+        local MARKER_LINE_PLUS       = {-1, 0, 1, 0, 0, -1, 0, 1}
+        local MARKER_LINE_CROSS      = {-SQRT_1_2, -SQRT_1_2, SQRT_1_2, SQRT_1_2, SQRT_1_2, -SQRT_1_2, -SQRT_1_2, SQRT_1_2}
+        local MARKER_LINE_VERTICAL   = {0, -1, 0, 1}
+        local MARKER_LINE_HORIZONTAL = {-1, 0, 1, 0}
+
+        local MARKER_FILL = {
+            [ImPlotMarker.Circle] = MARKER_FILL_CIRCLE, [ImPlotMarker.Square] = MARKER_FILL_SQUARE,
+            [ImPlotMarker.Diamond] = MARKER_FILL_DIAMOND, [ImPlotMarker.Up] = MARKER_FILL_UP,
+            [ImPlotMarker.Down] = MARKER_FILL_DOWN, [ImPlotMarker.Left] = MARKER_FILL_LEFT,
+            [ImPlotMarker.Right] = MARKER_FILL_RIGHT,
+        }
+        local MARKER_LINE = {
+            [ImPlotMarker.Circle] = MARKER_LINE_CIRCLE, [ImPlotMarker.Square] = MARKER_LINE_SQUARE,
+            [ImPlotMarker.Diamond] = MARKER_LINE_DIAMOND, [ImPlotMarker.Up] = MARKER_LINE_UP,
+            [ImPlotMarker.Down] = MARKER_LINE_DOWN, [ImPlotMarker.Left] = MARKER_LINE_LEFT,
+            [ImPlotMarker.Right] = MARKER_LINE_RIGHT, [ImPlotMarker.Asterisk] = MARKER_LINE_ASTERISK,
+            [ImPlotMarker.Plus] = MARKER_LINE_PLUS, [ImPlotMarker.Cross] = MARKER_LINE_CROSS,
+            [ImPlotMarker.Vertical] = MARKER_LINE_VERTICAL, [ImPlotMarker.Horizontal] = MARKER_LINE_HORIZONTAL,
+        }
+
+        -- [Port] color/size getters passed as (array-or-nil, const, alpha) instead of getter objects
+        function internal.RenderMarkers(getter, marker, rend_fill, fill_cols, fill_col, fill_alpha, rend_line, line_cols, line_col, sizes, size, weight)
+            UseCurrentTransformer()
+            if rend_fill then
+                local m = MARKER_FILL[marker]
+                if m then
+                    local r = internal.RendererMarkersFill(getter, m, #m // 2)
+                    r.Sizes, r.Size = sizes, size
+                    Render(r, fill_cols, getter.Count, fill_col, fill_alpha)
+                end
+            end
+            if rend_line then
+                local m = MARKER_LINE[marker]
+                if m then
+                    local r = internal.RendererMarkersLine(getter, m, #m // 2, weight)
+                    r.Sizes, r.Size = sizes, size
+                    Render(r, line_cols, getter.Count, line_col, 1)
+                end
+            end
+        end
+
+        function internal.RenderColoredMarkers(getter, s)
+            local sp = s.Spec
+            internal.RenderMarkers(getter, sp.Marker,
+                s.RenderMarkerFill, sp.MarkerFillColors, ImGui.GetColorU32(sp.MarkerFillColor), sp.MarkerFillColors and sp.FillAlpha or 1,
+                s.RenderMarkerLine, sp.MarkerLineColors, ImGui.GetColorU32(sp.MarkerLineColor),
+                sp.MarkerSizes, sp.MarkerSize, sp.LineWeight)
+        end
+
+        -----------------------------------------------------------------------
+        -- PlotLine
+        -----------------------------------------------------------------------
+
+        function internal.PlotLineEx(label_id, getter, spec)
+            if BeginItemEx(label_id, internal.Fitter1(getter), spec, spec.LineColor, spec.Marker) then
+                if getter.Count <= 0 then
+                    EndItem()
+                    return
+                end
+                local s = GetItemData()
+                local sp = s.Spec
+                local flags = spec.Flags
+                if getter.Count > 1 then
+                    if ImHasFlag(flags, ImPlotLineFlags.Shaded) and s.RenderFill then
+                        UseCurrentTransformer()
+                        local getter2 = internal.GetterOverrideY(getter, 0)
+                        if sp.FillColors ~= nil then
+                            Render(internal.RendererShaded(getter, getter2), sp.FillColors, getter.Count, 0, sp.FillAlpha)
+                        else
+                            Render(internal.RendererShaded(getter, getter2), nil, 0, ImGui.GetColorU32(sp.FillColor), sp.FillAlpha)
+                        end
+                    end
+                    if s.RenderLine then
+                        UseCurrentTransformer()
+                        local col_line = ImGui.GetColorU32(sp.LineColor)
+                        local r
+                        if ImHasFlag(flags, ImPlotLineFlags.Segments) then
+                            r = internal.RendererLineSegments1(getter, sp.LineWeight)
+                        elseif ImHasFlag(flags, ImPlotLineFlags.Loop) then
+                            r = internal.RendererLineStrip(internal.GetterLoop(getter), sp.LineWeight, ImHasFlag(flags, ImPlotLineFlags.SkipNaN))
+                        else
+                            r = internal.RendererLineStrip(getter, sp.LineWeight, ImHasFlag(flags, ImPlotLineFlags.SkipNaN))
+                        end
+                        Render(r, sp.LineColors, getter.Count, col_line, 1)
+                    end
+                end
+                -- render markers
+                if s.RenderMarkers then
+                    if ImHasFlag(flags, ImPlotLineFlags.NoClip) then
+                        PopPlotClipRect()
+                        PushPlotClipRect(sp.MarkerSize)
+                    end
+                    internal.RenderColoredMarkers(getter, s)
+                end
+                EndItem()
+            end
+        end
+
+        -- [Port] overloads dispatched on argument types:
+        --   PlotX(label_id, values, count?, xscale?, xstart?, spec?)   values-only (b is a number or nil)
+        --   PlotX(label_id, xs, ys, count?, spec?)                     xs/ys arrays (b is a table)
+        -- spec: nil, an ImPlotSpec, or a plain table of ImPlotSpec fields. count defaults to #ys.
+        local function MakeGetter(a, b, c, d, e)
+            local spec, count
+            local getter
+            if type(b) == "table" and getmetatable(b) ~= SpecMT and (b[1] ~= nil or next(b) == nil) then
+                -- xs, ys
+                count = c or math.min(#a, #b)
+                spec = ResolveSpec(d)
+                getter = internal.GetterXY(internal.IndexerIdx(a, count, spec.Offset, spec.Stride), internal.IndexerIdx(b, count, spec.Offset, spec.Stride), count)
+            else
+                -- values, count, xscale, x0
+                local cnt, xscale, x0, sp = b, c, d, e
+                if type(cnt) == "table" then sp, cnt, xscale, x0 = cnt, nil, nil, nil end
+                count = cnt or #a
+                spec = ResolveSpec(sp)
+                getter = internal.GetterXY(internal.IndexerLin(xscale or 1, x0 or 0), internal.IndexerIdx(a, count, spec.Offset, spec.Stride), count)
+            end
+            return getter, spec
+        end
+
+        function ImPlot.PlotLine(label_id, a, b, c, d, e)
+            local getter, spec = MakeGetter(a, b, c, d, e)
+            internal.PlotLineEx(label_id, getter, spec)
+        end
+
+        -- custom getter: getter_func(idx, data) -> ImPlotPoint or (x, y)
+        function ImPlot.PlotLineG(label_id, getter_func, data, count, spec)
+            internal.PlotLineEx(label_id, internal.GetterFuncPtr(getter_func, data, count), ResolveSpec(spec))
+        end
+
+        -----------------------------------------------------------------------
+        -- PlotScatter
+        -----------------------------------------------------------------------
+
+        function internal.PlotScatterEx(label_id, getter, spec)
+            -- force scatter to render a marker even if none
+            local marker = spec.Marker
+            if marker == ImPlotMarker.None then marker = ImPlotMarker.Auto end
+            if BeginItemEx(label_id, internal.Fitter1(getter), spec, spec.MarkerLineColor, marker) then
+                if getter.Count <= 0 then
+                    EndItem()
+                    return
+                end
+                local s = GetItemData()
+                if s.RenderMarkers then
+                    if ImHasFlag(spec.Flags, ImPlotScatterFlags.NoClip) then
+                        PopPlotClipRect()
+                        PushPlotClipRect(s.Spec.MarkerSize)
+                    end
+                    internal.RenderColoredMarkers(getter, s)
+                end
+                EndItem()
+            end
+        end
+
+        function ImPlot.PlotScatter(label_id, a, b, c, d, e)
+            local getter, spec = MakeGetter(a, b, c, d, e)
+            internal.PlotScatterEx(label_id, getter, spec)
+        end
+
+        function ImPlot.PlotScatterG(label_id, getter_func, data, count, spec)
+            internal.PlotScatterEx(label_id, internal.GetterFuncPtr(getter_func, data, count), ResolveSpec(spec))
+        end
+
+        -----------------------------------------------------------------------
+        -- Legend Utils (implot.cpp)
+        -----------------------------------------------------------------------
+
+        function internal.GetLocationPos(outer_rect, inner_size, loc, pad)
+            pad = pad or ImVec2(0, 0)
+            local x, y
+            if ImHasFlag(loc, ImPlotLocation.West) and not ImHasFlag(loc, ImPlotLocation.East) then
+                x = outer_rect.Min.x + pad.x
+            elseif not ImHasFlag(loc, ImPlotLocation.West) and ImHasFlag(loc, ImPlotLocation.East) then
+                x = outer_rect.Max.x - pad.x - inner_size.x
+            else
+                x = (outer_rect.Min.x + outer_rect.Max.x) * 0.5 - inner_size.x * 0.5
+            end
+            -- legend reference point y
+            if ImHasFlag(loc, ImPlotLocation.North) and not ImHasFlag(loc, ImPlotLocation.South) then
+                y = outer_rect.Min.y + pad.y
+            elseif not ImHasFlag(loc, ImPlotLocation.North) and ImHasFlag(loc, ImPlotLocation.South) then
+                y = outer_rect.Max.y - pad.y - inner_size.y
+            else
+                y = (outer_rect.Min.y + outer_rect.Max.y) * 0.5 - inner_size.y * 0.5
+            end
+            return ImVec2(floor(x + 0.5), floor(y + 0.5))
+        end
+
+        function internal.CalcLegendSize(items, pad, spacing, vertical)
+            -- vars
+            local nItems    = items:GetLegendCount()
+            local txt_ht    = ImGui.GetTextLineHeight()
+            local icon_size = txt_ht
+            -- get label max width
+            local max_label_width = 0
+            local sum_label_width = 0
+            for i = 0, nItems - 1 do
+                local label_width = ImGui.CalcTextSize(items:GetLegendLabel(i), nil, true).x
+                max_label_width   = max(label_width, max_label_width)
+                sum_label_width  += label_width
+            end
+            -- calc legend size
+            if vertical then
+                return ImVec2(pad.x * 2 + icon_size + max_label_width, pad.y * 2 + nItems * txt_ht + (nItems - 1) * spacing.y)
+            end
+            return ImVec2(pad.x * 2 + icon_size * nItems + sum_label_width + (nItems - 1) * spacing.x, pad.y * 2 + txt_ht)
+        end
+
+        function internal.ClampLegendRect(legend_rect, outer_rect, pad)
+            local clamped = false
+            local minx, miny = outer_rect.Min.x + pad.x, outer_rect.Min.y + pad.y
+            local maxx, maxy = outer_rect.Max.x - pad.x, outer_rect.Max.y - pad.y
+            if legend_rect.Min.x < minx then legend_rect.Min.x = minx; clamped = true end
+            if legend_rect.Min.y < miny then legend_rect.Min.y = miny; clamped = true end
+            if legend_rect.Max.x > maxx then legend_rect.Max.x = maxx; clamped = true end
+            if legend_rect.Max.y > maxy then legend_rect.Max.y = maxy; clamped = true end
+            return clamped
+        end
+
+        local legend_indices = {} -- [Port] gp.TempInt1 (0-based legend indices, 1-based array)
+
+        function internal.ShowLegendEntries(items, legend_bb, hovered, pad, spacing, vertical, DrawList)
+            -- vars
+            local txt_ht      = ImGui.GetTextLineHeight()
+            local icon_size   = txt_ht
+            local icon_shrink = 2
+            local col_txt     = GetStyleColorU32(ImPlotCol.LegendText)
+            local col_txt_dis = ImAlphaU32(col_txt, 0.25)
+            -- render each legend item
+            local sum_label_width = 0
+            local any_item_hovered = false
+
+            local num_items = items:GetLegendCount()
+            if num_items < 1 then
+                return hovered
+            end
+            -- build render order
+            local indices = legend_indices
+            table.clear(indices)
+            for i = 0, num_items - 1 do indices[i + 1] = i end
+            local lflags = items.Legend.Flags
+            if ImHasFlag(lflags, ImPlotLegendFlags.Sort) and num_items > 1 then
+                table.sort(indices, function(a, b) return items:GetLegendLabel(a) < items:GetLegendLabel(b) end)
+            end
+            -- render
+            for i = 0, num_items - 1 do
+                local idx = indices[i + 1]
+                if ImHasFlag(lflags, ImPlotLegendFlags.Reverse) then idx = indices[num_items - i] end
+                local item        = items:GetLegendItem(idx)
+                local label       = items:GetLegendLabel(idx)
+                local label_width = ImGui.CalcTextSize(label, nil, true).x
+                local tlx, tly
+                if vertical then
+                    tlx, tly = legend_bb.Min.x + pad.x, legend_bb.Min.y + pad.y + i * (txt_ht + spacing.y)
+                else
+                    tlx, tly = legend_bb.Min.x + pad.x + i * (icon_size + spacing.x) + sum_label_width, legend_bb.Min.y + pad.y
+                end
+                sum_label_width += label_width
+                local icon_bb  = G.ImRect(tlx + icon_shrink, tly + icon_shrink, tlx + icon_size - icon_shrink, tly + icon_size - icon_shrink)
+                local label_bb = G.ImRect(tlx, tly, tlx + label_width + icon_size, tly + icon_size)
+                local col_txt_hl
+                local col_item = ImAlphaU32(item.Color, 1)
+
+                local button_bb = G.ImRect(icon_bb.Min, label_bb.Max)
+
+                ImGui.KeepAliveID(item.ID)
+
+                local item_clk, item_hov, item_hld = false, false, false
+                if not ImHasFlag(lflags, ImPlotLegendFlags.NoButtons) then
+                    item_clk, item_hov, item_hld = ImGui.ButtonBehavior(button_bb, item.ID)
+                end
+
+                if item_clk then
+                    item.Show = not item.Show
+                end
+
+                local can_hover = item_hov and (not ImHasFlag(lflags, ImPlotLegendFlags.NoHighlightItem) or not ImHasFlag(lflags, ImPlotLegendFlags.NoHighlightAxis))
+
+                if can_hover then
+                    item.LegendHoverRect.Min.x, item.LegendHoverRect.Min.y = icon_bb.Min.x, icon_bb.Min.y
+                    item.LegendHoverRect.Max.x, item.LegendHoverRect.Max.y = label_bb.Max.x, label_bb.Max.y
+                    item.LegendHovered = true
+                    col_txt_hl = internal.ImMixU32(col_txt, col_item, 64)
+                    any_item_hovered = true
+                else
+                    col_txt_hl = col_txt
+                end
+                local col_icon
+                if item_hld then
+                    col_icon = item.Show and ImAlphaU32(col_item, 0.5) or ImGui.GetColorU32(G.ImGuiCol.TextDisabled, 0.5)
+                elseif item_hov then
+                    col_icon = item.Show and ImAlphaU32(col_item, 0.75) or ImGui.GetColorU32(G.ImGuiCol.TextDisabled, 0.75)
+                else
+                    col_icon = item.Show and col_item or col_txt_dis
+                end
+
+                DrawList:AddRectFilled(icon_bb.Min, icon_bb.Max, col_icon)
+                local text_display_end = ImGui.FindRenderedTextEnd(label)
+                if text_display_end ~= 1 then
+                    DrawList:AddText(nil, 0.0, ImVec2(tlx + icon_size, tly), item.Show and col_txt_hl or col_txt_dis, label, 1, text_display_end)
+                end
+            end
+            return hovered and not any_item_hovered
+        end
+
+        function internal.ShowLegendContextMenu(legend, visible)
+            local s = ImGui.GetFrameHeight()
+            local ret = false
+            local pressed
+            pressed, visible = ImGui.Checkbox("Show", visible)
+            if pressed then ret = true end
+            if legend.CanGoInside then
+                _, legend.Flags = ImGui.CheckboxFlags("Outside", legend.Flags, ImPlotLegendFlags.Outside)
+            end
+            if ImGui.RadioButtonEx("H", ImHasFlag(legend.Flags, ImPlotLegendFlags.Horizontal)) then
+                legend.Flags = bor(legend.Flags, ImPlotLegendFlags.Horizontal)
+            end
+            ImGui.SameLine()
+            if ImGui.RadioButtonEx("V", not ImHasFlag(legend.Flags, ImPlotLegendFlags.Horizontal)) then
+                legend.Flags = band(legend.Flags, bnot(ImPlotLegendFlags.Horizontal))
+            end
+            ImGui.PushStyleVar(G.ImGuiStyleVar.ItemSpacing, ImVec2(2, 2))
+            local bs = ImVec2(1.5 * s, s)
+            if ImGui.Button("NW", bs) then legend.Location = ImPlotLocation.NorthWest end; ImGui.SameLine()
+            if ImGui.Button("N", bs)  then legend.Location = ImPlotLocation.North     end; ImGui.SameLine()
+            if ImGui.Button("NE", bs) then legend.Location = ImPlotLocation.NorthEast end
+            if ImGui.Button("W", bs)  then legend.Location = ImPlotLocation.West      end; ImGui.SameLine()
+            ImGui.InvisibleButton("C", bs); ImGui.SameLine()
+            if ImGui.Button("E", bs)  then legend.Location = ImPlotLocation.East      end
+            if ImGui.Button("SW", bs) then legend.Location = ImPlotLocation.SouthWest end; ImGui.SameLine()
+            if ImGui.Button("S", bs)  then legend.Location = ImPlotLocation.South     end; ImGui.SameLine()
+            if ImGui.Button("SE", bs) then legend.Location = ImPlotLocation.SouthEast end
+            ImGui.PopStyleVar()
+            return ret
+        end
+
+        function ImPlot.SetupLegend(location, flags)
+            flags = flags or ImPlotLegendFlags.None
+            local gp = GImPlot
+            IM_ASSERT((gp.CurrentPlot ~= nil and not gp.CurrentPlot.SetupLocked) or (gp.CurrentSubplot ~= nil and gp.CurrentPlot == nil),
+                "Setup needs to be called after BeginPlot or BeginSubplots and before any setup locking functions (e.g. PlotX)!")
+            if gp.CurrentItems then
+                local legend = gp.CurrentItems.Legend
+                -- check and set location
+                if location ~= legend.PreviousLocation then legend.Location = location end
+                legend.PreviousLocation = location
+                -- check and set flags
+                if flags ~= legend.PreviousFlags then legend.Flags = flags end
+                legend.PreviousFlags = flags
+            end
+        end
+
+        -- outside legend adjustments (called from SetupFinish)
+        function internal.AdjustForOutsideLegend(plot)
+            local gs = GImPlot.Style
+            if ImHasFlag(plot.Flags, ImPlotFlags.NoLegend) or plot.Items:GetLegendCount() <= 0 or not ImHasFlag(plot.Items.Legend.Flags, ImPlotLegendFlags.Outside) then
+                return
+            end
+            local legend = plot.Items.Legend
+            local horz = ImHasFlag(legend.Flags, ImPlotLegendFlags.Horizontal)
+            local legend_size = internal.CalcLegendSize(plot.Items, gs.LegendInnerPadding, gs.LegendSpacing, not horz)
+            local loc = legend.Location
+            local west  = ImHasFlag(loc, ImPlotLocation.West) and not ImHasFlag(loc, ImPlotLocation.East)
+            local east  = ImHasFlag(loc, ImPlotLocation.East) and not ImHasFlag(loc, ImPlotLocation.West)
+            local north = ImHasFlag(loc, ImPlotLocation.North) and not ImHasFlag(loc, ImPlotLocation.South)
+            local south = ImHasFlag(loc, ImPlotLocation.South) and not ImHasFlag(loc, ImPlotLocation.North)
+            local cr, ar = plot.CanvasRect, plot.AxesRect
+            if (west and not horz) or (west and horz and not north and not south) then
+                cr.Min.x += legend_size.x + gs.LegendPadding.x
+                ar.Min.x += legend_size.x + gs.PlotPadding.x
+            end
+            if (east and not horz) or (east and horz and not north and not south) then
+                cr.Max.x -= legend_size.x + gs.LegendPadding.x
+                ar.Max.x -= legend_size.x + gs.PlotPadding.x
+            end
+            if (north and horz) or (north and not horz and not west and not east) then
+                cr.Min.y += legend_size.y + gs.LegendPadding.y
+                ar.Min.y += legend_size.y + gs.PlotPadding.y
+            end
+            if (south and horz) or (south and not horz and not west and not east) then
+                cr.Max.y -= legend_size.y + gs.LegendPadding.y
+                ar.Max.y -= legend_size.y + gs.PlotPadding.y
+            end
+        end
+
+        local legend_button_flags = bor(G.ImGuiButtonFlags.AllowOverlap, G.ImGuiButtonFlags.PressedOnClick, G.ImGuiButtonFlags.PressedOnDoubleClick,
+                                        G.ImGuiButtonFlags.MouseButtonLeft, G.ImGuiButtonFlags.MouseButtonRight, G.ImGuiButtonFlags.MouseButtonMiddle,
+                                        G.ImGuiButtonFlags.FlattenChildren)
+
+        -- legend section of EndPlot
+        function internal.RenderPlotLegend(plot, DrawList)
+            local gp = GImPlot
+            local gs = gp.Style
+            local IO = ImGui.GetIO()
+            -- reset legend hovers
+            plot.Items.Legend.Hovered = false
+            for i = 0, plot.Items:GetItemCount() - 1 do
+                local it = plot.Items:GetItemByIndex(i)
+                if it then it.LegendHovered = false end
+            end
+            -- render legend
+            if ImHasFlag(plot.Flags, ImPlotFlags.NoLegend) or plot.Items:GetLegendCount() <= 0 then
+                local r = plot.Items.Legend.Rect
+                r.Min.x, r.Min.y, r.Max.x, r.Max.y = 0, 0, 0, 0
+                return
+            end
+            local legend      = plot.Items.Legend
+            local legend_out  = ImHasFlag(legend.Flags, ImPlotLegendFlags.Outside)
+            local legend_horz = ImHasFlag(legend.Flags, ImPlotLegendFlags.Horizontal)
+            local legend_size = internal.CalcLegendSize(plot.Items, gs.LegendInnerPadding, gs.LegendSpacing, not legend_horz)
+            local outer       = legend_out and plot.FrameRect or plot.PlotRect
+            local outer_pad   = legend_out and gs.PlotPadding or gs.LegendPadding
+            local legend_pos  = internal.GetLocationPos(outer, legend_size, legend.Location, outer_pad)
+            local lr, lc = legend.Rect, legend.RectClamped
+            lr.Min.x, lr.Min.y, lr.Max.x, lr.Max.y = legend_pos.x, legend_pos.y, legend_pos.x + legend_size.x, legend_pos.y + legend_size.y
+            lc.Min.x, lc.Min.y, lc.Max.x, lc.Max.y = lr.Min.x, lr.Min.y, lr.Max.x, lr.Max.y
+            local legend_scrollable = internal.ClampLegendRect(lc, outer, outer_pad)
+            ImGui.KeepAliveID(plot.Items.ID)
+            _, legend.Hovered, legend.Held = ImGui.ButtonBehavior(lc, plot.Items.ID, legend_button_flags)
+            legend.Hovered = legend.Hovered or (ImGui.IsWindowHovered() and lc:Contains(IO.MousePos))
+
+            if legend_scrollable then
+                if legend.Hovered then
+                    ImGui.SetKeyOwner(G.ImGuiKey.MouseWheelY, plot.Items.ID)
+                    if IO.MouseWheel ~= 0.0 then
+                        local max_step_x = (lr.Max.x - lr.Min.x) * 0.67
+                        local font_size = ImGui.GetCurrentWindow().FontRefSize or ImGui.GetFontSize()
+                        local scroll_step = floor(min(2 * font_size, max_step_x))
+                        legend.Scroll.x += scroll_step * IO.MouseWheel
+                        legend.Scroll.y += scroll_step * IO.MouseWheel
+                    end
+                end
+                local min_sx = (lc.Max.x - lc.Min.x) - (lr.Max.x - lr.Min.x)
+                local min_sy = (lc.Max.y - lc.Min.y) - (lr.Max.y - lr.Min.y)
+                legend.Scroll.x = G.ImClamp(legend.Scroll.x, min_sx, 0.0)
+                legend.Scroll.y = G.ImClamp(legend.Scroll.y, min_sy, 0.0)
+                local ox = lc.Min.x - lr.Min.x + (legend_horz and legend.Scroll.x or 0)
+                local oy = lc.Min.y - lr.Min.y + (legend_horz and 0 or legend.Scroll.y)
+                lr.Min.x += ox; lr.Min.y += oy; lr.Max.x += ox; lr.Max.y += oy
+            else
+                legend.Scroll.x, legend.Scroll.y = 0, 0
+            end
+
+            local col_bg = GetStyleColorU32(ImPlotCol.LegendBg)
+            local col_bd = GetStyleColorU32(ImPlotCol.LegendBorder)
+            ImGui.PushClipRect(lc.Min, lc.Max, true)
+            DrawList:AddRectFilled(lc.Min, lc.Max, col_bg)
+            local legend_contextable = internal.ShowLegendEntries(plot.Items, lr, legend.Hovered, gs.LegendInnerPadding, gs.LegendSpacing, not legend_horz, DrawList)
+                                       and not ImHasFlag(legend.Flags, ImPlotLegendFlags.NoMenus)
+            DrawList:AddRect(lc.Min, lc.Max, col_bd)
+            ImGui.PopClipRect()
+
+            -- main ctx menu
+            if gp.OpenContextThisFrame and legend_contextable and not ImHasFlag(plot.Flags, ImPlotFlags.NoMenus) then
+                ImGui.OpenPopup("##LegendContext")
+            end
+            if ImGui.BeginPopup("##LegendContext") then
+                ImGui.Text("Legend"); ImGui.Separator()
+                if internal.ShowLegendContextMenu(legend, not ImHasFlag(plot.Flags, ImPlotFlags.NoLegend)) then
+                    plot.Flags = bit32.bxor(plot.Flags, ImPlotFlags.NoLegend)
+                end
+                ImGui.EndPopup()
+            end
         end
     end
 
