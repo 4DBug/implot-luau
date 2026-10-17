@@ -1672,13 +1672,636 @@ return function(G, ImPlot)
     end
 
     ---------------------------------------------------------------------------
+
+    -- [Port] float* data -> the frequency is passed directly
+    local function SinewaveGetter(i, f)
+        return i, math.sin(f * i)
+    end
+
+    S.Demo_SubplotsSizing = {
+        flags = bor(ImPlot.ImPlotSubplotFlags.ShareItems, ImPlot.ImPlotSubplotFlags.NoLegend),
+        rows = 3, cols = 3, rratios = { 5, 1, 1, 1, 1, 1 }, cratios = { 5, 1, 1, 1, 1, 1 },
+    }
+    function D.Demo_SubplotsSizing()
+        IMGUI_DEMO_MARKER("Subplots/Sizing")
+        local s = S.Demo_SubplotsSizing
+        local ImPlotSubplotFlags = ImPlot.ImPlotSubplotFlags
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotSubplotFlags_NoResize", ImPlotSubplotFlags.NoResize)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotSubplotFlags_NoTitle", ImPlotSubplotFlags.NoTitle)
+
+        s.rows = ImGui.SliderInt("Rows", s.rows, 1, 5)
+        s.cols = ImGui.SliderInt("Cols", s.cols, 1, 5)
+        local rows, cols = s.rows, s.cols
+        if rows < 1 or cols < 1 then
+            ImGui.TextColored(ImVec4(1, 0, 0, 1), "Nice try, but the number of rows and columns must be greater than 0!")
+            return
+        end
+        ImGui.DragScalarN("Row Ratios", G.ImGuiDataType.Float, s.rratios, rows, 0.01, nil)
+        ImGui.DragScalarN("Col Ratios", G.ImGuiDataType.Float, s.cratios, cols, 0.01, nil)
+        if ImPlot.BeginSubplots("My Subplots", rows, cols, ImVec2(-1, 400), s.flags, s.rratios, s.cratios) then
+            local id = 0
+            for i = 0, rows * cols - 1 do
+                if ImPlot.BeginPlot("", ImVec2(0, 0), ImPlotFlags.NoLegend) then
+                    ImPlot.SetupAxes(nil, nil, ImPlotAxisFlags.NoDecorations, ImPlotAxisFlags.NoDecorations)
+                    local fi = 0.01 * (i + 1)
+                    local col = ImPlot.GetColormapColor(0)
+                    if rows * cols > 1 then
+                        col = ImPlot.SampleColormap(i / (rows * cols - 1), ImPlotColormap.Jet)
+                    end
+                    local label = string.format("data%d", id)
+                    id += 1
+                    ImPlot.PlotLineG(label, SinewaveGetter, fi, 1000, ImPlot.ImPlotSpec(ImPlotProp.LineColor, col))
+                    ImPlot.EndPlot()
+                end
+            end
+            ImPlot.EndSubplots()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_SubplotItemSharing = { flags = ImPlot.ImPlotSubplotFlags.ShareItems, rows = 2, cols = 3, id = { 0, 1, 2, 3, 4, 5 }, curj = -1 }
+    function D.Demo_SubplotItemSharing()
+        IMGUI_DEMO_MARKER("Subplots/Item Sharing")
+        local s = S.Demo_SubplotItemSharing
+        local ImPlotSubplotFlags = ImPlot.ImPlotSubplotFlags
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotSubplotFlags_ShareItems", ImPlotSubplotFlags.ShareItems)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotSubplotFlags_ColMajor", ImPlotSubplotFlags.ColMajor)
+        ImGui.BulletText("Drag and drop items from the legend onto plots (except for 'common')")
+        local rows, cols, id = s.rows, s.cols, s.id
+        if ImPlot.BeginSubplots("##ItemSharing", rows, cols, ImVec2(-1, 400), s.flags) then
+            ImPlot.SetupLegend(ImPlotLocation.South, bor(ImPlotLegendFlags.Sort, ImPlotLegendFlags.Horizontal))
+            for i = 0, rows * cols - 1 do
+                if ImPlot.BeginPlot("") then
+                    ImPlot.PlotLineG("common", SinewaveGetter, 0.01, 1000)
+                    for j = 0, 5 do
+                        if id[j + 1] == i then
+                            local fj = 0.01 * (j + 2)
+                            local label = string.format("data%d", j)
+                            ImPlot.PlotLineG(label, SinewaveGetter, fj, 1000)
+                            if ImPlot.BeginDragDropSourceItem(label) then
+                                s.curj = j
+                                ImGui.SetDragDropPayload("MY_DND", nil, 0)
+                                ImPlot.ItemIcon(ImPlot.GetLastItemColor()); ImGui.SameLine()
+                                ImGui.TextUnformatted(label)
+                                ImPlot.EndDragDropSource()
+                            end
+                        end
+                    end
+                    if ImPlot.BeginDragDropTargetPlot() then
+                        if ImGui.AcceptDragDropPayload("MY_DND") then
+                            id[s.curj + 1] = i
+                        end
+                        ImPlot.EndDragDropTarget()
+                    end
+                    ImPlot.EndPlot()
+                end
+            end
+            ImPlot.EndSubplots()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_SubplotAxisLinking = {
+        flags = bor(ImPlot.ImPlotSubplotFlags.LinkRows, ImPlot.ImPlotSubplotFlags.LinkCols), rows = 2, cols = 2,
+    }
+    function D.Demo_SubplotAxisLinking()
+        IMGUI_DEMO_MARKER("Subplots/Axis Linking")
+        local s = S.Demo_SubplotAxisLinking
+        local ImPlotSubplotFlags = ImPlot.ImPlotSubplotFlags
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotSubplotFlags_LinkRows", ImPlotSubplotFlags.LinkRows)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotSubplotFlags_LinkCols", ImPlotSubplotFlags.LinkCols)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotSubplotFlags_LinkAllX", ImPlotSubplotFlags.LinkAllX)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotSubplotFlags_LinkAllY", ImPlotSubplotFlags.LinkAllY)
+
+        local rows, cols = s.rows, s.cols
+        if ImPlot.BeginSubplots("##AxisLinking", rows, cols, ImVec2(-1, 400), s.flags) then
+            for _ = 0, rows * cols - 1 do
+                if ImPlot.BeginPlot("") then
+                    ImPlot.SetupAxesLimits(0, 1000, -1, 1)
+                    ImPlot.PlotLineG("common", SinewaveGetter, 0.01, 1000)
+                    ImPlot.EndPlot()
+                end
+            end
+            ImPlot.EndSubplots()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    -- [Port] MyImPlot::WaveData / SawWave
+    local function WaveData(x, amp, freq, offset)
+        return { X = x, Amp = amp, Freq = freq, Offset = offset }
+    end
+    local function SawWave(idx, wd)
+        local x = idx * wd.X
+        return x, wd.Offset + wd.Amp * (-2 / 3.14 * math.atan(math.cos(3.14 * wd.Freq * x) / math.sin(3.14 * wd.Freq * x)))
+    end
+
+    S.Demo_LegendOptions = {
+        loc = ImPlotLocation.East, flags = 0, num_dummy_items = 25,
+        data1 = WaveData(0.001, 0.2, 4, 0.2), data2 = WaveData(0.001, 0.2, 4, 0.4), data3 = WaveData(0.001, 0.2, 4, 0.6),
+        data4 = WaveData(0.001, 0.2, 4, 0.8), data5 = WaveData(0.001, 0.2, 4, 1.0),
+    }
+    function D.Demo_LegendOptions()
+        IMGUI_DEMO_MARKER("Tools/Legend Options")
+        local s = S.Demo_LegendOptions
+        s.loc = CHECKBOX_FLAG(s.loc, "North", ImPlotLocation.North); ImGui.SameLine()
+        s.loc = CHECKBOX_FLAG(s.loc, "South", ImPlotLocation.South); ImGui.SameLine()
+        s.loc = CHECKBOX_FLAG(s.loc, "West", ImPlotLocation.West); ImGui.SameLine()
+        s.loc = CHECKBOX_FLAG(s.loc, "East", ImPlotLocation.East)
+
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotLegendFlags_Horizontal", ImPlotLegendFlags.Horizontal)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotLegendFlags_Outside", ImPlotLegendFlags.Outside)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotLegendFlags_Sort", ImPlotLegendFlags.Sort)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotLegendFlags_Reverse", ImPlotLegendFlags.Reverse)
+
+        local style = ImPlot.GetStyle()
+        ImGui.SliderFloat2("LegendPadding", style.LegendPadding, 0.0, 20.0, "%.0f")
+        ImGui.SliderFloat2("LegendInnerPadding", style.LegendInnerPadding, 0.0, 10.0, "%.0f")
+        ImGui.SliderFloat2("LegendSpacing", style.LegendSpacing, 0.0, 5.0, "%.0f")
+
+        s.num_dummy_items = ImGui.SliderInt("Num Dummy Items (Demo Scrolling)", s.num_dummy_items, 0, 100)
+
+        if ImPlot.BeginPlot("##Legend", ImVec2(-1, 0)) then
+            ImPlot.SetupLegend(s.loc, s.flags)
+            ImPlot.PlotLineG("Item 002", SawWave, s.data1, 1000)         -- "Item B" added to legend
+            ImPlot.PlotLineG("Item 001##IDText", SawWave, s.data2, 1000) -- "Item A" added to legend, text after ## used for ID only
+            ImPlot.PlotLineG("##NotListed", SawWave, s.data3, 1000)      -- plotted, but not added to legend
+            ImPlot.PlotLineG("Item 003", SawWave, s.data4, 1000)         -- "Item C" added to legend
+            ImPlot.PlotLineG("Item 003", SawWave, s.data5, 1000)         -- combined with previous "Item C"
+
+            for i = 0, s.num_dummy_items - 1 do
+                ImPlot.PlotDummy(string.format("Item %03d", i + 4))
+            end
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    -- [Port] ImPlotPoint P[] -> separate X/Y arrays (PlotLine reads the first 2 handle points directly)
+    S.Demo_DragPoints = {
+        flags = 0, PX = { 0.05, 0.2, 0.8, 0.95 }, PY = { 0.05, 0.4, 0.6, 0.95 },
+        BX = table.create(100, 0), BY = table.create(100, 0),
+    }
+    function D.Demo_DragPoints()
+        IMGUI_DEMO_MARKER("Tools/Drag Points")
+        local s = S.Demo_DragPoints
+        local ImPlotDragToolFlags = ImPlot.ImPlotDragToolFlags
+        ImGui.BulletText("Click and drag each point.")
+        s.flags = CHECKBOX_FLAG(s.flags, "NoCursors", ImPlotDragToolFlags.NoCursors); ImGui.SameLine()
+        s.flags = CHECKBOX_FLAG(s.flags, "NoFit", ImPlotDragToolFlags.NoFit); ImGui.SameLine()
+        s.flags = CHECKBOX_FLAG(s.flags, "NoInput", ImPlotDragToolFlags.NoInputs)
+        local ax_flags = bor(ImPlotAxisFlags.NoTickLabels, ImPlotAxisFlags.NoTickMarks)
+        local hovered, held = {}, {}
+        if ImPlot.BeginPlot("##Bezier", ImVec2(-1, 0), ImPlotFlags.CanvasOnly) then
+            ImPlot.SetupAxes(nil, nil, ax_flags, ax_flags)
+            ImPlot.SetupAxesLimits(0, 1, 0, 1)
+            local PX, PY = s.PX, s.PY
+            local cols = { ImVec4(0, 0.9, 0, 1), ImVec4(1, 0.5, 1, 1), ImVec4(0, 0.5, 1, 1), ImVec4(0, 0.9, 0, 1) }
+            for k = 1, 4 do
+                PX[k], PY[k], _, _, hovered[k], held[k] = ImPlot.DragPoint(k - 1, PX[k], PY[k], cols[k], 4, s.flags)
+            end
+
+            local BX, BY = s.BX, s.BY
+            for i = 0, 99 do
+                local t  = i / 99.0
+                local u  = 1 - t
+                local w1 = u * u * u
+                local w2 = 3 * u * u * t
+                local w3 = 3 * u * t * t
+                local w4 = t * t * t
+                BX[i + 1] = w1 * PX[1] + w2 * PX[2] + w3 * PX[3] + w4 * PX[4]
+                BY[i + 1] = w1 * PY[1] + w2 * PY[2] + w3 * PY[3] + w4 * PY[4]
+            end
+
+            local spec = ImPlot.ImPlotSpec()
+
+            spec.LineColor = ImVec4(1, 0.5, 1, 1)
+            spec.LineWeight = (hovered[2] or held[2]) and 2.0 or 1.0
+            ImPlot.PlotLine("##h1", { PX[1], PX[2] }, { PY[1], PY[2] }, 2, spec)
+
+            spec.LineColor = ImVec4(0, 0.5, 1, 1)
+            spec.LineWeight = (hovered[3] or held[3]) and 2.0 or 1.0
+            ImPlot.PlotLine("##h2", { PX[3], PX[4] }, { PY[3], PY[4] }, 2, spec)
+
+            spec.LineColor = ImVec4(0, 0.9, 0, 1)
+            spec.LineWeight = (hovered[1] or held[1] or hovered[4] or held[4]) and 3.0 or 2.0
+            ImPlot.PlotLine("##bez", BX, BY, 100, spec)
+
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_DragLines = { x1 = 0.2, x2 = 0.8, y1 = 0.25, y2 = 0.75, f = 0.1, flags = 0, xs = table.create(1000, 0), ys = table.create(1000, 0) }
+    function D.Demo_DragLines()
+        IMGUI_DEMO_MARKER("Tools/Drag Lines")
+        local s = S.Demo_DragLines
+        local ImPlotDragToolFlags = ImPlot.ImPlotDragToolFlags
+        ImGui.BulletText("Click and drag the horizontal and vertical lines.")
+        local hovered, held = false, false
+        s.flags = CHECKBOX_FLAG(s.flags, "NoCursors", ImPlotDragToolFlags.NoCursors); ImGui.SameLine()
+        s.flags = CHECKBOX_FLAG(s.flags, "NoFit", ImPlotDragToolFlags.NoFit); ImGui.SameLine()
+        s.flags = CHECKBOX_FLAG(s.flags, "NoInput", ImPlotDragToolFlags.NoInputs)
+        if ImPlot.BeginPlot("##lines", ImVec2(-1, 0)) then
+            ImPlot.SetupAxesLimits(0, 1, 0, 1)
+            local white = ImVec4(1, 1, 1, 1)
+            s.x1 = ImPlot.DragLineX(0, s.x1, white, 1, s.flags)
+            s.x2 = ImPlot.DragLineX(1, s.x2, white, 1, s.flags)
+            s.y1 = ImPlot.DragLineY(2, s.y1, white, 1, s.flags)
+            s.y2 = ImPlot.DragLineY(3, s.y2, white, 1, s.flags)
+            local xs, ys = s.xs, s.ys
+            for i = 0, 999 do
+                xs[i + 1] = (s.x2 + s.x1) / 2 + math.abs(s.x2 - s.x1) * (i / 1000.0 - 0.5)
+                ys[i + 1] = (s.y1 + s.y2) / 2 + math.abs(s.y2 - s.y1) / 2 * math.sin(s.f * i / 10)
+            end
+            s.f, _, _, hovered, held = ImPlot.DragLineY(120482, s.f, ImVec4(1, 0.5, 1, 1), 1, s.flags)
+            ImPlot.PlotLine("Interactive Data", xs, ys, 1000, ImPlot.ImPlotSpec(ImPlotProp.LineWeight, (hovered or held) and 2.0 or 1.0))
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_DragRects = {
+        x_data = table.create(512, 0), y_data1 = table.create(512, 0), y_data2 = table.create(512, 0), y_data3 = table.create(512, 0),
+        sampling_freq = 44100, freq = 500, rect = ImPlot.ImPlotRect(0.0025, 0.0045, 0, 0.5), flags = 0,
+    }
+    function D.Demo_DragRects()
+        IMGUI_DEMO_MARKER("Tools/Drag Rects")
+        local s = S.Demo_DragRects
+        local ImPlotDragToolFlags = ImPlot.ImPlotDragToolFlags
+        local x_data, y_data1, y_data2, y_data3 = s.x_data, s.y_data1, s.y_data2, s.y_data3
+        local clicked, hovered, held = false, false, false
+        for i = 1, 512 do
+            local t = (i - 1) / s.sampling_freq
+            x_data[i] = t
+            local arg = 2 * 3.14 * s.freq * t
+            y_data1[i] = math.sin(arg)
+            y_data2[i] = y_data1[i] * -0.6 + math.sin(2 * arg) * 0.4
+            y_data3[i] = y_data2[i] * -0.6 + math.sin(3 * arg) * 0.4
+        end
+        ImGui.BulletText("Click and drag the edges, corners, and center of the rect.")
+        ImGui.BulletText("Double click edges to expand rect to plot extents.")
+        local rect = s.rect
+        s.flags = CHECKBOX_FLAG(s.flags, "NoCursors", ImPlotDragToolFlags.NoCursors); ImGui.SameLine()
+        s.flags = CHECKBOX_FLAG(s.flags, "NoFit", ImPlotDragToolFlags.NoFit); ImGui.SameLine()
+        s.flags = CHECKBOX_FLAG(s.flags, "NoInput", ImPlotDragToolFlags.NoInputs)
+
+        if ImPlot.BeginPlot("##Main", ImVec2(-1, ImGui.GetTextLineHeight() * 10)) then
+            ImPlot.SetupAxes(nil, nil, ImPlotAxisFlags.NoTickLabels, ImPlotAxisFlags.NoTickLabels)
+            ImPlot.SetupAxesLimits(0, 0.01, -1, 1)
+            ImPlot.PlotLine("Signal 1", x_data, y_data1, 512)
+            ImPlot.PlotLine("Signal 2", x_data, y_data2, 512)
+            ImPlot.PlotLine("Signal 3", x_data, y_data3, 512)
+            _, clicked, hovered, held = ImPlot.DragRect(0, rect, ImVec4(1, 0, 1, 1), s.flags)
+            ImPlot.EndPlot()
+        end
+        local bg_col = held and ImVec4(0.5, 0, 0.5, 1) or (hovered and ImVec4(0.25, 0, 0.25, 1) or ImPlot.GetStyle().Colors[ImPlot.ImPlotCol.PlotBg])
+        ImPlot.PushStyleColor(ImPlot.ImPlotCol.PlotBg, bg_col)
+        if ImPlot.BeginPlot("##rect", ImVec2(-1, ImGui.GetTextLineHeight() * 10), ImPlotFlags.CanvasOnly) then
+            ImPlot.SetupAxes(nil, nil, ImPlotAxisFlags.NoDecorations, ImPlotAxisFlags.NoDecorations)
+            ImPlot.SetupAxesLimits(rect.X.Min, rect.X.Max, rect.Y.Min, rect.Y.Max, ImGuiCond.Always)
+            ImPlot.PlotLine("Signal 1", x_data, y_data1, 512)
+            ImPlot.PlotLine("Signal 2", x_data, y_data2, 512)
+            ImPlot.PlotLine("Signal 3", x_data, y_data3, 512)
+            ImPlot.EndPlot()
+        end
+        ImPlot.PopStyleColor()
+        ImGui.Text("Rect is %sclicked, %shovered, %sheld", clicked and "" or "not ", hovered and "" or "not ", held and "" or "not ")
+    end
+
+    ---------------------------------------------------------------------------
+
+    -- [Port] ImVector<ImPlotPoint> -> separate X/Y arrays; returns avg, cnt
+    local function FindCentroid(xs, ys, bounds)
+        local cnt = 0
+        local avg = ImPlot.ImPlotPoint()
+        local bounds_fixed = ImPlot.ImPlotRect(
+            math.min(bounds.X.Min, bounds.X.Max), math.max(bounds.X.Min, bounds.X.Max),
+            math.min(bounds.Y.Min, bounds.Y.Max), math.max(bounds.Y.Min, bounds.Y.Max))
+        for i = 1, #xs do
+            if bounds_fixed:Contains(xs[i], ys[i]) then
+                avg.x += xs[i]
+                avg.y += ys[i]
+                cnt += 1
+            end
+        end
+        if cnt > 0 then
+            avg.x = avg.x / cnt
+            avg.y = avg.y / cnt
+        end
+        return avg, cnt
+    end
+
+    S.Demo_Querying = { xs = {}, ys = {}, rects = {}, limits = nil, select = nil, init = true }
+    function D.Demo_Querying()
+        IMGUI_DEMO_MARKER("Tools/Querying")
+        local s = S.Demo_Querying
+        local xs, ys, rects = s.xs, s.ys, s.rects
+        if s.init then
+            for _ = 1, 50 do
+                table.insert(xs, RandomRange(0.1, 0.9))
+                table.insert(ys, RandomRange(0.1, 0.9))
+            end
+            s.init = false
+        end
+
+        ImGui.BulletText("Box select and left click mouse to create a new query rect.")
+        ImGui.BulletText("Ctrl + click in the plot area to draw points.")
+
+        if ImGui.Button("Clear Queries") then
+            table.clear(rects)
+        end
+
+        if ImPlot.BeginPlot("##Centroid") then
+            ImPlot.SetupAxesLimits(0, 1, 0, 1)
+            if ImPlot.IsPlotHovered() and ImGui.IsMouseClicked(0) and ImGui.GetIO().KeyCtrl then
+                local pt = ImPlot.GetPlotMousePos()
+                table.insert(xs, pt.x)
+                table.insert(ys, pt.y)
+            end
+            local cent_spec = ImPlot.ImPlotSpec()
+            cent_spec.Marker = ImPlotMarker.Square
+            cent_spec.MarkerSize = 6
+            ImPlot.PlotScatter("Points", xs, ys, #xs)
+            if ImPlot.IsPlotSelected() then
+                s.select = ImPlot.GetPlotSelection()
+                local centroid, cnt = FindCentroid(xs, ys, s.select)
+                if cnt > 0 then
+                    ImPlot.PlotScatter("Centroid", { centroid.x }, { centroid.y }, 1, cent_spec)
+                end
+                if ImGui.IsMouseClicked(ImPlot.GetInputMap().SelectCancel) then
+                    ImPlot.CancelPlotSelection()
+                    table.insert(rects, s.select)
+                end
+            end
+            for i = 1, #rects do
+                local centroid, cnt = FindCentroid(xs, ys, rects[i])
+                if cnt > 0 then
+                    ImPlot.PlotScatter("Centroid", { centroid.x }, { centroid.y }, 1, cent_spec)
+                end
+                ImPlot.DragRect(i - 1, rects[i], ImVec4(1, 0, 1, 1))
+            end
+            s.limits = ImPlot.GetPlotLimits()
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_Annotations = { clamp = false, p = { 0.25, 0.25, 0.75, 0.75, 0.25 } }
+    function D.Demo_Annotations()
+        IMGUI_DEMO_MARKER("Tools/Annotations")
+        local s = S.Demo_Annotations
+        _, s.clamp = ImGui.Checkbox("Clamp", s.clamp)
+        local clamp = s.clamp
+        if ImPlot.BeginPlot("##Annotations") then
+            ImPlot.SetupAxesLimits(0, 2, 0, 1)
+            -- [Port] &p[0], &p[1] (overlapping pointers) -> explicit slices
+            local p = s.p
+            ImPlot.PlotScatter("##Points", { p[1], p[2], p[3], p[4] }, { p[2], p[3], p[4], p[5] }, 4)
+            local col = ImPlot.GetLastItemColor()
+            ImPlot.Annotation(0.25, 0.25, col, ImVec2(-15, 15), clamp, "BL")
+            ImPlot.Annotation(0.75, 0.25, col, ImVec2(15, 15), clamp, "BR")
+            ImPlot.Annotation(0.75, 0.75, col, ImVec2(15, -15), clamp, "TR")
+            ImPlot.Annotation(0.25, 0.75, col, ImVec2(-15, -15), clamp, "TL")
+            ImPlot.Annotation(0.5, 0.5, col, ImVec2(0, 0), clamp, "Center")
+
+            ImPlot.Annotation(1.25, 0.75, ImVec4(0, 1, 0, 1), ImVec2(0, 0), clamp)
+
+            local bx = { 1.2, 1.5, 1.8 }
+            local by = { 0.25, 0.5, 0.75 }
+            ImPlot.PlotBars("##Bars", bx, by, 3, 0.2)
+            for i = 0, 2 do
+                ImPlot.Annotation(bx[i + 1], by[i + 1], ImVec4(0, 0, 0, 0), ImVec2(0, -5), clamp, "B[%d]=%.2f", i, by[i + 1])
+            end
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_Tags = { show = true, drag_tag = 0.25 }
+    function D.Demo_Tags()
+        IMGUI_DEMO_MARKER("Tools/Tags")
+        local s = S.Demo_Tags
+        _, s.show = ImGui.Checkbox("Show Tags", s.show)
+        if ImPlot.BeginPlot("##Tags") then
+            ImPlot.SetupAxis(ImAxis.X2)
+            ImPlot.SetupAxis(ImAxis.Y2)
+            if s.show then
+                ImPlot.TagX(0.25, ImVec4(1, 1, 0, 1))
+                ImPlot.TagY(0.75, ImVec4(1, 1, 0, 1))
+                s.drag_tag = ImPlot.DragLineY(0, s.drag_tag, ImVec4(1, 0, 0, 1), 1, ImPlot.ImPlotDragToolFlags.NoFit)
+                ImPlot.TagY(s.drag_tag, ImVec4(1, 0, 0, 1), "Drag")
+                ImPlot.SetAxes(ImAxis.X2, ImAxis.Y2)
+                ImPlot.TagX(0.5, ImVec4(0, 1, 1, 1), "%s", "MyTag")
+                ImPlot.TagY(0.5, ImVec4(0, 1, 1, 1), "Tag: %d", 42)
+            end
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    local function RandomColor()
+        return ImVec4(RandomRange(0.0, 1.0), RandomRange(0.0, 1.0), RandomRange(0.0, 1.0), 1.0)
+    end
+
+    -- convenience struct to manage DND items; do this however you like
+    -- [Port] MyDndItem -> table; ImVector<ImVec2> Data -> X/Y arrays; dnd[] is 0-indexed via [k + 1]
+    local function MyDndItem(idx)
+        local item = { Idx = idx, Plt = 0, Yax = ImAxis.Y1, Label = string.format("%02d Hz", idx + 1), Color = RandomColor(),
+            X = table.create(1001, 0), Y = table.create(1001, 0) }
+        for k = 0, 1000 do
+            local t = k * 1.0 / 999
+            item.X[k + 1] = t
+            item.Y[k + 1] = 0.5 + 0.5 * math.sin(2 * 3.14 * t * (idx + 1))
+        end
+        return item
+    end
+    local function MyDndItem_Reset(item) item.Plt = 0; item.Yax = ImAxis.Y1 end
+
+    S.Demo_DragAndDrop = { dnd = nil, dndx = nil, dndy = nil } -- [Port] dnd created on first use
+    function D.Demo_DragAndDrop()
+        IMGUI_DEMO_MARKER("Tools/Drag and Drop")
+        local s = S.Demo_DragAndDrop
+        local ImPlotCol = ImPlot.ImPlotCol
+        ImGui.BulletText("Drag/drop items from the left column.")
+        ImGui.BulletText("Drag/drop items between plots.")
+        ImGui.Indent()
+        ImGui.BulletText("Plot 1 Targets: Plot, Y-Axes, Legend")
+        ImGui.BulletText("Plot 1 Sources: Legend Item Labels")
+        ImGui.BulletText("Plot 2 Targets: Plot, X-Axis, Y-Axis")
+        ImGui.BulletText("Plot 2 Sources: Plot, X-Axis, Y-Axis (hold Ctrl)")
+        ImGui.Unindent()
+
+        local k_dnd = 20
+        if s.dnd == nil then
+            s.dnd = table.create(k_dnd)
+            for k = 0, k_dnd - 1 do s.dnd[k + 1] = MyDndItem(k) end
+        end
+        local dnd = s.dnd
+
+        -- child window to serve as initial source for our DND items
+        ImGui.BeginChild("DND_LEFT", ImVec2(100, 400))
+        if ImGui.Button("Reset Data") then
+            for k = 1, k_dnd do
+                MyDndItem_Reset(dnd[k])
+            end
+            s.dndx, s.dndy = nil, nil
+        end
+        for k = 0, k_dnd - 1 do
+            local item = dnd[k + 1]
+            if item.Plt <= 0 then
+                ImPlot.ItemIcon(item.Color); ImGui.SameLine()
+                ImGui.Selectable(item.Label, false, 0, ImVec2(100, 0))
+                if ImGui.BeginDragDropSource(0) then
+                    ImGui.SetDragDropPayload("MY_DND", k, 1)
+                    ImPlot.ItemIcon(item.Color); ImGui.SameLine()
+                    ImGui.TextUnformatted(item.Label)
+                    ImGui.EndDragDropSource()
+                end
+            end
+        end
+        ImGui.EndChild()
+        if ImGui.BeginDragDropTarget() then
+            local payload = ImGui.AcceptDragDropPayload("MY_DND")
+            if payload then
+                MyDndItem_Reset(dnd[payload.Data + 1])
+            end
+            ImGui.EndDragDropTarget()
+        end
+
+        ImGui.SameLine()
+        ImGui.BeginChild("DND_RIGHT", ImVec2(-1, 400))
+        -- plot 1 (time series)
+        local flags = bor(ImPlotAxisFlags.NoTickLabels, ImPlotAxisFlags.NoGridLines, ImPlotAxisFlags.NoHighlight)
+        if ImPlot.BeginPlot("##DND1", ImVec2(-1, ImGui.GetTextLineHeight() * 13)) then
+            ImPlot.SetupAxis(ImAxis.X1, nil, bor(flags, ImPlotAxisFlags.Lock))
+            ImPlot.SetupAxis(ImAxis.Y1, "[drop here]", flags)
+            ImPlot.SetupAxis(ImAxis.Y2, "[drop here]", bor(flags, ImPlotAxisFlags.Opposite))
+            ImPlot.SetupAxis(ImAxis.Y3, "[drop here]", bor(flags, ImPlotAxisFlags.Opposite))
+
+            for k = 0, k_dnd - 1 do
+                local item = dnd[k + 1]
+                if item.Plt == 1 and #item.X > 0 then
+                    ImPlot.SetAxis(item.Yax)
+                    local spec = ImPlot.ImPlotSpec()
+                    spec.LineColor = item.Color
+                    ImPlot.PlotLine(item.Label, item.X, item.Y, #item.X, spec)
+                    -- allow legend item labels to be DND sources
+                    if ImPlot.BeginDragDropSourceItem(item.Label) then
+                        ImGui.SetDragDropPayload("MY_DND", k, 1)
+                        ImPlot.ItemIcon(item.Color); ImGui.SameLine()
+                        ImGui.TextUnformatted(item.Label)
+                        ImPlot.EndDragDropSource()
+                    end
+                end
+            end
+            -- allow the main plot area to be a DND target
+            if ImPlot.BeginDragDropTargetPlot() then
+                local payload = ImGui.AcceptDragDropPayload("MY_DND")
+                if payload then
+                    local i = payload.Data + 1; dnd[i].Plt = 1; dnd[i].Yax = ImAxis.Y1
+                end
+                ImPlot.EndDragDropTarget()
+            end
+            -- allow each y-axis to be a DND target
+            for y = ImAxis.Y1, ImAxis.Y3 do
+                if ImPlot.BeginDragDropTargetAxis(y) then
+                    local payload = ImGui.AcceptDragDropPayload("MY_DND")
+                    if payload then
+                        local i = payload.Data + 1; dnd[i].Plt = 1; dnd[i].Yax = y
+                    end
+                    ImPlot.EndDragDropTarget()
+                end
+            end
+            -- allow the legend to be a DND target
+            if ImPlot.BeginDragDropTargetLegend() then
+                local payload = ImGui.AcceptDragDropPayload("MY_DND")
+                if payload then
+                    local i = payload.Data + 1; dnd[i].Plt = 1; dnd[i].Yax = ImAxis.Y1
+                end
+                ImPlot.EndDragDropTarget()
+            end
+            ImPlot.EndPlot()
+        end
+        -- plot 2 (Lissajous)
+        if ImPlot.BeginPlot("##DND2", ImVec2(-1, ImGui.GetTextLineHeight() * 13)) then
+            local dndx, dndy = s.dndx, s.dndy
+            local axis_bg = ImPlot.GetStyle().Colors[ImPlotCol.AxisBg]
+            ImPlot.PushStyleColor(ImPlotCol.AxisBg, dndx ~= nil and dndx.Color or axis_bg)
+            ImPlot.SetupAxis(ImAxis.X1, dndx == nil and "[drop here]" or dndx.Label, flags)
+            ImPlot.PushStyleColor(ImPlotCol.AxisBg, dndy ~= nil and dndy.Color or axis_bg)
+            ImPlot.SetupAxis(ImAxis.Y1, dndy == nil and "[drop here]" or dndy.Label, flags)
+            ImPlot.PopStyleColor(2)
+            if dndx ~= nil and dndy ~= nil then
+                local mixed = ImVec4((dndx.Color.x + dndy.Color.x) / 2, (dndx.Color.y + dndy.Color.y) / 2,
+                    (dndx.Color.z + dndy.Color.z) / 2, (dndx.Color.w + dndy.Color.w) / 2)
+                local spec = ImPlot.ImPlotSpec()
+                spec.LineColor = mixed
+                ImPlot.PlotLine("##dndxy", dndx.Y, dndy.Y, #dndx.Y, spec)
+            end
+            -- allow the x-axis to be a DND target
+            if ImPlot.BeginDragDropTargetAxis(ImAxis.X1) then
+                local payload = ImGui.AcceptDragDropPayload("MY_DND")
+                if payload then
+                    s.dndx = dnd[payload.Data + 1]
+                end
+                ImPlot.EndDragDropTarget()
+            end
+            -- allow the x-axis to be a DND source
+            if dndx ~= nil and ImPlot.BeginDragDropSourceAxis(ImAxis.X1) then
+                ImGui.SetDragDropPayload("MY_DND", dndx.Idx, 1)
+                ImPlot.ItemIcon(dndx.Color); ImGui.SameLine()
+                ImGui.TextUnformatted(dndx.Label)
+                ImPlot.EndDragDropSource()
+            end
+            -- allow the y-axis to be a DND target
+            if ImPlot.BeginDragDropTargetAxis(ImAxis.Y1) then
+                local payload = ImGui.AcceptDragDropPayload("MY_DND")
+                if payload then
+                    s.dndy = dnd[payload.Data + 1]
+                end
+                ImPlot.EndDragDropTarget()
+            end
+            -- allow the y-axis to be a DND source
+            if dndy ~= nil and ImPlot.BeginDragDropSourceAxis(ImAxis.Y1) then
+                ImGui.SetDragDropPayload("MY_DND", dndy.Idx, 1)
+                ImPlot.ItemIcon(dndy.Color); ImGui.SameLine()
+                ImGui.TextUnformatted(dndy.Label)
+                ImPlot.EndDragDropSource()
+            end
+            -- allow the plot area to be a DND target
+            if ImPlot.BeginDragDropTargetPlot() then
+                local payload = ImGui.AcceptDragDropPayload("MY_DND")
+                if payload then
+                    s.dndx = dnd[payload.Data + 1]; s.dndy = s.dndx
+                end
+                ImPlot.EndDragDropTarget() -- [Port] missing upstream; required to balance BeginDragDropTargetCustom
+            end
+            -- allow the plot area to be a DND source
+            if ImPlot.BeginDragDropSourcePlot() then
+                ImGui.TextUnformatted("Yes, you can\ndrag this!")
+                ImPlot.EndDragDropSource()
+            end
+            ImPlot.EndPlot()
+        end
+        ImGui.EndChild()
+    end
+
+    ---------------------------------------------------------------------------
     -- [Port] TODO: the remaining demos are not ported yet; stubs show a placeholder
     ---------------------------------------------------------------------------
 
     for _, name in {
-        "TickLabels", "SubplotsSizing",
-        "SubplotItemSharing", "SubplotAxisLinking", "Tables", "LegendOptions", "LegendPopups", "DragPoints", "DragLines",
-        "DragRects", "Querying", "Annotations", "Tags", "DragAndDrop", "ColormapWidgets", "ItemStylingAndSpec",
+        "TickLabels", "Tables", "LegendPopups", "ColormapWidgets", "ItemStylingAndSpec",
         "OffsetAndStride", "CustomStyles", "CustomDataAndGetters", "CustomRendering", "CustomPlottersAndTooltips",
     } do
         if D["Demo_" .. name] == nil then

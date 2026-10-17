@@ -32,6 +32,13 @@ ImPlot.BeginPlot = function(title, ...)
     return r
 end
 
+local BeginSubplots, subplotted = ImPlot.BeginSubplots, {}
+ImPlot.BeginSubplots = function(title, ...)
+    local r = BeginSubplots(title, ...)
+    if r then subplotted[title] = true end
+    return r
+end
+
 local frame, done = 0, false
 game:GetService("RunService").Stepped:Connect(function()
     if done then return end
@@ -56,8 +63,12 @@ game:GetService("RunService").Stepped:Connect(function()
             "##MarkerStyles", "##NaNValues", "Colorful Lines", "Colorful Shaded Plots", "Colorful Scatter", "Colorful Bubbles",
             "Colorful Stairstep Plot", "Colorful Bar Plot", "Colorful Stem Plots", "Colorful Infinite Lines", "Log Plot",
             "SymLog Plot", "##Time", "Sqrt", "Multi-Axis Plot", "Plot A", "Plot B", "##AxisConstraints", "##EqualAxes",
-            "##DataFitting" } do
+            "##DataFitting", "##Legend", "##Bezier", "##lines", "##Main", "##rect", "##Centroid", "##Annotations",
+            "##Tags", "##DND1", "##DND2" } do
             assert(plotted[p], "plot never began: " .. p)
+        end
+        for _, p in { "My Subplots", "##ItemSharing", "##AxisLinking" } do
+            assert(subplotted[p], "subplots never began: " .. p)
         end
         ImPlot.DestroyContext()
         print("OK")
