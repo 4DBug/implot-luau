@@ -867,6 +867,12 @@ return function(G)
                 StyleModifiers = {},
                 ColormapData = internal.ImPlotColormapData(),
                 ColormapModifiers = {},
+                -- Plot States
+                -- [Port] ImPool<ImPlotPlot>; ctor resolved lazily since ImPlotPlot is defined in a later section
+                Plots = G.ImPool(function() return internal.ImPlotPlot() end),
+                CurrentAlignmentH = nil,
+                CurrentAlignmentV = nil,
+                -- [Port] TODO: NextPlotData, NextItemData, Annotations, Tags, Subplots (later milestones)
             }
         end
 
@@ -1013,6 +1019,1539 @@ return function(G)
             return ImGui.ColorConvertU32ToFloat4(ImPlot.SampleColormapU32(t, cmap))
         end
     end
+
+    --------------------------------------------------------------------------
+    -- [SECTION] Axes, Ticker, Plot (implot_internal.h)
+    --------------------------------------------------------------------------
+    do
+        local ImAxis = ImPlot.ImAxis
+        local ImPlotAxisFlags = ImPlot.ImPlotAxisFlags
+        local ImPlotScale = ImPlot.ImPlotScale
+        local ImPlotCond = ImPlot.ImPlotCond
+        local band = bit32.band
+        local HUGE_VAL = math.huge
+        local DBL_MAX = 1.7976931348623157e308
+        local DBL_MIN = 2.2250738585072014e-308
+        local DBL_EPSILON = 2.220446049250313e-16
+
+        internal.IMPLOT_LABEL_FORMAT = "%g"
+        internal.IMPLOT_NUM_X_AXES = ImAxis.Y1
+        internal.IMPLOT_NUM_Y_AXES = ImAxis.COUNT - ImAxis.Y1
+
+        local function ImHasFlag(set, flag) return band(set, flag) == flag end
+        internal.ImHasFlag = ImHasFlag
+        -- Returns true if val is NAN
+        local function ImNan(val) return val ~= val end
+        -- Returns true if val is NAN or INFINITY
+        local function ImNanOrInf(val) return val ~= val or val == HUGE_VAL or val == -HUGE_VAL end
+        -- Turns NANs to 0s
+        local function ImConstrainNan(val)
+            if ImNan(val) then return 0 end
+            return val
+        end
+        -- Turns infinity to floating point maximums
+        local function ImConstrainInf(val)
+            if val >= DBL_MAX then return DBL_MAX end
+            if val <= -DBL_MAX then return -DBL_MAX end
+            return val
+        end
+        -- True if two numbers are approximately equal using units in the last place.
+        local function ImAlmostEqual(v1, v2, ulp)
+            ulp = ulp or 2
+            return math.abs(v1 - v2) < DBL_EPSILON * math.abs(v1 + v2) * ulp or math.abs(v1 - v2) < DBL_MIN
+        end
+        internal.ImNanOrInf = ImNanOrInf
+        internal.ImAlmostEqual = ImAlmostEqual
+
+        -- Tick mark info
+        -- [Port] the label string is stored on the tick (Text) instead of an offset into a shared ImGuiTextBuffer
+        function internal.ImPlotTick(value, major, level, show_label)
+            return {
+                PlotPos   = value or 0,
+                PixelPos  = 0,
+                LabelSize = ImVec2(0, 0),
+                Text      = nil,
+                Major     = major or false,
+                ShowLabel = show_label or false,
+                Level     = level or 0,
+                Idx       = -1,
+            }
+        end
+
+        -- Collection of ticks
+        -- [Port] Ticks is a 1-based array whose tick tables are recycled across frames (Size = live count) to avoid per-frame allocations.
+        local TickerMT = {}
+        TickerMT.__index = TickerMT
+        function internal.ImPlotTicker()
+            local t = setmetatable({ Ticks = {}, Size = 0, MaxSize = ImVec2(0, 0), LateSize = ImVec2(0, 0), Levels = 1 }, TickerMT)
+            t:Reset()
+            return t
+        end
+
+        -- [Port] AddTick(value, major, level, show_label, label) and AddTick(..., formatter, data) overloads:
+        -- `label_or_formatter` is a string or a formatter function(value, data) -> string
+        function TickerMT:AddTick(value, major, level, show_label, label_or_formatter, data)
+            local n = self.Size + 1
+            local tick = self.Ticks[n]
+            if tick == nil then
+                tick = internal.ImPlotTick()
+                self.Ticks[n] = tick
+            end
+            tick.PlotPos = value
+            tick.PixelPos = 0
+            tick.Major = major
+            tick.ShowLabel = show_label
+            tick.Level = level
+            tick.Text = nil
+            tick.LabelSize.x = 0; tick.LabelSize.y = 0
+            if show_label and label_or_formatter ~= nil then
+                local label = label_or_formatter
+                if type(label) == "function" then
+                    label = label_or_formatter(value, data)
+                end
+                tick.Text = label
+                local sz = ImGui.CalcTextSize(label)
+                tick.LabelSize.x = sz.x; tick.LabelSize.y = sz.y
+            end
+            if tick.ShowLabel then
+                if tick.LabelSize.x > self.MaxSize.x then self.MaxSize.x = tick.LabelSize.x end
+                if tick.LabelSize.y > self.MaxSize.y then self.MaxSize.y = tick.LabelSize.y end
+            end
+            tick.Idx = self.Size
+            self.Size = n
+            return tick
+        end
+        function TickerMT:GetText(idx) return self.Ticks[idx + 1].Text end
+        function TickerMT:OverrideSizeLate(size)
+            if size.x > self.LateSize.x then self.LateSize.x = size.x end
+            if size.y > self.LateSize.y then self.LateSize.y = size.y end
+        end
+        function TickerMT:Reset()
+            self.Size = 0
+            self.MaxSize.x = self.LateSize.x; self.MaxSize.y = self.LateSize.y
+            self.LateSize.x = 0; self.LateSize.y = 0
+            self.Levels = 1
+        end
+        function TickerMT:TickCount() return self.Size end
+
+        -- Axis state information that must persist after EndPlot
+        local AxisMT = {}
+        AxisMT.__index = AxisMT
+        internal.ImPlotAxisMT = AxisMT
+        function internal.ImPlotAxis()
+            local a = setmetatable({}, AxisMT)
+            a.ID               = 0
+            a.Flags            = ImPlotAxisFlags.None
+            a.PreviousFlags    = ImPlotAxisFlags.None
+            a.Range            = ImPlot.ImPlotRange(0, 1)
+            a.RangeCond        = ImPlotCond.None
+            a.Scale            = ImPlotScale.Linear
+            a.FitExtents       = ImPlot.ImPlotRange(HUGE_VAL, -HUGE_VAL)
+            a.OrthoAxis        = nil
+            a.ConstraintRange  = ImPlot.ImPlotRange(-HUGE_VAL, HUGE_VAL)
+            a.ConstraintZoom   = ImPlot.ImPlotRange(DBL_MIN, HUGE_VAL)
+            a.Ticker           = internal.ImPlotTicker()
+            a.Formatter        = nil
+            a.FormatterData    = nil
+            a.FormatSpec       = nil
+            a.Locator          = nil
+            a.LinkedMin        = nil
+            a.LinkedMax        = nil
+            a.PickerLevel      = 0
+            -- [Port] TODO: PickerTimeMin/PickerTimeMax (time scale milestone)
+            a.TransformForward = nil
+            a.TransformInverse = nil
+            a.TransformData    = nil
+            a.PixelMin         = 0
+            a.PixelMax         = 0
+            a.ScaleMin         = 0
+            a.ScaleMax         = 0
+            a.ScaleToPixel     = 0
+            a.Datum1           = 0
+            a.Datum2           = 0
+            a.HoverRect        = G.ImRect()
+            a.Label            = nil -- [Port] replaces LabelOffset into plot TextBuffer
+            a.ColorMaj, a.ColorMin, a.ColorTick, a.ColorTxt, a.ColorBg, a.ColorHov, a.ColorAct = 0, 0, 0, 0, 0, 0, 0
+            a.ColorHiLi        = G.IM_COL32_BLACK_TRANS
+            a.Enabled          = false
+            a.Vertical         = false
+            a.FitThisFrame     = false
+            a.HasRange         = false
+            a.HasFormatSpec    = false
+            a.ShowDefaultTicks = true
+            a.Hovered          = false
+            a.Held             = false
+            return a
+        end
+
+        function AxisMT:Reset()
+            self.Enabled          = false
+            self.Scale            = ImPlotScale.Linear
+            self.TransformForward = nil
+            self.TransformInverse = nil
+            self.TransformData    = nil
+            self.Label            = nil
+            self.HasFormatSpec    = false
+            self.Formatter        = nil
+            self.FormatterData    = nil
+            self.Locator          = nil
+            self.ShowDefaultTicks = true
+            self.FitThisFrame     = false
+            self.FitExtents.Min   = HUGE_VAL
+            self.FitExtents.Max   = -HUGE_VAL
+            self.OrthoAxis        = nil
+            self.ConstraintRange.Min, self.ConstraintRange.Max = -HUGE_VAL, HUGE_VAL
+            self.ConstraintZoom.Min, self.ConstraintZoom.Max = DBL_MIN, HUGE_VAL
+            self.Ticker:Reset()
+        end
+
+        function AxisMT:SetMin(_min, force)
+            if not force and self:IsLockedMin() then
+                return false
+            end
+            _min = ImConstrainNan(ImConstrainInf(_min))
+            if _min < self.ConstraintRange.Min then
+                _min = self.ConstraintRange.Min
+            end
+            local z = self.Range.Max - _min
+            if z < self.ConstraintZoom.Min then
+                _min = self.Range.Max - self.ConstraintZoom.Min
+            end
+            if z > self.ConstraintZoom.Max then
+                _min = self.Range.Max - self.ConstraintZoom.Max
+            end
+            if _min >= self.Range.Max then
+                return false
+            end
+            self.Range.Min = _min
+            -- [Port] TODO: PickerTimeMin
+            self:UpdateTransformCache()
+            return true
+        end
+
+        function AxisMT:SetMax(_max, force)
+            if not force and self:IsLockedMax() then
+                return false
+            end
+            _max = ImConstrainNan(ImConstrainInf(_max))
+            if _max > self.ConstraintRange.Max then
+                _max = self.ConstraintRange.Max
+            end
+            local z = _max - self.Range.Min
+            if z < self.ConstraintZoom.Min then
+                _max = self.Range.Min + self.ConstraintZoom.Min
+            end
+            if z > self.ConstraintZoom.Max then
+                _max = self.Range.Min + self.ConstraintZoom.Max
+            end
+            if _max <= self.Range.Min then
+                return false
+            end
+            self.Range.Max = _max
+            -- [Port] TODO: PickerTimeMax
+            self:UpdateTransformCache()
+            return true
+        end
+
+        -- [Port] SetRange(v1, v2) and SetRange(const ImPlotRange&) overloads
+        function AxisMT:SetRange(v1, v2)
+            if type(v1) == "table" then v1, v2 = v1.Min, v1.Max end
+            self.Range.Min = math.min(v1, v2)
+            self.Range.Max = math.max(v1, v2)
+            self:Constrain()
+            -- [Port] TODO: PickerTimeMin/PickerTimeMax
+            self:UpdateTransformCache()
+        end
+
+        function AxisMT:SetAspect(unit_per_pix)
+            local new_size = unit_per_pix * self:PixelSize()
+            local delta    = (new_size - self.Range:Size()) * 0.5
+            if self:IsLocked() then
+                return
+            elseif self:IsLockedMin() and not self:IsLockedMax() then
+                self:SetRange(self.Range.Min, self.Range.Max + 2 * delta)
+            elseif not self:IsLockedMin() and self:IsLockedMax() then
+                self:SetRange(self.Range.Min - 2 * delta, self.Range.Max)
+            else
+                self:SetRange(self.Range.Min - delta, self.Range.Max + delta)
+            end
+        end
+
+        function AxisMT:PixelSize() return math.abs(self.PixelMax - self.PixelMin) end
+
+        function AxisMT:GetAspect() return self.Range:Size() / self:PixelSize() end
+
+        function AxisMT:Constrain()
+            local r = self.Range
+            r.Min = ImConstrainNan(ImConstrainInf(r.Min))
+            r.Max = ImConstrainNan(ImConstrainInf(r.Max))
+            if r.Min < self.ConstraintRange.Min then
+                r.Min = self.ConstraintRange.Min
+            end
+            if r.Max > self.ConstraintRange.Max then
+                r.Max = self.ConstraintRange.Max
+            end
+            local z = r.Max - r.Min
+            if z < self.ConstraintZoom.Min then
+                local delta = (self.ConstraintZoom.Min - z) * 0.5
+                r.Min -= delta
+                r.Max += delta
+            end
+            if z > self.ConstraintZoom.Max then
+                local delta = (z - self.ConstraintZoom.Max) * 0.5
+                r.Min += delta
+                r.Max -= delta
+            end
+            if r.Max <= r.Min then
+                r.Max = r.Min + DBL_EPSILON
+            end
+        end
+
+        function AxisMT:UpdateTransformCache()
+            self.ScaleToPixel = (self.PixelMax - self.PixelMin) / (self.Range.Max - self.Range.Min)
+            if self.TransformForward ~= nil then
+                self.ScaleMin = self.TransformForward(self.Range.Min, self.TransformData)
+                self.ScaleMax = self.TransformForward(self.Range.Max, self.TransformData)
+            else
+                self.ScaleMin = self.Range.Min
+                self.ScaleMax = self.Range.Max
+            end
+        end
+
+        function AxisMT:PlotToPixels(plt)
+            if self.TransformForward ~= nil then
+                local s = self.TransformForward(plt, self.TransformData)
+                local t = (s - self.ScaleMin) / (self.ScaleMax - self.ScaleMin)
+                plt     = self.Range.Min + (self.Range.Max - self.Range.Min) * t
+            end
+            return self.PixelMin + self.ScaleToPixel * (plt - self.Range.Min)
+        end
+
+        function AxisMT:PixelsToPlot(pix)
+            local plt = (pix - self.PixelMin) / self.ScaleToPixel + self.Range.Min
+            if self.TransformInverse ~= nil then
+                local t = (plt - self.Range.Min) / (self.Range.Max - self.Range.Min)
+                local s = t * (self.ScaleMax - self.ScaleMin) + self.ScaleMin
+                plt = self.TransformInverse(s, self.TransformData)
+            end
+            return plt
+        end
+
+        function AxisMT:ExtendFit(v)
+            if not ImNanOrInf(v) and v >= self.ConstraintRange.Min and v <= self.ConstraintRange.Max then
+                if v < self.FitExtents.Min then self.FitExtents.Min = v end
+                if v > self.FitExtents.Max then self.FitExtents.Max = v end
+            end
+        end
+
+        function AxisMT:ExtendFitWith(alt, v, v_alt)
+            if ImHasFlag(self.Flags, ImPlotAxisFlags.RangeFit) and not alt.Range:Contains(v_alt) then
+                return
+            end
+            self:ExtendFit(v)
+        end
+
+        function AxisMT:ApplyFit(padding)
+            local ext_size = (self.FitExtents.Max - self.FitExtents.Min) * 0.5
+            self.FitExtents.Min -= ext_size * padding
+            self.FitExtents.Max += ext_size * padding
+            if not self:IsLockedMin() and not ImNanOrInf(self.FitExtents.Min) then
+                self.Range.Min = self.FitExtents.Min
+            end
+            if not self:IsLockedMax() and not ImNanOrInf(self.FitExtents.Max) then
+                self.Range.Max = self.FitExtents.Max
+            end
+            if ImAlmostEqual(self.Range.Min, self.Range.Max) then
+                self.Range.Max += 0.5
+                self.Range.Min -= 0.5
+            end
+            self:Constrain()
+            self:UpdateTransformCache()
+        end
+
+        function AxisMT:HasLabel()         return self.Label ~= nil and not ImHasFlag(self.Flags, ImPlotAxisFlags.NoLabel) end
+        function AxisMT:HasGridLines()     return not ImHasFlag(self.Flags, ImPlotAxisFlags.NoGridLines) end
+        function AxisMT:HasTickLabels()    return not ImHasFlag(self.Flags, ImPlotAxisFlags.NoTickLabels) end
+        function AxisMT:HasTickMarks()     return not ImHasFlag(self.Flags, ImPlotAxisFlags.NoTickMarks) end
+        function AxisMT:WillRender()       return self.Enabled and (self:HasGridLines() or self:HasTickLabels() or self:HasTickMarks()) end
+        function AxisMT:IsOpposite()       return ImHasFlag(self.Flags, ImPlotAxisFlags.Opposite) end
+        function AxisMT:IsInverted()       return ImHasFlag(self.Flags, ImPlotAxisFlags.Invert) end
+        function AxisMT:IsForeground()     return ImHasFlag(self.Flags, ImPlotAxisFlags.Foreground) end
+        function AxisMT:IsAutoFitting()    return ImHasFlag(self.Flags, ImPlotAxisFlags.AutoFit) end
+        function AxisMT:CanInitFit()       return not ImHasFlag(self.Flags, ImPlotAxisFlags.NoInitialFit) and not self.HasRange and self.LinkedMin == nil and self.LinkedMax == nil end
+        function AxisMT:IsRangeLocked()    return self.HasRange and self.RangeCond == ImPlotCond.Always end
+        function AxisMT:IsLockedMin()      return not self.Enabled or self:IsRangeLocked() or ImHasFlag(self.Flags, ImPlotAxisFlags.LockMin) end
+        function AxisMT:IsLockedMax()      return not self.Enabled or self:IsRangeLocked() or ImHasFlag(self.Flags, ImPlotAxisFlags.LockMax) end
+        function AxisMT:IsLocked()         return self:IsLockedMin() and self:IsLockedMax() end
+        function AxisMT:IsInputLockedMin() return self:IsLockedMin() or self:IsAutoFitting() end
+        function AxisMT:IsInputLockedMax() return self:IsLockedMax() or self:IsAutoFitting() end
+        function AxisMT:IsInputLocked()    return self:IsLocked() or self:IsAutoFitting() end
+        function AxisMT:HasMenus()         return not ImHasFlag(self.Flags, ImPlotAxisFlags.NoMenus) end
+
+        -- [Port] TODO: IsPanLocked, PushLinks/PullLinks (input / linked axes milestones)
+
+        -- Holds Plot state information that must persist after EndPlot
+        -- [Port] Axes is indexed by 0-based ImAxis values; Title/axis labels are stored as strings (no TextBuffer).
+        local PlotMT = {}
+        PlotMT.__index = PlotMT
+        function internal.ImPlotPlot()
+            local p = setmetatable({}, PlotMT)
+            p.ID                = 0
+            p.Flags             = ImPlot.ImPlotFlags.None
+            p.PreviousFlags     = ImPlot.ImPlotFlags.None
+            p.MouseTextLocation = bit32.bor(ImPlot.ImPlotLocation.South, ImPlot.ImPlotLocation.East)
+            p.MouseTextFlags    = ImPlot.ImPlotMouseTextFlags.None
+            p.Axes = {}
+            for i = 0, ImAxis.COUNT - 1 do
+                p.Axes[i] = internal.ImPlotAxis()
+                p.Axes[i].Vertical = i >= ImAxis.Y1
+            end
+            -- [Port] TODO: ImPlotItemGroup (items/legend milestone); only the ID is needed for now
+            p.Items             = { ID = 0 }
+            p.CurrentX          = ImAxis.X1
+            p.CurrentY          = ImAxis.Y1
+            p.FrameRect         = G.ImRect()
+            p.CanvasRect        = G.ImRect()
+            p.PlotRect          = G.ImRect()
+            p.AxesRect          = G.ImRect()
+            p.SelectRect        = G.ImRect()
+            p.SelectStart       = ImVec2(0, 0)
+            p.Title             = nil
+            p.JustCreated       = true
+            p.Initialized       = false
+            p.SetupLocked       = false
+            p.FitThisFrame      = false
+            p.Hovered           = false
+            p.Held              = false
+            p.Selecting         = false
+            p.Selected          = false
+            p.ContextLocked     = false
+            return p
+        end
+
+        function PlotMT:IsInputLocked()
+            for i = 0, ImAxis.COUNT - 1 do
+                if not self.Axes[i]:IsInputLocked() then
+                    return false
+                end
+            end
+            return true
+        end
+        function PlotMT:ClearTextBuffer() end -- [Port] no shared text buffer
+        function PlotMT:SetTitle(title)
+            if title and ImGui.FindRenderedTextEnd(title) ~= 1 then
+                self.Title = title
+            else
+                self.Title = nil
+            end
+        end
+        function PlotMT:HasTitle() return self.Title ~= nil and not ImHasFlag(self.Flags, ImPlot.ImPlotFlags.NoTitle) end
+        function PlotMT:GetTitle() return self.Title end
+        function PlotMT:XAxis(i) return self.Axes[ImAxis.X1 + i] end
+        function PlotMT:YAxis(i) return self.Axes[ImAxis.Y1 + i] end
+        function PlotMT:EnabledAxesX()
+            local cnt = 0
+            for i = 0, internal.IMPLOT_NUM_X_AXES - 1 do
+                if self:XAxis(i).Enabled then cnt += 1 end
+            end
+            return cnt
+        end
+        function PlotMT:EnabledAxesY()
+            local cnt = 0
+            for i = 0, internal.IMPLOT_NUM_Y_AXES - 1 do
+                if self:YAxis(i).Enabled then cnt += 1 end
+            end
+            return cnt
+        end
+        function PlotMT:SetAxisLabel(axis, label)
+            if label and ImGui.FindRenderedTextEnd(label) ~= 1 then
+                axis.Label = label
+            else
+                axis.Label = nil
+            end
+        end
+        function PlotMT:GetAxisLabel(axis) return axis.Label end
+    end
+
+    --------------------------------------------------------------------------
+    -- [SECTION] Formatters, Locators
+    --------------------------------------------------------------------------
+    do
+        -- [Port] formatters return the label string instead of writing to a char buffer
+        function internal.Formatter_Default(value, data)
+            return string.format(data, value)
+        end
+
+        function internal.NiceNum(x, round)
+            local nf
+            local expv = math.floor(math.log10(x))
+            local f = x / 10 ^ expv
+            if round then
+                if f < 1.5 then
+                    nf = 1
+                elseif f < 3 then
+                    nf = 2
+                elseif f < 7 then
+                    nf = 5
+                else
+                    nf = 10
+                end
+            elseif f <= 1 then
+                nf = 1
+            elseif f <= 2 then
+                nf = 2
+            elseif f <= 5 then
+                nf = 5
+            else
+                nf = 10
+            end
+            return nf * 10 ^ expv
+        end
+        local NiceNum = internal.NiceNum
+
+        local TICK_FILL_X = 0.8
+        local TICK_FILL_Y = 1.0
+
+        function internal.Locator_Default(ticker, range, pixels, vertical, formatter, formatter_data)
+            if range.Min == range.Max then
+                return
+            end
+            local nMinor        = 10
+            local nMajor        = math.max(2, math.floor(pixels / ((vertical and 300.0) or 400.0) + 0.5))
+            local nice_range    = NiceNum((range.Max - range.Min) * 0.99, false)
+            local interval      = NiceNum(nice_range / (nMajor - 1), true)
+            local graphmin      = math.floor(range.Min / interval) * interval
+            local graphmax      = math.ceil(range.Max / interval) * interval
+            local first_major_set = false
+            local first_major_idx = 0
+            local idx0 = ticker:TickCount() -- ticker may have user custom ticks
+            local total_x, total_y = 0, 0
+            local major = graphmin
+            while major < graphmax + 0.5 * interval do
+                -- is this zero? combat zero formatting issues
+                if major - interval < 0 and major + interval > 0 then
+                    major = 0
+                end
+                if range:Contains(major) then
+                    if not first_major_set then
+                        first_major_idx = ticker:TickCount()
+                        first_major_set = true
+                    end
+                    local ls = ticker:AddTick(major, true, 0, true, formatter, formatter_data).LabelSize
+                    total_x += ls.x; total_y += ls.y
+                end
+                for i = 1, nMinor - 1 do
+                    local minor = major + i * interval / nMinor
+                    if range:Contains(minor) then
+                        local ls = ticker:AddTick(minor, false, 0, true, formatter, formatter_data).LabelSize
+                        total_x += ls.x; total_y += ls.y
+                    end
+                end
+                major += interval
+            end
+            -- prune if necessary
+            if (not vertical and total_x > pixels * TICK_FILL_X) or (vertical and total_y > pixels * TICK_FILL_Y) then
+                local ticks = ticker.Ticks
+                for i = first_major_idx - 1, idx0, -2 do
+                    ticks[i + 1].ShowLabel = false
+                end
+                for i = first_major_idx + 1, ticker:TickCount() - 1, 2 do
+                    ticks[i + 1].ShowLabel = false
+                end
+            end
+        end
+        -- [Port] TODO: Locator_Time, Locator_Log10, Locator_SymLog (log/time scale milestone)
+    end
+
+    --------------------------------------------------------------------------
+    -- [SECTION] Plot Utils, Rendering helpers, Setup, BeginPlot, EndPlot
+    --------------------------------------------------------------------------
+    do
+        local ImAxis = ImPlot.ImAxis
+        local ImPlotFlags = ImPlot.ImPlotFlags
+        local ImPlotAxisFlags = ImPlot.ImPlotAxisFlags
+        local ImPlotCond = ImPlot.ImPlotCond
+        local ImPlotScale = ImPlot.ImPlotScale
+        local IMPLOT_AUTO = ImPlot.IMPLOT_AUTO
+        local IMPLOT_NUM_X_AXES = internal.IMPLOT_NUM_X_AXES
+        local IMPLOT_NUM_Y_AXES = internal.IMPLOT_NUM_Y_AXES
+        local ImHasFlag = internal.ImHasFlag
+        local GetStyleColorU32 = internal.GetStyleColorU32
+        local GetStyleColorVec4 = internal.GetStyleColorVec4
+        local IM_COL32_BLACK_TRANS = G.IM_COL32_BLACK_TRANS
+        local ImRect = G.ImRect
+
+        -- [Port] scratch vector reused for text positions (AddText copies the position)
+        local tmp_pos = ImVec2(0, 0)
+        local function SetTmp(x, y) tmp_pos.x = x; tmp_pos.y = y; return tmp_pos end
+
+        local function AddLineH(draw_list, x1, x2, y, col, thickness)
+            draw_list:AddLineH(x1, x2, y, col, thickness or 1.0)
+        end
+        local function AddLineV(draw_list, x, y1, y2, col, thickness)
+            draw_list:AddLineV(x, y1, y2, col, thickness or 1.0)
+        end
+        internal.AddLineH = AddLineH
+        internal.AddLineV = AddLineV
+
+        -- Calculates the size of vertical text
+        function internal.CalcTextSizeVertical(text)
+            local sz = ImGui.CalcTextSize(text)
+            return ImVec2(sz.y, sz.x)
+        end
+
+        -- Draws vertical text. The position is the bottom left of the text rect.
+        function internal.AddTextVertical(DrawList, pos, col, text)
+            -- the code below is based loosely on ImFont::RenderText
+            local g = ImGui.GetCurrentContext()
+            local font = g.Font:GetFontBaked(g.FontSize)
+            local scale = g.FontSize / font.Size
+            -- Align to be pixel perfect
+            local x = math.floor(pos.x)
+            local y = math.floor(pos.y)
+            -- [Port] PrimReserve/PrimUnreserve replaced by a reserve per glyph
+            for _, c in utf8.codes(text) do
+                local glyph = font:FindGlyph(c)
+                if glyph ~= nil then
+                    DrawList:PrimReserve(6, 4)
+                    DrawList:PrimQuadUV(ImVec2(x + glyph.Y0 * scale, y - glyph.X0 * scale), ImVec2(x + glyph.Y0 * scale, y - glyph.X1 * scale),
+                                        ImVec2(x + glyph.Y1 * scale, y - glyph.X1 * scale), ImVec2(x + glyph.Y1 * scale, y - glyph.X0 * scale),
+                                        ImVec2(glyph.U0, glyph.V0), ImVec2(glyph.U1, glyph.V0),
+                                        ImVec2(glyph.U1, glyph.V1), ImVec2(glyph.U0, glyph.V1),
+                                        col)
+                    y -= glyph.AdvanceX * scale
+                end
+            end
+        end
+
+        -- Draws multiline horizontal text centered.
+        function internal.AddTextCentered(DrawList, top_center, col, text)
+            local txt_ht = ImGui.GetTextLineHeight()
+            local title_end = ImGui.FindRenderedTextEnd(text)
+            local text_begin = 1
+            local y = 0
+            while true do
+                local tmp = string.find(text, "\n", text_begin, true)
+                if tmp == nil or tmp >= title_end then
+                    break
+                end
+                local text_size = ImGui.CalcTextSizeEx(text, text_begin, tmp, true)
+                DrawList:AddText(nil, 0.0, SetTmp(top_center.x - text_size.x * 0.5, top_center.y + y), col, text, text_begin, tmp)
+                text_begin = tmp + 1
+                y += txt_ht
+            end
+            local text_size = ImGui.CalcTextSizeEx(text, text_begin, title_end, true)
+            DrawList:AddText(nil, 0.0, SetTmp(top_center.x - text_size.x * 0.5, top_center.y + y), col, text, text_begin, title_end)
+        end
+
+        function internal.ResetCtxForNextPlot(ctx)
+            -- [Port] TODO: NextPlotData/NextItemData/Annotations/Tags/digital counters (later milestones)
+            ctx.OpenContextThisFrame = false
+            -- nullify plot
+            ctx.CurrentPlot  = nil
+            ctx.CurrentItem  = nil
+            ctx.PreviousItem = nil
+        end
+
+        function internal.GetPlot(title)
+            local Window = ImGui.GetCurrentWindow()
+            return GImPlot.Plots:GetByKey(Window:GetID(title))
+        end
+
+        function internal.GetCurrentPlot()
+            return GImPlot.CurrentPlot
+        end
+
+        function internal.BustPlotCache()
+            GImPlot.Plots:Clear()
+        end
+
+        function internal.UpdateAxisColors(axis)
+            local col_grid = GetStyleColorVec4(ImPlotCol.AxisGrid)
+            axis.ColorMaj  = ImGui.GetColorU32(col_grid)
+            axis.ColorMin  = ImGui.GetColorU32(ImVec4(col_grid.x, col_grid.y, col_grid.z, col_grid.w * GImPlot.Style.MinorAlpha))
+            axis.ColorTick = GetStyleColorU32(ImPlotCol.AxisTick)
+            axis.ColorTxt  = GetStyleColorU32(ImPlotCol.AxisText)
+            axis.ColorBg   = GetStyleColorU32(ImPlotCol.AxisBg)
+            axis.ColorHov  = GetStyleColorU32(ImPlotCol.AxisBgHovered)
+            axis.ColorAct  = GetStyleColorU32(ImPlotCol.AxisBgActive)
+            -- axis.ColorHiLi = IM_COL32_BLACK_TRANS
+        end
+        local UpdateAxisColors = internal.UpdateAxisColors
+
+        -- [Port] pad_a/pad_b are returned instead of passed by reference
+        function internal.PadAndDatumAxesX(plot, pad_T, pad_B, align)
+            local gp = GImPlot
+            local T = ImGui.GetTextLineHeight()
+            local P = gp.Style.LabelPadding.y
+            local K = gp.Style.MinorTickLen.x
+
+            local count_T = 0
+            local count_B = 0
+            local last_T  = plot.AxesRect.Min.y
+            local last_B  = plot.AxesRect.Max.y
+
+            for i = IMPLOT_NUM_X_AXES - 1, 0, -1 do -- FYI: can iterate forward
+                local axis = plot:XAxis(i)
+                if axis.Enabled then
+                    local label = axis:HasLabel()
+                    local ticks = axis:HasTickLabels()
+                    local opp   = axis:IsOpposite()
+                    local time  = axis.Scale == ImPlotScale.Time
+                    local time_pad = 0
+                    if time then time_pad = T + P end
+                    if opp then
+                        if count_T > 0 then
+                            pad_T += K + P
+                        end
+                        count_T += 1
+                        if label then
+                            pad_T += ImGui.CalcTextSize(plot:GetAxisLabel(axis)).y + P
+                        end
+                        if ticks then
+                            pad_T += math.max(T, axis.Ticker.MaxSize.y) + P + time_pad
+                        end
+                        axis.Datum1 = plot.CanvasRect.Min.y + pad_T
+                        axis.Datum2 = last_T
+                        last_T = axis.Datum1
+                    else
+                        if count_B > 0 then
+                            pad_B += K + P
+                        end
+                        count_B += 1
+                        if label then
+                            pad_B += ImGui.CalcTextSize(plot:GetAxisLabel(axis)).y + P
+                        end
+                        if ticks then
+                            pad_B += math.max(T, axis.Ticker.MaxSize.y) + P + time_pad
+                        end
+                        axis.Datum1 = plot.CanvasRect.Max.y - pad_B
+                        axis.Datum2 = last_B
+                        last_B = axis.Datum1
+                    end
+                end
+            end
+
+            if align then
+                -- [Port] TODO: ImPlotAlignmentData (aligned plots milestone)
+            end
+            return pad_T, pad_B
+        end
+
+        -- [Port] pad_L/pad_R are returned instead of passed by reference
+        function internal.PadAndDatumAxesY(plot, pad_L, pad_R, align)
+            --   [   pad_L   ]                 [   pad_R   ]
+            --   .................CanvasRect................
+            --   :TPWPK.PTPWP _____PlotRect____ PWPTP.KPWPT:
+            --   :A # |- A # |-               -| # A -| # A:
+            --   :X   |  X   |                 |   X  |   x:
+            --   :I # |- I # |-               -| # I -| # I:
+            --   :S   |  S   |                 |   S  |   S:
+            --   :3 # |- 0 # |-_______________-| # 1 -| # 2:
+            --   :.........................................:
+            --
+            --   T = text height
+            --   P = label padding
+            --   K = minor tick length
+            --   W = label width
+            local gp = GImPlot
+            local T = ImGui.GetTextLineHeight()
+            local P = gp.Style.LabelPadding.x
+            local K = gp.Style.MinorTickLen.y
+
+            local count_L = 0
+            local count_R = 0
+            local last_L  = plot.AxesRect.Min.x
+            local last_R  = plot.AxesRect.Max.x
+
+            for i = IMPLOT_NUM_Y_AXES - 1, 0, -1 do -- FYI: can iterate forward
+                local axis = plot:YAxis(i)
+                if axis.Enabled then
+                    local label = axis:HasLabel()
+                    local ticks = axis:HasTickLabels()
+                    local opp   = axis:IsOpposite()
+                    if opp then
+                        if count_R > 0 then
+                            pad_R += K + P
+                        end
+                        count_R += 1
+                        if label then
+                            pad_R += T + P
+                        end
+                        if ticks then
+                            pad_R += axis.Ticker.MaxSize.x + P
+                        end
+                        axis.Datum1 = plot.CanvasRect.Max.x - pad_R
+                        axis.Datum2 = last_R
+                        last_R = axis.Datum1
+                    else
+                        if count_L > 0 then
+                            pad_L += K + P
+                        end
+                        count_L += 1
+                        if label then
+                            pad_L += T + P
+                        end
+                        if ticks then
+                            pad_L += axis.Ticker.MaxSize.x + P
+                        end
+                        axis.Datum1 = plot.CanvasRect.Min.x + pad_L
+                        axis.Datum2 = last_L
+                        last_L = axis.Datum1
+                    end
+                end
+            end
+
+            plot.PlotRect.Min.x = plot.CanvasRect.Min.x + pad_L
+            plot.PlotRect.Max.x = plot.CanvasRect.Max.x - pad_R
+
+            if align then
+                -- [Port] TODO: ImPlotAlignmentData (aligned plots milestone)
+            end
+            return pad_L, pad_R
+        end
+
+        local function ColMinWithDensity(col_min, density)
+            local col_min4 = ImGui.ColorConvertU32ToFloat4(col_min)
+            local t = 1.0 + (density - 0.1) * (0.0 - 1.0) / (0.2 - 0.1) -- ImRemap(density, 0.1f, 0.2f, 1.0f, 0.0f)
+            col_min4.w *= math.clamp(t, 0.0, 1.0)
+            return ImGui.ColorConvertFloat4ToU32(col_min4)
+        end
+
+        function internal.RenderGridLinesX(DrawList, ticker, rect, col_maj, col_min, size_maj, size_min)
+            local density = ticker:TickCount() / rect:GetWidth()
+            col_min = ColMinWithDensity(col_min, density)
+            local ticks = ticker.Ticks
+            for t = 1, ticker:TickCount() do
+                local xt = ticks[t]
+                if not (xt.PixelPos < rect.Min.x or xt.PixelPos > rect.Max.x) and xt.Level == 0 then
+                    if xt.Major then
+                        AddLineV(DrawList, xt.PixelPos, rect.Min.y, rect.Max.y, col_maj, size_maj)
+                    elseif density < 0.2 then
+                        AddLineV(DrawList, xt.PixelPos, rect.Min.y, rect.Max.y, col_min, size_min)
+                    end
+                end
+            end
+        end
+
+        function internal.RenderGridLinesY(DrawList, ticker, rect, col_maj, col_min, size_maj, size_min)
+            local density = ticker:TickCount() / rect:GetHeight()
+            col_min = ColMinWithDensity(col_min, density)
+            local ticks = ticker.Ticks
+            for t = 1, ticker:TickCount() do
+                local yt = ticks[t]
+                if not (yt.PixelPos < rect.Min.y or yt.PixelPos > rect.Max.y) then
+                    if yt.Major then
+                        AddLineH(DrawList, rect.Min.x, rect.Max.x, yt.PixelPos, col_maj, size_maj)
+                    elseif density < 0.2 then
+                        AddLineH(DrawList, rect.Min.x, rect.Max.x, yt.PixelPos, col_min, size_min)
+                    end
+                end
+            end
+        end
+        local RenderGridLinesX = internal.RenderGridLinesX
+        local RenderGridLinesY = internal.RenderGridLinesY
+
+        local plot_button_flags = bit32.bor(G.ImGuiButtonFlags.AllowOverlap, G.ImGuiButtonFlags.PressedOnClick, G.ImGuiButtonFlags.PressedOnDoubleClick,
+                                            G.ImGuiButtonFlags.MouseButtonLeft, G.ImGuiButtonFlags.MouseButtonRight, G.ImGuiButtonFlags.MouseButtonMiddle)
+
+        function internal.UpdateInput(plot)
+            -- BUTTON STATE -----------------------------------------------------------
+            local _, hovered, held = ImGui.ButtonBehavior(plot.PlotRect, plot.ID, plot_button_flags)
+            plot.Hovered = hovered
+            plot.Held = held
+            -- [Port] TODO: axis buttons, fit on double click, panning, zooming, box selection, context menus (input milestone)
+            return false
+        end
+
+        -----------------------------------------------------------------------
+        -- Setup
+        -----------------------------------------------------------------------
+
+        local function CheckSetup()
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil and not GImPlot.CurrentPlot.SetupLocked,
+                      "Setup needs to be called after BeginPlot and before any setup locking functions (e.g. PlotX)!")
+        end
+
+        function ImPlot.SetupAxis(idx, label, flags)
+            if flags == nil then flags = ImPlotAxisFlags.None end
+            CheckSetup()
+            -- get plot and axis
+            local plot = GImPlot.CurrentPlot
+            local axis = plot.Axes[idx]
+            -- set ID
+            axis.ID = plot.ID + idx + 1
+            -- check and set flags
+            if plot.JustCreated or flags ~= axis.PreviousFlags then
+                axis.Flags = flags
+            end
+            axis.PreviousFlags = flags
+            -- enable axis
+            axis.Enabled = true
+            -- set label
+            plot:SetAxisLabel(axis, label)
+            -- cache colors
+            UpdateAxisColors(axis)
+        end
+
+        function ImPlot.SetupAxisLimits(idx, min_lim, max_lim, cond)
+            if cond == nil then cond = ImPlotCond.Once end
+            CheckSetup()
+            local plot = GImPlot.CurrentPlot
+            local axis = plot.Axes[idx]
+            IM_ASSERT(axis.Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            if not plot.Initialized or cond == ImPlotCond.Always then
+                axis:SetRange(min_lim, max_lim)
+            end
+            axis.HasRange  = true
+            axis.RangeCond = cond
+        end
+
+        -- [Port] only the format-string overload; TODO: SetupAxisFormat(idx, formatter, data)
+        function ImPlot.SetupAxisFormat(idx, fmt)
+            CheckSetup()
+            local plot = GImPlot.CurrentPlot
+            local axis = plot.Axes[idx]
+            IM_ASSERT(axis.Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            axis.HasFormatSpec = fmt ~= nil
+            if fmt ~= nil then
+                axis.FormatSpec = fmt
+            end
+        end
+
+        -- [Port] TODO: SetupAxisLinks, SetupAxisTicks, SetupAxisScale, SetupAxisLimitsConstraints, SetupAxisZoomConstraints, SetupLegend, SetupMouseText
+
+        function ImPlot.SetupAxes(x_label, y_label, x_flags, y_flags)
+            ImPlot.SetupAxis(ImAxis.X1, x_label, x_flags)
+            ImPlot.SetupAxis(ImAxis.Y1, y_label, y_flags)
+        end
+
+        function ImPlot.SetupAxesLimits(x_min, x_max, y_min, y_max, cond)
+            ImPlot.SetupAxisLimits(ImAxis.X1, x_min, x_max, cond)
+            ImPlot.SetupAxisLimits(ImAxis.Y1, y_min, y_max, cond)
+        end
+
+        -----------------------------------------------------------------------
+        -- BeginPlot
+        -----------------------------------------------------------------------
+
+        function ImPlot.BeginPlot(title_id, size, flags)
+            if size == nil then size = ImVec2(-1, 0) end
+            if flags == nil then flags = ImPlotFlags.None end
+            IM_ASSERT(GImPlot ~= nil, "No current context. Did you call ImPlot::CreateContext() or ImPlot::SetCurrentContext()?")
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot == nil, "Mismatched BeginPlot()/EndPlot()!")
+
+            -- FRONT MATTER -----------------------------------------------------------
+            -- [Port] TODO: subplots (PushID(CurrentSubplot.CurrentIdx))
+
+            -- get globals
+            local Window = ImGui.GetCurrentWindow()
+
+            -- skip if needed
+            if Window.SkipItems then
+                internal.ResetCtxForNextPlot(gp)
+                return false
+            end
+
+            -- ID and age (TODO: keep track of plot age in frames)
+            local ID           = Window:GetID(title_id)
+            local just_created = gp.Plots:GetByKey(ID) == nil
+            gp.CurrentPlot     = gp.Plots:GetOrAddByKey(ID)
+
+            local plot         = gp.CurrentPlot
+            plot.ID            = ID
+            plot.Items.ID      = ID - 1
+            plot.JustCreated   = just_created
+            plot.SetupLocked   = false
+
+            -- check flags
+            if plot.JustCreated then
+                plot.Flags = flags
+            elseif flags ~= plot.PreviousFlags then
+                plot.Flags = flags
+            end
+            plot.PreviousFlags = flags
+
+            -- setup default axes
+            if plot.JustCreated then
+                ImPlot.SetupAxis(ImAxis.X1)
+                ImPlot.SetupAxis(ImAxis.Y1)
+            end
+
+            -- reset axes
+            for i = 0, ImAxis.COUNT - 1 do
+                plot.Axes[i]:Reset()
+                UpdateAxisColors(plot.Axes[i])
+            end
+            -- ensure first axes enabled
+            plot.Axes[ImAxis.X1].Enabled = true
+            plot.Axes[ImAxis.Y1].Enabled = true
+            -- set initial axes
+            plot.CurrentX = ImAxis.X1
+            plot.CurrentY = ImAxis.Y1
+
+            -- process next plot data (legacy)
+            -- [Port] TODO: ApplyNextPlotData (SetNextAxis* milestone)
+
+            -- clear text buffers
+            plot:ClearTextBuffer()
+            plot:SetTitle(title_id)
+
+            -- set frame size
+            local frame_size = ImGui.CalcItemSize(size, gp.Style.PlotDefaultSize.x, gp.Style.PlotDefaultSize.y)
+
+            if frame_size.x < gp.Style.PlotMinSize.x and size.x < 0.0 then
+                frame_size.x = gp.Style.PlotMinSize.x
+            end
+            if frame_size.y < gp.Style.PlotMinSize.y and size.y < 0.0 then
+                frame_size.y = gp.Style.PlotMinSize.y
+            end
+
+            local cp = Window.DC.CursorPos
+            local fr = plot.FrameRect
+            fr.Min.x, fr.Min.y = cp.x, cp.y
+            fr.Max.x, fr.Max.y = cp.x + frame_size.x, cp.y + frame_size.y
+            ImGui.ItemSize(fr)
+            if not ImGui.ItemAdd(fr, plot.ID, fr) then
+                internal.ResetCtxForNextPlot(gp)
+                return false
+            end
+
+            -- setup items (or dont)
+            if gp.CurrentItems == nil then
+                gp.CurrentItems = plot.Items
+            end
+
+            return true
+        end
+
+        -----------------------------------------------------------------------
+        -- SetupFinish
+        -----------------------------------------------------------------------
+
+        local function SetRect(r, x1, y1, x2, y2)
+            r.Min.x, r.Min.y, r.Max.x, r.Max.y = x1, y1, x2, y2
+        end
+
+        -- render x/y axis button, label, tick labels
+        local function RenderAxisBg(DrawList, plot, ax)
+            if (ax.Hovered or ax.Held) and not plot.Held and not ImHasFlag(ax.Flags, ImPlotAxisFlags.NoHighlight) then
+                DrawList:AddRectFilled(ax.HoverRect.Min, ax.HoverRect.Max, (ax.Held and ax.ColorAct) or ax.ColorHov)
+            elseif ax.ColorHiLi ~= IM_COL32_BLACK_TRANS then
+                DrawList:AddRectFilled(ax.HoverRect.Min, ax.HoverRect.Max, ax.ColorHiLi)
+                ax.ColorHiLi = IM_COL32_BLACK_TRANS
+            elseif ax.ColorBg ~= IM_COL32_BLACK_TRANS then
+                DrawList:AddRectFilled(ax.HoverRect.Min, ax.HoverRect.Max, ax.ColorBg)
+            end
+        end
+
+        function ImPlot.SetupFinish()
+            IM_ASSERT(GImPlot ~= nil, "No current context. Did you call ImPlot::CreateContext() or ImPlot::SetCurrentContext()?")
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil, "SetupFinish needs to be called after BeginPlot!")
+
+            local g        = ImGui.GetCurrentContext()
+            local DrawList = g.CurrentWindow.DrawList
+            local Style    = g.Style
+            local gs       = gp.Style
+
+            local plot = gp.CurrentPlot
+
+            -- lock setup
+            plot.SetupLocked = true
+
+            -- finalize axes and set default formatter/locator
+            for i = 0, ImAxis.COUNT - 1 do
+                local axis = plot.Axes[i]
+                if axis.Enabled then
+                    axis:Constrain()
+                    if not plot.Initialized and axis:CanInitFit() then
+                        plot.FitThisFrame = true
+                        axis.FitThisFrame = true
+                    end
+                end
+                if axis.Formatter == nil then
+                    axis.Formatter = internal.Formatter_Default
+                    if axis.HasFormatSpec then
+                        axis.FormatterData = axis.FormatSpec
+                    else
+                        axis.FormatterData = internal.IMPLOT_LABEL_FORMAT
+                    end
+                end
+                if axis.Locator == nil then
+                    axis.Locator = internal.Locator_Default
+                end
+            end
+
+            -- setup nullptr orthogonal axes
+            local axis_equal = ImHasFlag(plot.Flags, ImPlotFlags.Equal)
+            for k = 0, IMPLOT_NUM_X_AXES - 1 do
+                local x_axis = plot.Axes[ImAxis.X1 + k]
+                local y_axis = plot.Axes[ImAxis.Y1 + k]
+                if x_axis.Enabled and y_axis.Enabled then
+                    if x_axis.OrthoAxis == nil then x_axis.OrthoAxis = y_axis end
+                    if y_axis.OrthoAxis == nil then y_axis.OrthoAxis = x_axis end
+                elseif x_axis.Enabled then
+                    if x_axis.OrthoAxis == nil and not axis_equal then x_axis.OrthoAxis = plot.Axes[ImAxis.Y1] end
+                elseif y_axis.Enabled then
+                    if y_axis.OrthoAxis == nil and not axis_equal then y_axis.OrthoAxis = plot.Axes[ImAxis.X1] end
+                end
+            end
+
+            -- canvas/axes bb
+            local fr = plot.FrameRect
+            SetRect(plot.CanvasRect, fr.Min.x + gs.PlotPadding.x, fr.Min.y + gs.PlotPadding.y, fr.Max.x - gs.PlotPadding.x, fr.Max.y - gs.PlotPadding.y)
+            SetRect(plot.AxesRect, fr.Min.x, fr.Min.y, fr.Max.x, fr.Max.y)
+
+            -- outside legend adjustments
+            -- [Port] TODO: legend milestone
+
+            -- plot bb
+            local pad_top, pad_bot, pad_left, pad_right = 0, 0, 0, 0
+
+            -- (0) calc top padding form title
+            local title_x, title_y = 0, 0
+            if plot:HasTitle() then
+                local ts = ImGui.CalcTextSize(plot:GetTitle(), nil, true)
+                title_x, title_y = ts.x, ts.y
+            end
+            if title_x > 0 then
+                pad_top += title_y + gs.LabelPadding.y
+                plot.AxesRect.Min.y += gs.PlotPadding.y + pad_top
+            end
+
+            -- (1) calc addition top padding and bot padding
+            pad_top, pad_bot = internal.PadAndDatumAxesX(plot, pad_top, pad_bot, gp.CurrentAlignmentH)
+
+            local plot_height = plot.CanvasRect:GetHeight() - pad_top - pad_bot
+
+            -- (2) get y tick labels (needed for left/right pad)
+            for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                local axis = plot:YAxis(i)
+                if axis:WillRender() and axis.ShowDefaultTicks and plot_height > 0 then
+                    axis.Locator(axis.Ticker, axis.Range, plot_height, true, axis.Formatter, axis.FormatterData)
+                end
+            end
+
+            -- (3) calc left/right pad
+            pad_left, pad_right = internal.PadAndDatumAxesY(plot, pad_left, pad_right, gp.CurrentAlignmentV)
+
+            local plot_width = plot.CanvasRect:GetWidth() - pad_left - pad_right
+
+            -- (4) get x ticks
+            for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                local axis = plot:XAxis(i)
+                if axis:WillRender() and axis.ShowDefaultTicks and plot_width > 0 then
+                    axis.Locator(axis.Ticker, axis.Range, plot_width, false, axis.Formatter, axis.FormatterData)
+                end
+            end
+
+            -- (4.5) recalc padding now that we have actual X-axis tick labels (handles multi-line labels)
+            -- Save title padding before resetting
+            local title_pad = 0.0
+            if title_x > 0 then title_pad = title_y + gs.LabelPadding.y end
+            pad_top = title_pad
+            pad_bot = 0
+            pad_top, pad_bot = internal.PadAndDatumAxesX(plot, pad_top, pad_bot, gp.CurrentAlignmentH)
+            -- Update AxesRect to account for title padding (was done in step 0)
+            if title_x > 0 then
+                plot.AxesRect.Min.y = fr.Min.y + gs.PlotPadding.y + title_pad
+            end
+
+            -- (5) calc plot bb
+            local cr = plot.CanvasRect
+            local pr = plot.PlotRect
+            SetRect(pr, cr.Min.x + pad_left, cr.Min.y + pad_top, cr.Max.x - pad_right, cr.Max.y - pad_bot)
+
+            -- HOVER------------------------------------------------------------
+
+            -- axes hover rect, pixel ranges
+            for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                local xax = plot:XAxis(i)
+                SetRect(xax.HoverRect, pr.Min.x, math.min(xax.Datum1, xax.Datum2), pr.Max.x, math.max(xax.Datum1, xax.Datum2))
+                if xax:IsInverted() then
+                    xax.PixelMin, xax.PixelMax = pr.Max.x, pr.Min.x
+                else
+                    xax.PixelMin, xax.PixelMax = pr.Min.x, pr.Max.x
+                end
+                xax:UpdateTransformCache()
+            end
+
+            for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                local yax = plot:YAxis(i)
+                SetRect(yax.HoverRect, math.min(yax.Datum1, yax.Datum2), pr.Min.y, math.max(yax.Datum1, yax.Datum2), pr.Max.y)
+                if yax:IsInverted() then
+                    yax.PixelMin, yax.PixelMax = pr.Min.y, pr.Max.y
+                else
+                    yax.PixelMin, yax.PixelMax = pr.Max.y, pr.Min.y
+                end
+                yax:UpdateTransformCache()
+            end
+            -- Equal axis constraint. Must happen after we set Pixels
+            -- constrain equal axes for primary x and y if not approximately equal
+            -- constrains x to y since x pixel size depends on y labels width, and causes feedback loops in opposite case
+            if axis_equal then
+                for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                    local x_axis = plot:XAxis(i)
+                    if x_axis.OrthoAxis ~= nil then
+                        local xar = x_axis:GetAspect()
+                        local yar = x_axis.OrthoAxis:GetAspect()
+                        -- edge case: user has set x range this frame, so fit y to x so that we honor their request for x range
+                        -- NB: because of feedback across several frames, the user's x request may not be perfectly honored
+                        if x_axis.HasRange then
+                            x_axis.OrthoAxis:SetAspect(xar)
+                        elseif not internal.ImAlmostEqual(xar, yar) and not x_axis.OrthoAxis:IsInputLocked() then
+                            x_axis:SetAspect(yar)
+                        end
+                    end
+                end
+            end
+
+            -- INPUT ------------------------------------------------------------------
+            if not ImHasFlag(plot.Flags, ImPlotFlags.NoInputs) then
+                internal.UpdateInput(plot)
+            end
+
+            -- fit from FitNextPlotAxes or auto fit
+            for i = 0, ImAxis.COUNT - 1 do
+                -- [Port] TODO: gp.NextPlotData.Fit[i]
+                if plot.Axes[i]:IsAutoFitting() then
+                    plot.FitThisFrame = true
+                    plot.Axes[i].FitThisFrame = true
+                end
+            end
+
+            -- RENDER -----------------------------------------------------------------
+
+            local txt_height = ImGui.GetTextLineHeight()
+
+            -- render frame
+            if not ImHasFlag(plot.Flags, ImPlotFlags.NoFrame) then
+                ImGui.RenderFrame(fr.Min, fr.Max, GetStyleColorU32(ImPlotCol.FrameBg), true, Style.FrameRounding)
+            end
+
+            -- grid bg
+            DrawList:AddRectFilled(pr.Min, pr.Max, GetStyleColorU32(ImPlotCol.PlotBg))
+
+            -- transform ticks
+            for i = 0, ImAxis.COUNT - 1 do
+                local axis = plot.Axes[i]
+                if axis:WillRender() then
+                    local ticks = axis.Ticker.Ticks
+                    for t = 1, axis.Ticker:TickCount() do
+                        local tk = ticks[t]
+                        tk.PixelPos = math.floor(axis:PlotToPixels(tk.PlotPos) + 0.5)
+                    end
+                end
+            end
+
+            -- render grid (background)
+            for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                local x_axis = plot:XAxis(i)
+                if x_axis.Enabled and x_axis:HasGridLines() and not x_axis:IsForeground() then
+                    RenderGridLinesX(DrawList, x_axis.Ticker, pr, x_axis.ColorMaj, x_axis.ColorMin, gs.MajorGridSize.x, gs.MinorGridSize.x)
+                end
+            end
+            for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                local y_axis = plot:YAxis(i)
+                if y_axis.Enabled and y_axis:HasGridLines() and not y_axis:IsForeground() then
+                    RenderGridLinesY(DrawList, y_axis.Ticker, pr, y_axis.ColorMaj, y_axis.ColorMin, gs.MajorGridSize.y, gs.MinorGridSize.y)
+                end
+            end
+
+            -- render x axis button, label, tick labels
+            for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                local ax = plot:XAxis(i)
+                if ax.Enabled then
+                    RenderAxisBg(DrawList, plot, ax)
+                    local tkr = ax.Ticker
+                    local opp = ax:IsOpposite()
+                    if ax:HasLabel() then
+                        local label        = plot:GetAxisLabel(ax)
+                        local label_size   = ImGui.CalcTextSize(label)
+                        local label_offset = (tkr.Levels - 1) * (txt_height + gs.LabelPadding.y) + gs.LabelPadding.y
+                        if ax:HasTickLabels() then
+                            label_offset += tkr.MaxSize.y + gs.LabelPadding.y
+                        end
+                        local ly = ax.Datum1 + label_offset
+                        if opp then ly = ax.Datum1 - label_offset - label_size.y end
+                        DrawList:AddText(SetTmp((pr.Min.x + pr.Max.x) * 0.5 - label_size.x * 0.5, ly), ax.ColorTxt, label)
+                    end
+                    if ax:HasTickLabels() then
+                        local ticks = tkr.Ticks
+                        for j = 1, tkr:TickCount() do
+                            local tk = ticks[j]
+                            if tk.ShowLabel and tk.PixelPos >= pr.Min.x - 1 and tk.PixelPos <= pr.Max.x + 1 then
+                                local datum
+                                if opp then
+                                    datum = ax.Datum1 + (-gs.LabelPadding.y - txt_height - tk.Level * (txt_height + gs.LabelPadding.y))
+                                else
+                                    datum = ax.Datum1 + gs.LabelPadding.y + tk.Level * (txt_height + gs.LabelPadding.y)
+                                end
+                                DrawList:AddText(SetTmp(tk.PixelPos - 0.5 * tk.LabelSize.x, datum), ax.ColorTxt, tk.Text)
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- render y axis button, label, tick labels
+            for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                local ax = plot:YAxis(i)
+                if ax.Enabled then
+                    RenderAxisBg(DrawList, plot, ax)
+                    local tkr = ax.Ticker
+                    local opp = ax:IsOpposite()
+                    if ax:HasLabel() then
+                        local label        = plot:GetAxisLabel(ax)
+                        local label_size   = internal.CalcTextSizeVertical(label)
+                        local label_offset = gs.LabelPadding.x
+                        if ax:HasTickLabels() then
+                            label_offset += tkr.MaxSize.x + gs.LabelPadding.x
+                        end
+                        local lx = ax.Datum1 - label_offset - label_size.x
+                        if opp then lx = ax.Datum1 + label_offset end
+                        internal.AddTextVertical(DrawList, SetTmp(lx, (pr.Min.y + pr.Max.y) * 0.5 + label_size.y * 0.5), ax.ColorTxt, label)
+                    end
+                    if ax:HasTickLabels() then
+                        local ticks = tkr.Ticks
+                        for j = 1, tkr:TickCount() do
+                            local tk = ticks[j]
+                            if tk.ShowLabel and tk.PixelPos >= pr.Min.y - 1 and tk.PixelPos <= pr.Max.y + 1 then
+                                local datum = ax.Datum1 - gs.LabelPadding.x - tk.LabelSize.x
+                                if opp then datum = ax.Datum1 + gs.LabelPadding.x end
+                                DrawList:AddText(SetTmp(datum, tk.PixelPos - 0.5 * tk.LabelSize.y), ax.ColorTxt, tk.Text)
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- clear legend (TODO: put elsewhere)
+            -- [Port] TODO: plot.Items.Legend:Reset() (legend milestone)
+            -- push ID to set item hashes (NB: !!!THIS PROBABLY NEEDS TO BE IN BEGIN PLOT!!!!)
+            ImGui.PushOverrideID(gp.CurrentItems.ID)
+        end
+
+        function internal.SetupLock()
+            local gp = GImPlot
+            if not gp.CurrentPlot.SetupLocked then
+                ImPlot.SetupFinish()
+            end
+            gp.CurrentPlot.SetupLocked = true
+        end
+        local SetupLock = internal.SetupLock
+
+        -----------------------------------------------------------------------
+        -- EndPlot()
+        -----------------------------------------------------------------------
+
+        function ImPlot.EndPlot()
+            IM_ASSERT(GImPlot ~= nil, "No current context. Did you call ImPlot::CreateContext() or ImPlot::SetCurrentContext()?")
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil, "Mismatched BeginPlot()/EndPlot()!")
+
+            SetupLock()
+
+            local plot     = gp.CurrentPlot
+            local Window   = ImGui.GetCurrentWindow()
+            local DrawList = Window.DrawList
+            local gs       = gp.Style
+            local pr       = plot.PlotRect
+
+            -- FINAL RENDER -----------------------------------------------------------
+
+            local render_border = gs.PlotBorderSize > 0 and GetStyleColorVec4(ImPlotCol.PlotBorder).w > 0
+
+            ImGui.PushClipRect(plot.FrameRect.Min, plot.FrameRect.Max, true)
+
+            -- render grid (foreground)
+            for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                local x_axis = plot:XAxis(i)
+                if x_axis.Enabled and x_axis:HasGridLines() and x_axis:IsForeground() then
+                    RenderGridLinesX(DrawList, x_axis.Ticker, pr, x_axis.ColorMaj, x_axis.ColorMin, gs.MajorGridSize.x, gs.MinorGridSize.x)
+                end
+            end
+            for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                local y_axis = plot:YAxis(i)
+                if y_axis.Enabled and y_axis:HasGridLines() and y_axis:IsForeground() then
+                    RenderGridLinesY(DrawList, y_axis.Ticker, pr, y_axis.ColorMaj, y_axis.ColorMin, gs.MajorGridSize.y, gs.MinorGridSize.y)
+                end
+            end
+
+            -- render title
+            if plot:HasTitle() then
+                local col = GetStyleColorU32(ImPlotCol.TitleText)
+                internal.AddTextCentered(DrawList, ImVec2((pr.Min.x + pr.Max.x) * 0.5, plot.CanvasRect.Min.y), col, plot:GetTitle())
+            end
+
+            -- render x ticks
+            local count_B, count_T = 0, 0
+            for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                local ax = plot:XAxis(i)
+                if ax.Enabled then
+                    local tkr = ax.Ticker
+                    local opp = ax:IsOpposite()
+                    local aux = (opp and count_T > 0) or (not opp and count_B > 0)
+                    if ax:HasTickMarks() then
+                        local direction = -1.0
+                        if opp then direction = 1.0 end
+                        local ticks = tkr.Ticks
+                        for j = 1, tkr:TickCount() do
+                            local tk = ticks[j]
+                            if not (tk.Level ~= 0 or tk.PixelPos < pr.Min.x or tk.PixelPos > pr.Max.x) then
+                                local len, thk = gs.MinorTickLen.x, gs.MinorTickSize.x
+                                if not aux and tk.Major then
+                                    len, thk = gs.MajorTickLen.x, gs.MajorTickSize.x
+                                end
+                                AddLineV(DrawList, tk.PixelPos, ax.Datum1, ax.Datum1 + direction * len, ax.ColorTick, thk)
+                            end
+                        end
+                        if aux or not render_border then
+                            AddLineH(DrawList, pr.Min.x, pr.Max.x, ax.Datum1, ax.ColorTick, gs.MinorTickSize.x)
+                        end
+                    end
+                    if opp then count_T += 1 else count_B += 1 end
+                end
+            end
+
+            -- render y ticks
+            local count_L, count_R = 0, 0
+            for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                local ax = plot:YAxis(i)
+                if ax.Enabled then
+                    local tkr = ax.Ticker
+                    local opp = ax:IsOpposite()
+                    local aux = (opp and count_R > 0) or (not opp and count_L > 0)
+                    if ax:HasTickMarks() then
+                        local direction = 1.0
+                        if opp then direction = -1.0 end
+                        local ticks = tkr.Ticks
+                        for j = 1, tkr:TickCount() do
+                            local tk = ticks[j]
+                            if not (tk.Level ~= 0 or tk.PixelPos < pr.Min.y or tk.PixelPos > pr.Max.y) then
+                                local len, thk = gs.MinorTickLen.y, gs.MinorTickSize.y
+                                if not aux and tk.Major then
+                                    len, thk = gs.MajorTickLen.y, gs.MajorTickSize.y
+                                end
+                                AddLineH(DrawList, ax.Datum1, ax.Datum1 + direction * len, tk.PixelPos, ax.ColorTick, thk)
+                            end
+                        end
+                        if aux or not render_border then
+                            AddLineV(DrawList, ax.Datum1, pr.Min.y, pr.Max.y, ax.ColorTick, gs.MinorTickSize.y)
+                        end
+                    end
+                    if opp then count_R += 1 else count_L += 1 end
+                end
+            end
+            ImGui.PopClipRect()
+
+            -- [Port] TODO: annotations, selection, crosshairs, mouse text, axis side switch, legend (later milestones)
+
+            -- render border
+            if render_border then
+                DrawList:AddRect(pr.Min, pr.Max, GetStyleColorU32(ImPlotCol.PlotBorder), 0, gs.PlotBorderSize, G.ImDrawFlags.None)
+            end
+
+            -- [Port] TODO: tags
+
+            -- FIT DATA --------------------------------------------------------------
+            -- [Port] TODO: ImPlotFlags_Equal aspect handling during fit
+            if plot.FitThisFrame then
+                for i = 0, ImAxis.COUNT - 1 do
+                    local axis = plot.Axes[i]
+                    if axis.FitThisFrame then
+                        if axis.Vertical then
+                            axis:ApplyFit(gs.FitPadding.y)
+                        else
+                            axis:ApplyFit(gs.FitPadding.x)
+                        end
+                    end
+                end
+                plot.FitThisFrame = false
+            end
+
+            -- CONTEXT MENUS -----------------------------------------------------------
+            -- [Port] TODO: plot/axis context menus (input milestone)
+
+            -- LINKED AXES ------------------------------------------------------------
+            -- [Port] TODO: PushLinks
+
+            -- CLEANUP ----------------------------------------------------------------
+
+            -- remove items
+            if gp.CurrentItems == plot.Items then
+                gp.CurrentItems = nil
+            end
+
+            -- mark the plot as initialized, i.e. having made it through one frame completely
+            plot.Initialized = true
+            -- Pop ImGui::PushID at the end of BeginPlot
+            ImGui.PopID()
+            -- Reset context for next plot
+            internal.ResetCtxForNextPlot(gp)
+        end
+
+        -----------------------------------------------------------------------
+        -- Plot Tools / Utils
+        -----------------------------------------------------------------------
+
+        local function GetAxes(x_idx, y_idx, what)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil, what .. "() needs to be called between BeginPlot() and EndPlot()!")
+            IM_ASSERT(x_idx == nil or x_idx == IMPLOT_AUTO or (x_idx >= ImAxis.X1 and x_idx < ImAxis.Y1), "X-Axis index out of bounds!")
+            IM_ASSERT(y_idx == nil or y_idx == IMPLOT_AUTO or (y_idx >= ImAxis.Y1 and y_idx < ImAxis.COUNT), "Y-Axis index out of bounds!")
+            SetupLock()
+            local plot = gp.CurrentPlot
+            if x_idx == nil or x_idx == IMPLOT_AUTO then x_idx = plot.CurrentX end
+            if y_idx == nil or y_idx == IMPLOT_AUTO then y_idx = plot.CurrentY end
+            return plot.Axes[x_idx], plot.Axes[y_idx]
+        end
+
+        -- [Port] PixelsToPlot(x, y, x_idx, y_idx) and PixelsToPlot(ImVec2, x_idx, y_idx) overloads
+        function ImPlot.PixelsToPlot(x, y, x_idx, y_idx)
+            if type(x) == "table" then
+                x, y, x_idx, y_idx = x.x, x.y, y, x_idx
+            end
+            local x_axis, y_axis = GetAxes(x_idx, y_idx, "PixelsToPlot")
+            return ImPlot.ImPlotPoint(x_axis:PixelsToPlot(x), y_axis:PixelsToPlot(y))
+        end
+
+        -- [Port] PlotToPixels(x, y, x_idx, y_idx) and PlotToPixels(ImPlotPoint, x_idx, y_idx) overloads
+        function ImPlot.PlotToPixels(x, y, x_idx, y_idx)
+            if type(x) == "table" then
+                x, y, x_idx, y_idx = x.x, x.y, y, x_idx
+            end
+            local x_axis, y_axis = GetAxes(x_idx, y_idx, "PlotToPixels")
+            return ImVec2(x_axis:PlotToPixels(x), y_axis:PlotToPixels(y))
+        end
+
+        function ImPlot.GetPlotPos()
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "GetPlotPos() needs to be called between BeginPlot() and EndPlot()!")
+            SetupLock()
+            local m = GImPlot.CurrentPlot.PlotRect.Min
+            return ImVec2(m.x, m.y)
+        end
+
+        function ImPlot.GetPlotSize()
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "GetPlotSize() needs to be called between BeginPlot() and EndPlot()!")
+            SetupLock()
+            return GImPlot.CurrentPlot.PlotRect:GetSize()
+        end
+
+        function ImPlot.GetPlotLimits(x_idx, y_idx)
+            local x_axis, y_axis = GetAxes(x_idx, y_idx, "GetPlotLimits")
+            return ImPlot.ImPlotRect(x_axis.Range.Min, x_axis.Range.Max, y_axis.Range.Min, y_axis.Range.Max)
+        end
+
+        function ImPlot.IsPlotHovered()
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "IsPlotHovered() needs to be called between BeginPlot() and EndPlot()!")
+            SetupLock()
+            return GImPlot.CurrentPlot.Hovered
+        end
+    end
+
 
     return ImPlot
 end
