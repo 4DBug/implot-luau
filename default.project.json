@@ -4,7 +4,8 @@
 		"$className": "DataModel",
 		"ReplicatedStorage": {
 			"ImGui": { "$path": "tools/core/build/ImGuiTyped.luau", "Impl": { "$path": "tools/core/build/ImGui.luau" } },
-			"ImPlot": { "$path": "ImPlot.lua" }
+			"ImPlot": { "$path": "ImPlot.lua" },
+			"ImPlotDemo": { "$path": "ImPlotDemo.lua" }
 		},
 		"StarterPlayer": { "StarterPlayerScripts": { "ImPlotExample": { "$path": "examples/roblox/main.client.luau" } } }
 	}
