@@ -4348,6 +4348,498 @@ return function(G)
         end
 
         -----------------------------------------------------------------------
+        -- PlotStairs, PlotShaded, PlotBars, PlotBarGroups (+ their primitives/renderers/fitters)
+        -----------------------------------------------------------------------
+        do
+            local ImPlotStairsFlags = ImPlot.ImPlotStairsFlags
+            local ImPlotBarsFlags = ImPlot.ImPlotBarsFlags
+            local ImPlotBarGroupsFlags = ImPlot.ImPlotBarGroupsFlags
+
+            local function IsArray(t)
+                return type(t) == "table" and getmetatable(t) ~= SpecMT and (t[1] ~= nil or next(t) == nil)
+            end
+
+            @native
+            local function PrimRectLine(dl, x1, y1, x2, y2, weight, col, u, v)
+                local b = dl.VtxBuffer.Buf
+                local vw = dl._VtxWritePtr
+                local o = (vw - 1) * VTX_STRIDE
+                WV(b, o,                  x1, y1, u, v, col)
+                WV(b, o + VTX_STRIDE,     x1, y2, u, v, col)
+                WV(b, o + VTX_STRIDE * 2, x2, y2, u, v, col)
+                WV(b, o + VTX_STRIDE * 3, x2, y1, u, v, col)
+                WV(b, o + VTX_STRIDE * 4, x1 + weight, y1 + weight, u, v, col)
+                WV(b, o + VTX_STRIDE * 5, x1 + weight, y2 - weight, u, v, col)
+                WV(b, o + VTX_STRIDE * 6, x2 - weight, y2 - weight, u, v, col)
+                WV(b, o + VTX_STRIDE * 7, x2 - weight, y1 + weight, u, v, col)
+                local idx = dl._VtxCurrentIdx
+                local id, iw = dl.IdxBuffer.Data, dl._IdxWritePtr
+                id[iw]      = idx;     id[iw + 1]  = idx + 1; id[iw + 2]  = idx + 5
+                id[iw + 3]  = idx;     id[iw + 4]  = idx + 5; id[iw + 5]  = idx + 4
+                id[iw + 6]  = idx + 1; id[iw + 7]  = idx + 2; id[iw + 8]  = idx + 6
+                id[iw + 9]  = idx + 1; id[iw + 10] = idx + 6; id[iw + 11] = idx + 5
+                id[iw + 12] = idx + 2; id[iw + 13] = idx + 3; id[iw + 14] = idx + 7
+                id[iw + 15] = idx + 2; id[iw + 16] = idx + 7; id[iw + 17] = idx + 6
+                id[iw + 18] = idx + 3; id[iw + 19] = idx;     id[iw + 20] = idx + 4
+                id[iw + 21] = idx + 3; id[iw + 22] = idx + 4; id[iw + 23] = idx + 7
+                dl._VtxWritePtr = vw + 8; dl._IdxWritePtr = iw + 24; dl._VtxCurrentIdx = idx + 8
+            end
+            internal.PrimRectLine = PrimRectLine
+
+            -------------------------------------------------------------------
+            -- Fitters
+            -------------------------------------------------------------------
+
+            local function FitterBarVFit(self, x_axis, y_axis)
+                local g1, g2, hw = self.Getter1, self.Getter2, self.HalfWidth
+                for i = 0, min(g1.Count, g2.Count) - 1 do
+                    local x1, y1 = g1.Get(g1, i)
+                    local x2, y2 = g2.Get(g2, i)
+                    x1 -= hw; x2 += hw
+                    x_axis:ExtendFitWith(y_axis, x1, y1)
+                    y_axis:ExtendFitWith(x_axis, y1, x1)
+                    x_axis:ExtendFitWith(y_axis, x2, y2)
+                    y_axis:ExtendFitWith(x_axis, y2, x2)
+                end
+            end
+            function internal.FitterBarV(g1, g2, width) return { Getter1 = g1, Getter2 = g2, HalfWidth = width * 0.5, Fit = FitterBarVFit } end
+
+            local function FitterBarHFit(self, x_axis, y_axis)
+                local g1, g2, hh = self.Getter1, self.Getter2, self.HalfHeight
+                for i = 0, min(g1.Count, g2.Count) - 1 do
+                    local x1, y1 = g1.Get(g1, i)
+                    local x2, y2 = g2.Get(g2, i)
+                    y1 -= hh; y2 += hh
+                    x_axis:ExtendFitWith(y_axis, x1, y1)
+                    y_axis:ExtendFitWith(x_axis, y1, x1)
+                    x_axis:ExtendFitWith(y_axis, x2, y2)
+                    y_axis:ExtendFitWith(x_axis, y2, x2)
+                end
+            end
+            function internal.FitterBarH(g1, g2, height) return { Getter1 = g1, Getter2 = g2, HalfHeight = height * 0.5, Fit = FitterBarHFit } end
+
+            -------------------------------------------------------------------
+            -- Renderers
+            -------------------------------------------------------------------
+
+            -- [Port] RendererBarsFillV/H + RendererBarsLineV/H share the rect computation; returns PMin/PMax or nil if culled
+            @native
+            local function BarRect(r, cr, prim)
+                local g1, g2, hs = r.Getter1, r.Getter2, r.HalfSize
+                local x1, y1 = g1.Get(g1, prim)
+                local x2, y2 = g2.Get(g2, prim)
+                if r.Horz then y1 += hs; y2 -= hs else x1 += hs; x2 -= hs end
+                local p1x, p1y, p2x, p2y = TransformX(x1), TransformY(y1), TransformX(x2), TransformY(y2)
+                if r.Horz then
+                    local height_px = math.abs(p1y - p2y)
+                    if height_px < 1.0 then
+                        if p1y > p2y then p1y += (1 - height_px) / 2 else p1y += (height_px - 1) / 2 end
+                        if p2y > p1y then p2y += (1 - height_px) / 2 else p2y += (height_px - 1) / 2 end
+                    end
+                else
+                    local width_px = math.abs(p1x - p2x)
+                    if width_px < 1.0 then
+                        if p1x > p2x then p1x += (1 - width_px) / 2 else p1x += (width_px - 1) / 2 end
+                        if p2x > p1x then p2x += (1 - width_px) / 2 else p2x += (width_px - 1) / 2 end
+                    end
+                end
+                local minx, miny, maxx, maxy = min(p1x, p2x), min(p1y, p2y), max(p1x, p2x), max(p1y, p2y)
+                if not (miny < cr.Max.y and maxy > cr.Min.y and minx < cr.Max.x and maxx > cr.Min.x) then
+                    return nil
+                end
+                return minx, miny, maxx, maxy
+            end
+
+            @native
+            local function BarsFillRender(r, dl, cr, prim)
+                local minx, miny, maxx, maxy = BarRect(r, cr, prim)
+                if minx == nil then return false end
+                PrimRectFill(dl, minx, miny, maxx, maxy, GetCol(r, prim), r.U, r.V)
+                return true
+            end
+            @native
+            local function BarsLineRender(r, dl, cr, prim)
+                local minx, miny, maxx, maxy = BarRect(r, cr, prim)
+                if minx == nil then return false end
+                PrimRectLine(dl, minx, miny, maxx, maxy, r.Weight, GetCol(r, prim), r.U, r.V)
+                return true
+            end
+
+            function internal.RendererBarsFillV(getter1, getter2, width)
+                return {
+                    Prims = min(getter1.Count, getter2.Count), IdxConsumed = 6, VtxConsumed = 4,
+                    Getter1 = getter1, Getter2 = getter2, HalfSize = width / 2, Horz = false,
+                    Init = WhiteInit, Render = BarsFillRender,
+                }
+            end
+            function internal.RendererBarsFillH(getter1, getter2, height)
+                local r = internal.RendererBarsFillV(getter1, getter2, height)
+                r.Horz = true
+                return r
+            end
+            function internal.RendererBarsLineV(getter1, getter2, width, weight)
+                return {
+                    Prims = min(getter1.Count, getter2.Count), IdxConsumed = 24, VtxConsumed = 8,
+                    Getter1 = getter1, Getter2 = getter2, HalfSize = width / 2, Horz = false, Weight = weight,
+                    Init = WhiteInit, Render = BarsLineRender,
+                }
+            end
+            function internal.RendererBarsLineH(getter1, getter2, height, weight)
+                local r = internal.RendererBarsLineV(getter1, getter2, height, weight)
+                r.Horz = true
+                return r
+            end
+
+            @native
+            local function StairsPreRender(r, dl, cr, prim)
+                local g = r.Getter
+                local x, y = g.Get(g, prim + 1)
+                local p2x, p2y = TransformX(x), TransformY(y)
+                local p1x, p1y = r.P1x, r.P1y
+                r.P1x, r.P1y = p2x, p2y
+                if not Overlaps(cr, p1x, p1y, p2x, p2y) then return false end
+                local col, hw, u, v = GetCol(r, prim), r.HalfWeight, r.U, r.V
+                PrimRectFill(dl, p1x - hw, p1y, p1x + hw, p2y, col, u, v)
+                PrimRectFill(dl, p1x, p2y + hw, p2x, p2y - hw, col, u, v)
+                return true
+            end
+            @native
+            local function StairsPostRender(r, dl, cr, prim)
+                local g = r.Getter
+                local x, y = g.Get(g, prim + 1)
+                local p2x, p2y = TransformX(x), TransformY(y)
+                local p1x, p1y = r.P1x, r.P1y
+                r.P1x, r.P1y = p2x, p2y
+                if not Overlaps(cr, p1x, p1y, p2x, p2y) then return false end
+                local col, hw, u, v = GetCol(r, prim), r.HalfWeight, r.U, r.V
+                PrimRectFill(dl, p1x, p1y + hw, p2x, p1y - hw, col, u, v)
+                PrimRectFill(dl, p2x - hw, p2y, p2x + hw, p1y, col, u, v)
+                return true
+            end
+            @native
+            local function StairsPreShadedRender(r, dl, cr, prim)
+                local g = r.Getter
+                local x, y = g.Get(g, prim + 1)
+                local p2x, p2y = TransformX(x), TransformY(y)
+                local p1x = r.P1x
+                local y0 = r.Y0
+                r.P1x, r.P1y = p2x, p2y
+                local minx, miny, maxx, maxy = min(p1x, p2x), min(y0, p2y), max(p1x, p2x), max(y0, p2y)
+                if not (miny < cr.Max.y and maxy > cr.Min.y and minx < cr.Max.x and maxx > cr.Min.x) then return false end
+                PrimRectFill(dl, minx, miny, maxx, maxy, GetCol(r, prim), r.U, r.V)
+                return true
+            end
+            @native
+            local function StairsPostShadedRender(r, dl, cr, prim)
+                local g = r.Getter
+                local x, y = g.Get(g, prim + 1)
+                local p2x, p2y = TransformX(x), TransformY(y)
+                local p1x, p1y = r.P1x, r.P1y
+                local y0 = r.Y0
+                r.P1x, r.P1y = p2x, p2y
+                local minx, miny, maxx, maxy = min(p1x, p2x), min(p1y, y0), max(p1x, p2x), max(p1y, y0)
+                if not (miny < cr.Max.y and maxy > cr.Min.y and minx < cr.Max.x and maxx > cr.Min.x) then return false end
+                PrimRectFill(dl, minx, miny, maxx, maxy, GetCol(r, prim), r.U, r.V)
+                return true
+            end
+
+            local function StairsRenderer(getter, render, vtx, weight)
+                local x, y = getter.Get(getter, 0)
+                return {
+                    Prims = getter.Count - 1, IdxConsumed = vtx // 4 * 6, VtxConsumed = vtx,
+                    Getter = getter, HalfWeight = max(1.0, weight or 1) * 0.5,
+                    P1x = TransformX(x), P1y = TransformY(y), Y0 = TransformY(0),
+                    Init = WhiteInit, Render = render,
+                }
+            end
+            function internal.RendererStairsPre(getter, weight) return StairsRenderer(getter, StairsPreRender, 8, weight) end
+            function internal.RendererStairsPost(getter, weight) return StairsRenderer(getter, StairsPostRender, 8, weight) end
+            function internal.RendererStairsPreShaded(getter) return StairsRenderer(getter, StairsPreShadedRender, 4) end
+            function internal.RendererStairsPostShaded(getter) return StairsRenderer(getter, StairsPostShadedRender, 4) end
+
+            -------------------------------------------------------------------
+            -- PlotStairs
+            -------------------------------------------------------------------
+
+            function internal.PlotStairsEx(label_id, getter, spec)
+                if BeginItemEx(label_id, internal.Fitter1(getter), spec, spec.LineColor, spec.Marker) then
+                    if getter.Count <= 0 then
+                        EndItem()
+                        return
+                    end
+                    local s = GetItemData()
+                    local sp = s.Spec
+                    local pre = ImHasFlag(spec.Flags, ImPlotStairsFlags.PreStep)
+                    if getter.Count > 1 then
+                        if s.RenderFill and ImHasFlag(spec.Flags, ImPlotStairsFlags.Shaded) then
+                            UseCurrentTransformer()
+                            local r
+                            if pre then r = internal.RendererStairsPreShaded(getter) else r = internal.RendererStairsPostShaded(getter) end
+                            Render(r, sp.FillColors, getter.Count, ImGui.GetColorU32(sp.FillColor), sp.FillAlpha)
+                        end
+                        if s.RenderLine then
+                            UseCurrentTransformer()
+                            local r
+                            if pre then r = internal.RendererStairsPre(getter, sp.LineWeight) else r = internal.RendererStairsPost(getter, sp.LineWeight) end
+                            Render(r, sp.LineColors, getter.Count, ImGui.GetColorU32(sp.LineColor), 1)
+                        end
+                    end
+                    -- render markers
+                    if s.RenderMarkers then
+                        PopPlotClipRect()
+                        PushPlotClipRect(sp.MarkerSize)
+                        internal.RenderColoredMarkers(getter, s)
+                    end
+                    EndItem()
+                end
+            end
+
+            function ImPlot.PlotStairs(label_id, a, b, c, d, e)
+                local getter, spec = MakeGetter(a, b, c, d, e)
+                internal.PlotStairsEx(label_id, getter, spec)
+            end
+
+            function ImPlot.PlotStairsG(label_id, getter_func, data, count, spec)
+                internal.PlotStairsEx(label_id, internal.GetterFuncPtr(getter_func, data, count), ResolveSpec(spec))
+            end
+
+            -------------------------------------------------------------------
+            -- PlotShaded
+            -------------------------------------------------------------------
+
+            function internal.PlotShadedEx(label_id, getter1, getter2, spec)
+                if BeginItemEx(label_id, internal.Fitter2(getter1, getter2), spec, spec.FillColor) then
+                    if getter1.Count <= 0 or getter2.Count <= 0 then
+                        EndItem()
+                        return
+                    end
+                    local s = GetItemData()
+                    if s.RenderFill and min(getter1.Count, getter2.Count) > 1 then
+                        local sp = s.Spec
+                        UseCurrentTransformer()
+                        Render(internal.RendererShaded(getter1, getter2), sp.FillColors, getter1.Count, ImGui.GetColorU32(sp.FillColor), sp.FillAlpha)
+                    end
+                    EndItem()
+                end
+            end
+
+            local function ResolveYRef(y_ref)
+                y_ref = y_ref or 0
+                if y_ref == -math.huge then y_ref = ImPlot.GetPlotLimits(IMPLOT_AUTO, IMPLOT_AUTO).Y.Min end
+                if y_ref == math.huge then y_ref = ImPlot.GetPlotLimits(IMPLOT_AUTO, IMPLOT_AUTO).Y.Max end
+                return y_ref
+            end
+
+            -- [Port] overloads dispatched on argument types:
+            --   PlotShaded(label_id, values, count?, y_ref?, xscale?, x0?, spec?)
+            --   PlotShaded(label_id, xs, ys, count?, y_ref?, spec?)
+            --   PlotShaded(label_id, xs, ys1, ys2, count?, spec?)
+            -- a trailing table (spec) may appear in place of any optional argument.
+            function ImPlot.PlotShaded(label_id, a, b, c, d, e, f)
+                local getter1, getter2
+                if IsArray(b) and IsArray(c) then
+                    -- xs, ys1, ys2
+                    local count, sp = d, e
+                    if type(count) == "table" then sp, count = count, nil end
+                    count = count or min(#a, #b, #c)
+                    local spec = ResolveSpec(sp)
+                    local ix = internal.IndexerIdx(a, count, spec.Offset, spec.Stride)
+                    getter1 = internal.GetterXY(ix, internal.IndexerIdx(b, count, spec.Offset, spec.Stride), count)
+                    getter2 = internal.GetterXY(ix, internal.IndexerIdx(c, count, spec.Offset, spec.Stride), count)
+                    internal.PlotShadedEx(label_id, getter1, getter2, spec)
+                elseif IsArray(b) then
+                    -- xs, ys, count, y_ref
+                    local count, y_ref, sp = c, d, e
+                    if type(count) == "table" then sp, count, y_ref = count, nil, nil
+                    elseif type(y_ref) == "table" then sp, y_ref = y_ref, nil end
+                    count = count or min(#a, #b)
+                    local spec = ResolveSpec(sp)
+                    y_ref = ResolveYRef(y_ref)
+                    local ix = internal.IndexerIdx(a, count, spec.Offset, spec.Stride)
+                    getter1 = internal.GetterXY(ix, internal.IndexerIdx(b, count, spec.Offset, spec.Stride), count)
+                    getter2 = internal.GetterXY(ix, internal.IndexerConst(y_ref), count)
+                    internal.PlotShadedEx(label_id, getter1, getter2, spec)
+                else
+                    -- values, count, y_ref, xscale, x0
+                    local count, y_ref, xscale, x0, sp = b, c, d, e, f
+                    if type(count) == "table" then sp, count, y_ref, xscale, x0 = count, nil, nil, nil, nil
+                    elseif type(y_ref) == "table" then sp, y_ref, xscale, x0 = y_ref, nil, nil, nil
+                    elseif type(xscale) == "table" then sp, xscale, x0 = xscale, nil, nil
+                    elseif type(x0) == "table" then sp, x0 = x0, nil end
+                    count = count or #a
+                    local spec = ResolveSpec(sp)
+                    y_ref = ResolveYRef(y_ref)
+                    local ix = internal.IndexerLin(xscale or 1, x0 or 0)
+                    getter1 = internal.GetterXY(ix, internal.IndexerIdx(a, count, spec.Offset, spec.Stride), count)
+                    getter2 = internal.GetterXY(ix, internal.IndexerConst(y_ref), count)
+                    internal.PlotShadedEx(label_id, getter1, getter2, spec)
+                end
+            end
+
+            function ImPlot.PlotShadedG(label_id, getter_func1, data1, getter_func2, data2, count, spec)
+                internal.PlotShadedEx(label_id, internal.GetterFuncPtr(getter_func1, data1, count), internal.GetterFuncPtr(getter_func2, data2, count), ResolveSpec(spec))
+            end
+
+            -------------------------------------------------------------------
+            -- PlotBars
+            -------------------------------------------------------------------
+
+            -- [Port] PlotBarsVEx/PlotBarsHEx merged; horz selects FitterBarH + RendererBars*H
+            local function PlotBarsEx(label_id, getter1, getter2, size, spec, horz)
+                local fitter
+                if horz then fitter = internal.FitterBarH(getter1, getter2, size) else fitter = internal.FitterBarV(getter1, getter2, size) end
+                if BeginItemEx(label_id, fitter, spec, spec.FillColor) then
+                    if getter1.Count <= 0 or getter2.Count <= 0 then
+                        EndItem()
+                        return
+                    end
+                    local s = GetItemData()
+                    local sp = s.Spec
+                    local col_fill = ImGui.GetColorU32(sp.FillColor)
+                    local col_line = ImGui.GetColorU32(sp.LineColor)
+                    local rend_fill = s.RenderFill
+                    local rend_line = s.RenderLine
+                    if rend_fill then
+                        UseCurrentTransformer()
+                        local r
+                        if horz then r = internal.RendererBarsFillH(getter1, getter2, size) else r = internal.RendererBarsFillV(getter1, getter2, size) end
+                        Render(r, sp.FillColors, getter1.Count, col_fill, sp.FillAlpha)
+                        if rend_line and col_fill == col_line then
+                            rend_line = false
+                        end
+                    end
+                    if rend_line then
+                        UseCurrentTransformer()
+                        local r
+                        if horz then r = internal.RendererBarsLineH(getter1, getter2, size, sp.LineWeight) else r = internal.RendererBarsLineV(getter1, getter2, size, sp.LineWeight) end
+                        Render(r, sp.LineColors, getter1.Count, col_line, 1)
+                    end
+                    EndItem()
+                end
+            end
+            function internal.PlotBarsVEx(label_id, getter1, getter2, width, spec) PlotBarsEx(label_id, getter1, getter2, width, spec, false) end
+            function internal.PlotBarsHEx(label_id, getter1, getter2, height, spec) PlotBarsEx(label_id, getter1, getter2, height, spec, true) end
+
+            -- values indexer -> bars at x = shift + i
+            local function PlotBarsIdx(label_id, values_idx, count, bar_size, shift, spec)
+                local lin = internal.IndexerLin(1.0, shift)
+                local zero = internal.IndexerConst(0)
+                if ImHasFlag(spec.Flags, ImPlotBarsFlags.Horizontal) then
+                    PlotBarsEx(label_id, internal.GetterXY(values_idx, lin, count), internal.GetterXY(zero, lin, count), bar_size, spec, true)
+                else
+                    PlotBarsEx(label_id, internal.GetterXY(lin, values_idx, count), internal.GetterXY(lin, zero, count), bar_size, spec, false)
+                end
+            end
+
+            -- [Port] overloads dispatched on argument types:
+            --   PlotBars(label_id, values, count?, bar_size = 0.67, shift = 0, spec?)
+            --   PlotBars(label_id, xs, ys, count?, bar_size = 0.67, spec?)
+            function ImPlot.PlotBars(label_id, a, b, c, d, e)
+                if IsArray(b) then
+                    local count, bar_size, sp = c, d, e
+                    if type(count) == "table" then sp, count, bar_size = count, nil, nil
+                    elseif type(bar_size) == "table" then sp, bar_size = bar_size, nil end
+                    count = count or min(#a, #b)
+                    bar_size = bar_size or 0.67
+                    local spec = ResolveSpec(sp)
+                    local ix = internal.IndexerIdx(a, count, spec.Offset, spec.Stride)
+                    local iy = internal.IndexerIdx(b, count, spec.Offset, spec.Stride)
+                    if ImHasFlag(spec.Flags, ImPlotBarsFlags.Horizontal) then
+                        PlotBarsEx(label_id, internal.GetterXY(ix, iy, count), internal.GetterXY(internal.IndexerConst(0), iy, count), bar_size, spec, true)
+                    else
+                        PlotBarsEx(label_id, internal.GetterXY(ix, iy, count), internal.GetterXY(ix, internal.IndexerConst(0), count), bar_size, spec, false)
+                    end
+                else
+                    local count, bar_size, shift, sp = b, c, d, e
+                    if type(count) == "table" then sp, count, bar_size, shift = count, nil, nil, nil
+                    elseif type(bar_size) == "table" then sp, bar_size, shift = bar_size, nil, nil
+                    elseif type(shift) == "table" then sp, shift = shift, nil end
+                    count = count or #a
+                    local spec = ResolveSpec(sp)
+                    PlotBarsIdx(label_id, internal.IndexerIdx(a, count, spec.Offset, spec.Stride), count, bar_size or 0.67, shift or 0, spec)
+                end
+            end
+
+            function ImPlot.PlotBarsG(label_id, getter_func, data, count, bar_size, spec)
+                spec = ResolveSpec(spec)
+                local getter1 = internal.GetterFuncPtr(getter_func, data, count)
+                if ImHasFlag(spec.Flags, ImPlotBarsFlags.Horizontal) then
+                    PlotBarsEx(label_id, getter1, internal.GetterOverrideX(getter1, 0), bar_size, spec, true)
+                else
+                    PlotBarsEx(label_id, getter1, internal.GetterOverrideY(getter1, 0), bar_size, spec, false)
+                end
+            end
+
+            -------------------------------------------------------------------
+            -- PlotBarGroups
+            -------------------------------------------------------------------
+
+            -- [Port] &values[i*group_count] -> slice indexer over the shared IndexerIdx (Offset/Stride apply to the whole array)
+            local function SliceAt(self, i) local ix = self.Indexer; return ix.At(ix, self.Base + i) end
+            -- [Port] TempDouble1 split into four reusable arrays
+            local bg_neg, bg_pos, bg_curr_min, bg_curr_max = {}, {}, {}, {}
+            local bg_spec = SpecDefaults({})
+
+            -- label_ids: array of strings; values: item_count*group_count array (row = item)
+            function ImPlot.PlotBarGroups(label_ids, values, item_count, group_count, group_size, shift, spec)
+                if type(group_size) == "table" then spec, group_size, shift = group_size, nil, nil
+                elseif type(shift) == "table" then spec, shift = shift, nil end
+                group_size = group_size or 0.67
+                shift = shift or 0
+                spec = ResolveSpec(spec)
+                local indexer = internal.IndexerIdx(values, item_count * group_count, spec.Offset, spec.Stride)
+                local horz = ImHasFlag(spec.Flags, ImPlotBarGroupsFlags.Horizontal)
+                local stack = ImHasFlag(spec.Flags, ImPlotBarGroupsFlags.Stacked)
+                local spec_bars = SpecDefaults(bg_spec)
+                for _, fld in VEC4_FIELDS do CopyVec4(spec_bars[fld], spec[fld]) end
+                for _, fld in SCALAR_FIELDS do spec_bars[fld] = spec[fld] end
+                spec_bars.Flags = 0
+                if stack then
+                    internal.SetupLock()
+                    local neg, pos, curr_min, curr_max = bg_neg, bg_pos, bg_curr_min, bg_curr_max
+                    for g = 1, group_count do
+                        neg[g] = 0; pos[g] = 0
+                        if curr_min[g] == nil then curr_min[g] = 0; curr_max[g] = 0 end
+                    end
+                    local lin = internal.IndexerLin(1.0, shift)
+                    local imin = internal.IndexerIdx(curr_min, group_count)
+                    local imax = internal.IndexerIdx(curr_max, group_count)
+                    for i = 0, item_count - 1 do
+                        if not ImPlot.IsItemHidden(label_ids[i + 1]) then
+                            for g = 1, group_count do
+                                local v = indexer.At(indexer, i * group_count + g - 1)
+                                if v > 0 then
+                                    curr_min[g] = pos[g]
+                                    curr_max[g] = curr_min[g] + v
+                                    pos[g]      += v
+                                else
+                                    curr_max[g] = neg[g]
+                                    curr_min[g] = curr_max[g] + v
+                                    neg[g]      += v
+                                end
+                            end
+                        end
+                        if horz then
+                            PlotBarsEx(label_ids[i + 1], internal.GetterXY(imin, lin, group_count), internal.GetterXY(imax, lin, group_count), group_size, spec_bars, true)
+                        else
+                            PlotBarsEx(label_ids[i + 1], internal.GetterXY(lin, imin, group_count), internal.GetterXY(lin, imax, group_count), group_size, spec_bars, false)
+                        end
+                    end
+                else
+                    local subsize = group_size / item_count
+                    if horz then
+                        spec_bars.Flags = ImPlotBarsFlags.Horizontal
+                    end
+                    for i = 0, item_count - 1 do
+                        local subshift = (i + 0.5) * subsize - group_size / 2
+                        local slice = { Indexer = indexer, Base = i * group_count, At = SliceAt }
+                        PlotBarsIdx(label_ids[i + 1], slice, group_count, subsize, subshift + shift, spec_bars)
+                    end
+                end
+            end
+        end
+
+        -----------------------------------------------------------------------
         -- Legend Utils (implot.cpp)
         -----------------------------------------------------------------------
 
