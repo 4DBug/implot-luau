@@ -354,11 +354,6 @@ return function(G, ImPlot)
             s.star_ys[i + 1] = 0.5 + radius * math.sin(angle)
         end
 
-        -- [Port] PlotPolygon is not ported yet in ImPlot.lua
-        if ImPlot.PlotPolygon == nil then
-            ImGui.TextDisabled("[Port] TODO: PlotPolygon is not ported yet")
-            return
-        end
         if ImPlot.BeginPlot("Polygon Plot", ImVec2(-1, 0), ImPlotFlags.Equal) then
             ImPlot.PlotPolygon("Triangle", s.tri_xs, s.tri_ys, 3, {
                 FillAlpha = 0.5,
@@ -2297,17 +2292,547 @@ return function(G, ImPlot)
     end
 
     ---------------------------------------------------------------------------
-    -- [Port] TODO: the remaining demos are not ported yet; stubs show a placeholder
+    -- [SECTION] MyImPlot helpers (custom getters, sparkline, seaborn style, candlestick)
     ---------------------------------------------------------------------------
 
-    for _, name in {
-        "TickLabels", "Tables", "LegendPopups", "ColormapWidgets", "ItemStylingAndSpec",
-        "OffsetAndStride", "CustomStyles", "CustomDataAndGetters", "CustomRendering", "CustomPlottersAndTooltips",
-    } do
-        if D["Demo_" .. name] == nil then
-            D["Demo_" .. name] = function()
-                ImGui.TextDisabled("[Port] TODO: Demo_" .. name)
+    -- [Port] namespace MyImPlot -> table My (keeps the locals count down)
+    local My = {}
+
+    -- [Port] &arr[base] pointer: a read-only view so Spec.Offset/Stride (in elements) index from `base`
+    function My.Ptr(arr, base)
+        return setmetatable({}, { __index = function(_, i) return arr[i + base] end })
+    end
+
+    function My.SineWave(idx, wd)
+        local x = idx * wd.X
+        return x, wd.Offset + wd.Amp * math.sin(2 * 3.14 * wd.Freq * x)
+    end
+
+    function My.Spiral(idx)
+        local r = 0.9           -- outer radius
+        local a = 0             -- inner radius
+        local b = 0.05          -- increment per rev
+        local n = (r - a) / b   -- number  of revolutions
+        local th = 2 * n * 3.14 -- angle
+        local Th = th * idx / (1000 - 1)
+        return 0.5 + (a + b * Th / (2.0 * 3.14)) * math.cos(Th),
+               0.5 + (a + b * Th / (2.0 * 3.14)) * math.sin(Th)
+    end
+
+    function My.Sparkline(id, values, count, min_v, max_v, offset, col, size)
+        ImPlot.PushStyleVar(ImPlot.ImPlotStyleVar.PlotPadding, ImVec2(0, 0))
+        if ImPlot.BeginPlot(id, size, ImPlotFlags.CanvasOnly) then
+            ImPlot.SetupAxes(nil, nil, ImPlotAxisFlags.NoDecorations, ImPlotAxisFlags.NoDecorations)
+            ImPlot.SetupAxesLimits(0, count - 1, min_v, max_v, ImGuiCond.Always)
+            ImPlot.PlotLine(id, values, count, 1, 0, {
+                LineColor = col,
+                FillColor = col,
+                FillAlpha = 0.25,
+                Offset = offset,
+                Flags = ImPlot.ImPlotLineFlags.Shaded,
+            })
+            ImPlot.EndPlot()
+        end
+        ImPlot.PopStyleVar()
+    end
+
+    function My.StyleSeaborn()
+        local style = ImPlot.GetStyle()
+
+        local colors = style.Colors
+        local ImPlotCol = ImPlot.ImPlotCol
+        colors[ImPlotCol.FrameBg]       = ImVec4(1.00, 1.00, 1.00, 1.00)
+        colors[ImPlotCol.PlotBg]        = ImVec4(0.92, 0.92, 0.95, 1.00)
+        colors[ImPlotCol.PlotBorder]    = ImVec4(0.00, 0.00, 0.00, 0.00)
+        colors[ImPlotCol.LegendBg]      = ImVec4(0.92, 0.92, 0.95, 1.00)
+        colors[ImPlotCol.LegendBorder]  = ImVec4(0.80, 0.81, 0.85, 1.00)
+        colors[ImPlotCol.LegendText]    = ImVec4(0.00, 0.00, 0.00, 1.00)
+        colors[ImPlotCol.TitleText]     = ImVec4(0.00, 0.00, 0.00, 1.00)
+        colors[ImPlotCol.InlayText]     = ImVec4(0.00, 0.00, 0.00, 1.00)
+        colors[ImPlotCol.AxisText]      = ImVec4(0.00, 0.00, 0.00, 1.00)
+        colors[ImPlotCol.AxisGrid]      = ImVec4(1.00, 1.00, 1.00, 1.00)
+        colors[ImPlotCol.AxisBgHovered] = ImVec4(0.92, 0.92, 0.95, 1.00)
+        colors[ImPlotCol.AxisBgActive]  = ImVec4(0.92, 0.92, 0.95, 0.75)
+        colors[ImPlotCol.Selection]     = ImVec4(1.00, 0.65, 0.00, 1.00)
+        colors[ImPlotCol.Crosshairs]    = ImVec4(0.23, 0.10, 0.64, 0.50)
+
+        style.MousePosPadding  = ImVec2(5, 5)
+        style.PlotMinSize      = ImVec2(300, 225)
+        style.PlotBorderSize   = 0
+        style.MinorAlpha       = 1.0
+        style.MajorTickLen     = ImVec2(0, 0)
+        style.MinorTickLen     = ImVec2(0, 0)
+        style.MajorTickSize    = ImVec2(0, 0)
+        style.MinorTickSize    = ImVec2(0, 0)
+        style.MajorGridSize    = ImVec2(1.2, 1.2)
+        style.MinorGridSize    = ImVec2(1.2, 1.2)
+        style.PlotPadding      = ImVec2(12, 12)
+        style.LabelPadding     = ImVec2(5, 5)
+        style.LegendPadding    = ImVec2(5, 5)
+        style.DigitalPadding   = 20
+        style.DigitalSpacing   = 4
+    end
+
+    -- [Port] ImPlotStyle assignment (deep copy)
+    function My.CopyStyle(dst, src)
+        for k, v in pairs(src) do
+            if k == "Colors" then
+                dst.Colors = {}
+                for i, c in pairs(v) do dst.Colors[i] = ImVec4(c.x, c.y, c.z, c.w) end
+            elseif type(v) == "table" then
+                dst[k] = ImVec2(v.x, v.y)
+            else
+                dst[k] = v
             end
+        end
+        return dst
+    end
+
+    function My.BinarySearch(arr, l, r, x)
+        if r >= l then
+            local mid = l + (r - l) // 2
+            if arr[mid + 1] == x then
+                return mid
+            end
+            if arr[mid + 1] > x then
+                return My.BinarySearch(arr, l, mid - 1, x)
+            end
+            return My.BinarySearch(arr, mid + 1, r, x)
+        end
+        return -1
+    end
+
+    -- [Port] uses ImPlot.internal (implot_internal.h); arrays are 1-based
+    function My.PlotCandlestick(label_id, xs, opens, closes, lows, highs, count, tooltip, width_percent, bullCol, bearCol)
+        local internal = ImPlot.internal
+        if tooltip == nil then tooltip = true end
+        width_percent = width_percent or 0.25
+        bullCol = bullCol or ImVec4(0, 1, 0, 1)
+        bearCol = bearCol or ImVec4(1, 0, 0, 1)
+
+        -- get ImGui window DrawList
+        local draw_list = ImPlot.GetPlotDrawList()
+        -- calc real value width
+        local half_width = width_percent
+        if count > 1 then half_width = (xs[2] - xs[1]) * width_percent end
+
+        -- custom tool
+        if ImPlot.IsPlotHovered() and tooltip then
+            local mouse = ImPlot.GetPlotMousePos()
+            mouse.x = internal.RoundTime(internal.ImPlotTimeFromDouble(mouse.x), internal.ImPlotTimeUnit.Day):ToDouble()
+            local tool_l = ImPlot.PlotToPixels(mouse.x - half_width * 1.5, mouse.y).x
+            local tool_r = ImPlot.PlotToPixels(mouse.x + half_width * 1.5, mouse.y).x
+            local tool_t = ImPlot.GetPlotPos().y
+            local tool_b = tool_t + ImPlot.GetPlotSize().y
+            ImPlot.PushPlotClipRect()
+            draw_list:AddRectFilled(ImVec2(tool_l, tool_t), ImVec2(tool_r, tool_b), G.IM_COL32(128, 128, 128, 64))
+            ImPlot.PopPlotClipRect()
+            -- find mouse location index
+            local idx = My.BinarySearch(xs, 0, count - 1, mouse.x)
+            -- render tool tip (won't be affected by plot clip rect)
+            if idx ~= -1 then
+                ImGui.BeginTooltip()
+                local buff = internal.FormatDate(internal.ImPlotTimeFromDouble(xs[idx + 1]), internal.ImPlotDateFmt.DayMoYr, ImPlot.GetStyle().UseISO8601)
+                ImGui.Text("Day:   %s", buff)
+                ImGui.Text("Open:  $%.2f", opens[idx + 1])
+                ImGui.Text("Close: $%.2f", closes[idx + 1])
+                ImGui.Text("Low:   $%.2f", lows[idx + 1])
+                ImGui.Text("High:  $%.2f", highs[idx + 1])
+                ImGui.EndTooltip()
+            end
+        end
+
+        -- begin plot item
+        if internal.BeginItem(label_id) then
+            -- override legend icon color
+            internal.GetCurrentItem().Color = G.IM_COL32(64, 64, 64, 255)
+            -- fit data if requested
+            if internal.FitThisFrame() then
+                for i = 1, count do
+                    internal.FitPoint(xs[i], lows[i])
+                    internal.FitPoint(xs[i], highs[i])
+                end
+            end
+            -- render data
+            for i = 1, count do
+                local open_pos  = ImPlot.PlotToPixels(xs[i] - half_width, opens[i])
+                local close_pos = ImPlot.PlotToPixels(xs[i] + half_width, closes[i])
+                local color = ImGui.GetColorU32(opens[i] > closes[i] and bearCol or bullCol)
+                -- [Port] upstream passes plot-space values to AddLineV (pixel space); converted to pixels here
+                local low_pos  = ImPlot.PlotToPixels(xs[i], lows[i])
+                local high_pos = ImPlot.PlotToPixels(xs[i], highs[i])
+                internal.AddLineV(draw_list, low_pos.x, low_pos.y, high_pos.y, color)
+                draw_list:AddRectFilled(open_pos, close_pos, color)
+            end
+
+            -- end plot item
+            internal.EndItem()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_Tables = {
+        flags = bor(G.ImGuiTableFlags.BordersOuter, G.ImGuiTableFlags.BordersV, G.ImGuiTableFlags.RowBg,
+                    G.ImGuiTableFlags.Resizable, G.ImGuiTableFlags.Reorderable),
+        anim = true, offset = 0, data = table.create(100, 0),
+    }
+    function D.Demo_Tables()
+        IMGUI_DEMO_MARKER("Subplots/Tables")
+        local s = S.Demo_Tables
+        ImGui.BulletText("Plots can be used inside of ImGui tables as another means of creating subplots.")
+        _, s.anim = ImGui.Checkbox("Animate", s.anim)
+        if s.anim then
+            s.offset = (s.offset + 1) % 100
+        end
+        if ImGui.BeginTable("##table", 3, s.flags, ImVec2(-1, 0)) then
+            ImGui.TableSetupColumn("Electrode", G.ImGuiTableColumnFlags.WidthFixed, 75.0)
+            ImGui.TableSetupColumn("Voltage", G.ImGuiTableColumnFlags.WidthFixed, 75.0)
+            ImGui.TableSetupColumn("EMG Signal")
+            ImGui.TableHeadersRow()
+            ImPlot.PushColormap(ImPlotColormap.Cool)
+            local data = s.data
+            for row = 0, 9 do
+                ImGui.TableNextRow()
+                math.randomseed(row)
+                for i = 1, 100 do
+                    data[i] = RandomRange(0.0, 10.0)
+                end
+                ImGui.TableSetColumnIndex(0)
+                ImGui.Text("EMG %d", row)
+                ImGui.TableSetColumnIndex(1)
+                ImGui.Text("%.3f V", data[s.offset + 1])
+                ImGui.TableSetColumnIndex(2)
+                ImGui.PushID(row)
+                My.Sparkline("##spark", data, 100, 0, 11.0, s.offset, ImPlot.GetColormapColor(row), ImVec2(-1, 35))
+                ImGui.PopID()
+            end
+            ImPlot.PopColormap()
+            ImGui.EndTable()
+        end
+    end
+
+    -- [Port] ImVec2 data[20] -> flat interleaved {x0, y0, x1, y1, ...}; &data[0].x/.y -> My.Ptr views, Stride = 2
+    S.Demo_ItemStylingAndSpec = { data1 = table.create(40, 0), data2 = table.create(40, 0) }
+    function D.Demo_ItemStylingAndSpec()
+        local s = S.Demo_ItemStylingAndSpec
+        for i = 0, 19 do
+            local x = i * 1 / 19.0
+            s.data1[2 * i + 1] = x
+            s.data1[2 * i + 2] = x * x
+        end
+        for i = 0, 19 do
+            local x = i * 1 / 19.0
+            s.data2[2 * i + 1] = x
+            s.data2[2 * i + 2] = x * x * x
+        end
+        if ImPlot.BeginPlot("##SpecStyling") then
+            ImPlot.SetupAxes("x", "y")
+
+            -- Two options for using ImPlotSpec:
+
+            -- 1. By declaring and defining a struct instance:
+            local spec = ImPlot.ImPlotSpec()
+            spec.LineColor = ImVec4(1, 1, 0, 1)
+            spec.LineWeight = 1.0
+            spec.FillColor = ImVec4(1, 0.5, 0, 1)
+            spec.FillAlpha = 0.5
+            spec.Marker = ImPlotMarker.Square
+            spec.MarkerSize = 6
+            spec.Stride = 2
+            spec.Flags = bor(ImPlot.ImPlotItemFlags.NoLegend, ImPlot.ImPlotLineFlags.Shaded)
+            ImPlot.PlotLine("Line 1", My.Ptr(s.data1, 0), My.Ptr(s.data1, 1), 20, spec)
+
+            -- 2. Inline using ImPlotProp,value pairs (order does NOT matter):
+            ImPlot.PlotLine("Line 2", My.Ptr(s.data2, 0), My.Ptr(s.data2, 1), 20, ImPlot.ImPlotSpec(
+                ImPlotProp.LineColor, ImVec4(0, 1, 1, 1),
+                ImPlotProp.LineWeight, 1.0,
+                ImPlotProp.FillColor, ImVec4(0, 0, 1, 1),
+                ImPlotProp.FillAlpha, 0.5,
+                ImPlotProp.Marker, ImPlotMarker.Diamond,
+                ImPlotProp.Size, 6,
+                ImPlotProp.Stride, 2,
+                ImPlotProp.Flags, bor(ImPlot.ImPlotItemFlags.NoLegend, ImPlot.ImPlotLineFlags.Shaded)
+            ))
+
+            ImPlot.EndPlot()
+        end
+    end
+
+    S.Demo_OffsetAndStride = { offset = 0, interleaved_data = table.create(2 * 50 * 11, 0) }
+    function D.Demo_OffsetAndStride()
+        IMGUI_DEMO_MARKER("Tools/Offset and Stride")
+        local s = S.Demo_OffsetAndStride
+        local k_circles    = 11
+        local k_points_per = 50
+        local interleaved_data = s.interleaved_data
+        for p = 0, k_points_per - 1 do
+            for c = 0, k_circles - 1 do
+                local r = c / (k_circles - 1) * 0.2 + 0.2
+                interleaved_data[p * 2 * k_circles + 2 * c + 0 + 1] = 0.5 + r * math.cos(p / k_points_per * 6.28)
+                interleaved_data[p * 2 * k_circles + 2 * c + 1 + 1] = 0.5 + r * math.sin(p / k_points_per * 6.28)
+            end
+        end
+        ImGui.BulletText("Offsetting is useful for realtime plots (see above) and circular buffers.")
+        ImGui.BulletText("Striding is useful for interleaved data (e.g. audio) or plotting structs.")
+        ImGui.BulletText("Here, all circle data is stored in a single interleaved buffer:")
+        ImGui.BulletText("[c0.x0 c0.y0 ... cn.x0 cn.y0 c0.x1 c0.y1 ... cn.x1 cn.y1 ... cn.xm cn.ym]")
+        ImGui.BulletText("The offset value indicates which circle point index is considered the first.")
+        ImGui.BulletText("Offsets can be negative and/or larger than the actual data count.")
+        s.offset = ImGui.SliderInt("Offset", s.offset, -2 * k_points_per, 2 * k_points_per)
+        if ImPlot.BeginPlot("##strideoffset", ImVec2(-1, 0), ImPlotFlags.Equal) then
+            ImPlot.PushColormap(ImPlotColormap.Jet)
+            for c = 0, k_circles - 1 do
+                local buff = string.format("Circle %d", c)
+                -- [Port] Stride is in elements (2*k_circles doubles)
+                ImPlot.PlotLine(buff, My.Ptr(interleaved_data, c * 2 + 0), My.Ptr(interleaved_data, c * 2 + 1), k_points_per,
+                    ImPlot.ImPlotSpec(ImPlotProp.Offset, s.offset, ImPlotProp.Stride, 2 * k_circles))
+            end
+            ImPlot.EndPlot()
+            ImPlot.PopColormap()
+        end
+        -- offset++; uncomment for animation!
+    end
+
+    S.Demo_CustomDataAndGetters = {
+        data1 = WaveData(0.001, 0.2, 2, 0.75),
+        data2 = WaveData(0.001, 0.2, 4, 0.25),
+    }
+    function D.Demo_CustomDataAndGetters()
+        IMGUI_DEMO_MARKER("Custom/Custom Data and Getters")
+        local s = S.Demo_CustomDataAndGetters
+        ImGui.BulletText("You can plot custom structs using the stride feature.")
+        ImGui.BulletText("Most plotters can also be passed a function pointer for getting data.")
+        ImGui.Indent()
+            ImGui.BulletText("You can optionally pass user data to be given to your getter function.")
+            ImGui.BulletText("C++ lambdas can be passed as function pointers as well!")
+        ImGui.Unindent()
+
+        -- [Port] MyImPlot::Vector2f vec2_data[2] -> flat interleaved {x0, y0, x1, y1}
+        local vec2_data = { 0, 0, 1, 1 }
+
+        if ImPlot.BeginPlot("##Custom Data") then
+
+            -- custom structs using stride example:
+            ImPlot.PlotLine("Vector2f", My.Ptr(vec2_data, 0), My.Ptr(vec2_data, 1), 2, ImPlot.ImPlotSpec(ImPlotProp.Stride, 2))
+
+            -- custom getter example 1:
+            ImPlot.PlotLineG("Spiral", My.Spiral, nil, 1000)
+
+            -- custom getter example 2:
+            ImPlot.PlotLineG("Waves", My.SineWave, s.data1, 1000)
+            ImPlot.PlotLineG("Waves", SawWave, s.data2, 1000)
+            ImPlot.PlotShadedG("Waves", My.SineWave, s.data1, SawWave, s.data2, 1000, ImPlot.ImPlotSpec(ImPlotProp.FillAlpha, 0.25))
+
+            -- you can also pass C++ lambdas:
+            -- auto lambda = [](void* data, int idx) { ... return ImPlotPoint(x,y); };
+            -- ImPlot::PlotLine("My Lambda", lambda, data, 1000);
+
+            ImPlot.EndPlot()
+        end
+    end
+
+    -- [Port] formatter(value, data) -> string
+    local MetricFormatter_v = { 1000000000, 1000000, 1000, 1, 0.001, 0.000001, 0.000000001 }
+    local MetricFormatter_p = { "G", "M", "k", "", "m", "u", "n" }
+    function My.MetricFormatter(value, unit)
+        if value == 0 then
+            return string.format("0 %s", unit)
+        end
+        for i = 1, 7 do
+            if math.abs(value) >= MetricFormatter_v[i] then
+                return string.format("%g %s%s", value / MetricFormatter_v[i], MetricFormatter_p[i], unit)
+            end
+        end
+        return string.format("%g %s%s", value / MetricFormatter_v[7], MetricFormatter_p[7], unit)
+    end
+
+    S.Demo_TickLabels = {
+        custom_fmt = true, custom_ticks = false, custom_labels = true,
+        yticks = { 100, 300, 700, 900 },
+        ylabels = { "One", "Three", "Seven", "Nine" },
+        yticks_aux = { 0.2, 0.4, 0.6 },
+        ylabels_aux = { "A", "B", "C", "D", "E", "F" },
+    }
+    function D.Demo_TickLabels()
+        IMGUI_DEMO_MARKER("Axes/Tick Labels")
+        local s = S.Demo_TickLabels
+        _, s.custom_fmt = ImGui.Checkbox("Show Custom Format", s.custom_fmt)
+        ImGui.SameLine()
+        _, s.custom_ticks = ImGui.Checkbox("Show Custom Ticks", s.custom_ticks)
+        if s.custom_ticks then
+            ImGui.SameLine()
+            _, s.custom_labels = ImGui.Checkbox("Show Custom Labels", s.custom_labels)
+        end
+        local pi = { 3.14 }
+        local pi_str = { "PI" }
+        if ImPlot.BeginPlot("##Ticks") then
+            ImPlot.SetupAxesLimits(2.5, 5, 0, 1000)
+            ImPlot.SetupAxis(ImAxis.Y2, nil, ImPlotAxisFlags.AuxDefault)
+            ImPlot.SetupAxis(ImAxis.Y3, nil, ImPlotAxisFlags.AuxDefault)
+            if s.custom_fmt then
+                ImPlot.SetupAxisFormat(ImAxis.X1, "%g ms")
+                ImPlot.SetupAxisFormat(ImAxis.Y1, My.MetricFormatter, "Hz")
+                ImPlot.SetupAxisFormat(ImAxis.Y2, "%g dB")
+                ImPlot.SetupAxisFormat(ImAxis.Y3, My.MetricFormatter, "m")
+            end
+            if s.custom_ticks then
+                ImPlot.SetupAxisTicks(ImAxis.X1, pi, 1, s.custom_labels and pi_str or nil, true)
+                ImPlot.SetupAxisTicks(ImAxis.Y1, s.yticks, 4, s.custom_labels and s.ylabels or nil, false)
+                ImPlot.SetupAxisTicks(ImAxis.Y2, s.yticks_aux, 3, s.custom_labels and s.ylabels_aux or nil, false)
+                ImPlot.SetupAxisTicks(ImAxis.Y3, 0, 1, 6, s.custom_labels and s.ylabels_aux or nil, false)
+            end
+            ImPlot.EndPlot()
+        end
+    end
+
+    function D.Demo_CustomStyles()
+        IMGUI_DEMO_MARKER("Custom/Custom Styles")
+        ImPlot.PushColormap(ImPlotColormap.Deep)
+        -- normally you wouldn't change the entire style each frame
+        local backup = My.CopyStyle({}, ImPlot.GetStyle())
+        My.StyleSeaborn()
+        if ImPlot.BeginPlot("seaborn style") then
+            ImPlot.SetupAxes("x-axis", "y-axis")
+            ImPlot.SetupAxesLimits(-0.5, 9.5, 0, 10)
+            local lin = { 8, 8, 9, 7, 8, 8, 8, 9, 7, 8 }
+            local bar = { 1, 2, 5, 3, 4, 1, 2, 5, 3, 4 }
+            local dot = { 7, 6, 6, 7, 8, 5, 6, 5, 8, 7 }
+            ImPlot.PlotBars("Bars", bar, 10, 0.5)
+            ImPlot.PlotLine("Line", lin, 10)
+            ImPlot.NextColormapColor() -- skip green
+            ImPlot.PlotScatter("Scatter", dot, 10)
+            ImPlot.EndPlot()
+        end
+        My.CopyStyle(ImPlot.GetStyle(), backup)
+        ImPlot.PopColormap()
+    end
+
+    function D.Demo_CustomRendering()
+        IMGUI_DEMO_MARKER("Custom/Custom Rendering")
+        if ImPlot.BeginPlot("##CustomRend") then
+            local cntr = ImPlot.PlotToPixels(0.5, 0.5)
+            local rmin = ImPlot.PlotToPixels(0.25, 0.75)
+            local rmax = ImPlot.PlotToPixels(0.75, 0.25)
+            ImPlot.PushPlotClipRect()
+            ImPlot.GetPlotDrawList():AddCircleFilled(cntr, 20, G.IM_COL32(255, 255, 0, 255), 20)
+            ImPlot.GetPlotDrawList():AddRect(rmin, rmax, G.IM_COL32(128, 0, 255, 255))
+            ImPlot.PopPlotClipRect()
+            ImPlot.EndPlot()
+        end
+    end
+
+    S.Demo_LegendPopups = {
+        frequency = 0.1, amplitude = 0.5, color = ImVec4(1, 1, 0, 1), alpha = 1.0,
+        line = false, thickness = 1, markers = false, shaded = false,
+        vals = table.create(101, 0),
+    }
+    function D.Demo_LegendPopups()
+        IMGUI_DEMO_MARKER("Tools/Legend Popups")
+        local s = S.Demo_LegendPopups
+        ImGui.BulletText("You can implement legend context menus to inject per-item controls and widgets.")
+        ImGui.BulletText("Right click the legend label/icon to edit custom item attributes.")
+
+        for i = 0, 100 do
+            s.vals[i + 1] = s.amplitude * math.sin(s.frequency * i)
+        end
+
+        if ImPlot.BeginPlot("Right Click the Legend") then
+            ImPlot.SetupAxesLimits(0, 100, -1, 1)
+            -- rendering logic
+            if not s.line then
+                ImPlot.PlotBars("Right Click Me", s.vals, 101, 0.67, 0, ImPlot.ImPlotSpec(
+                    ImPlotProp.FillAlpha, s.alpha,
+                    ImPlotProp.FillColor, s.color
+                ))
+            else
+                ImPlot.PlotLine("Right Click Me", s.vals, 101, 1, 0, ImPlot.ImPlotSpec(
+                    ImPlotProp.LineColor, s.color,
+                    ImPlotProp.LineWeight, s.thickness
+                ))
+                if s.markers then
+                    ImPlot.PlotScatter("Right Click Me", s.vals, 101, 1, 0, ImPlot.ImPlotSpec(
+                        ImPlotProp.Marker, ImPlotMarker.Square,
+                        ImPlotProp.LineColor, s.color
+                    ))
+                end
+                if s.shaded then
+                    ImPlot.PlotShaded("Right Click Me", s.vals, 101, 0, 1, 0, ImPlot.ImPlotSpec(
+                        ImPlotProp.FillAlpha, s.alpha
+                    ))
+                end
+            end
+            -- custom legend context menu
+            if ImPlot.BeginLegendPopup("Right Click Me") then
+                s.frequency = ImGui.SliderFloat("Frequency", s.frequency, 0, 1, "%0.2f")
+                s.amplitude = ImGui.SliderFloat("Amplitude", s.amplitude, 0, 1, "%0.2f")
+                ImGui.Separator()
+                ImGui.ColorEdit3("Color", s.color)
+                s.alpha = ImGui.SliderFloat("Transparency", s.alpha, 0, 1, "%.2f")
+                _, s.line = ImGui.Checkbox("Line Plot", s.line)
+                if s.line then
+                    s.thickness = ImGui.SliderFloat("Thickness", s.thickness, 0, 5)
+                    _, s.markers = ImGui.Checkbox("Markers", s.markers)
+                    _, s.shaded = ImGui.Checkbox("Shaded", s.shaded)
+                end
+                ImPlot.EndLegendPopup()
+            end
+            ImPlot.EndPlot()
+        end
+    end
+
+    S.Demo_ColormapWidgets = { cmap = ImPlotColormap.Viridis, t = 0.5, col = ImVec4(0, 0, 0, 0), flags = 0, scale = { 0, 100 } }
+    function D.Demo_ColormapWidgets()
+        IMGUI_DEMO_MARKER("Tools/Colormap Widgets")
+        local s = S.Demo_ColormapWidgets
+
+        if ImPlot.ColormapButton("Button", ImVec2(0, 0), s.cmap) then
+            s.cmap = (s.cmap + 1) % ImPlot.GetColormapCount()
+        end
+
+        ImGui.ColorButton("##Display", s.col, G.ImGuiColorEditFlags.NoInputs)
+        ImGui.SameLine()
+        s.t = ImPlot.ColormapSlider("Slider", s.t, s.col, "%.3f", s.cmap)
+
+        ImPlot.ColormapIcon(s.cmap); ImGui.SameLine(); ImGui.Text("Icon")
+
+        ImPlot.ColormapScale("Scale", s.scale[1], s.scale[2], ImVec2(0, 0), "%g dB", s.flags, s.cmap)
+        ImGui.InputFloat2("Scale", s.scale)
+        local ImPlotColormapScaleFlags = ImPlot.ImPlotColormapScaleFlags
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotColormapScaleFlags_NoLabel", ImPlotColormapScaleFlags.NoLabel)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotColormapScaleFlags_Opposite", ImPlotColormapScaleFlags.Opposite)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotColormapScaleFlags_Invert", ImPlotColormapScaleFlags.Invert)
+    end
+
+    S.Demo_CustomPlottersAndTooltips = {
+        tooltip = true,
+        bullCol = ImVec4(0.000, 1.000, 0.441, 1.000),
+        bearCol = ImVec4(0.853, 0.050, 0.310, 1.000),
+        dates = { 1546300800,1546387200,1546473600,1546560000,1546819200,1546905600,1546992000,1547078400,1547164800,1547424000,1547510400,1547596800,1547683200,1547769600,1547942400,1548028800,1548115200,1548201600,1548288000,1548374400,1548633600,1548720000,1548806400,1548892800,1548979200,1549238400,1549324800,1549411200,1549497600,1549584000,1549843200,1549929600,1550016000,1550102400,1550188800,1550361600,1550448000,1550534400,1550620800,1550707200,1550793600,1551052800,1551139200,1551225600,1551312000,1551398400,1551657600,1551744000,1551830400,1551916800,1552003200,1552262400,1552348800,1552435200,1552521600,1552608000,1552867200,1552953600,1553040000,1553126400,1553212800,1553472000,1553558400,1553644800,1553731200,1553817600,1554076800,1554163200,1554249600,1554336000,1554422400,1554681600,1554768000,1554854400,1554940800,1555027200,1555286400,1555372800,1555459200,1555545600,1555632000,1555891200,1555977600,1556064000,1556150400,1556236800,1556496000,1556582400,1556668800,1556755200,1556841600,1557100800,1557187200,1557273600,1557360000,1557446400,1557705600,1557792000,1557878400,1557964800,1558051200,1558310400,1558396800,1558483200,1558569600,1558656000,1558828800,1558915200,1559001600,1559088000,1559174400,1559260800,1559520000,1559606400,1559692800,1559779200,1559865600,1560124800,1560211200,1560297600,1560384000,1560470400,1560729600,1560816000,1560902400,1560988800,1561075200,1561334400,1561420800,1561507200,1561593600,1561680000,1561939200,1562025600,1562112000,1562198400,1562284800,1562544000,1562630400,1562716800,1562803200,1562889600,1563148800,1563235200,1563321600,1563408000,1563494400,1563753600,1563840000,1563926400,1564012800,1564099200,1564358400,1564444800,1564531200,1564617600,1564704000,1564963200,1565049600,1565136000,1565222400,1565308800,1565568000,1565654400,1565740800,1565827200,1565913600,1566172800,1566259200,1566345600,1566432000,1566518400,1566777600,1566864000,1566950400,1567036800,1567123200,1567296000,1567382400,1567468800,1567555200,1567641600,1567728000,1567987200,1568073600,1568160000,1568246400,1568332800,1568592000,1568678400,1568764800,1568851200,1568937600,1569196800,1569283200,1569369600,1569456000,1569542400,1569801600,1569888000,1569974400,1570060800,1570147200,1570406400,1570492800,1570579200,1570665600,1570752000,1571011200,1571097600,1571184000,1571270400,1571356800,1571616000,1571702400,1571788800,1571875200,1571961600 },
+        opens = { 1284.7,1319.9,1318.7,1328,1317.6,1321.6,1314.3,1325,1319.3,1323.1,1324.7,1321.3,1323.5,1322,1281.3,1281.95,1311.1,1315,1314,1313.1,1331.9,1334.2,1341.3,1350.6,1349.8,1346.4,1343.4,1344.9,1335.6,1337.9,1342.5,1337,1338.6,1337,1340.4,1324.65,1324.35,1349.5,1371.3,1367.9,1351.3,1357.8,1356.1,1356,1347.6,1339.1,1320.6,1311.8,1314,1312.4,1312.3,1323.5,1319.1,1327.2,1332.1,1320.3,1323.1,1328,1330.9,1338,1333,1335.3,1345.2,1341.1,1332.5,1314,1314.4,1310.7,1314,1313.1,1315,1313.7,1320,1326.5,1329.2,1314.2,1312.3,1309.5,1297.4,1293.7,1277.9,1295.8,1295.2,1290.3,1294.2,1298,1306.4,1299.8,1302.3,1297,1289.6,1302,1300.7,1303.5,1300.5,1303.2,1306,1318.7,1315,1314.5,1304.1,1294.7,1293.7,1291.2,1290.2,1300.4,1284.2,1284.25,1301.8,1295.9,1296.2,1304.4,1323.1,1340.9,1341,1348,1351.4,1351.4,1343.5,1342.3,1349,1357.6,1357.1,1354.7,1361.4,1375.2,1403.5,1414.7,1433.2,1438,1423.6,1424.4,1418,1399.5,1435.5,1421.25,1434.1,1412.4,1409.8,1412.2,1433.4,1418.4,1429,1428.8,1420.6,1441,1460.4,1441.7,1438.4,1431,1439.3,1427.4,1431.9,1439.5,1443.7,1425.6,1457.5,1451.2,1481.1,1486.7,1512.1,1515.9,1509.2,1522.3,1513,1526.6,1533.9,1523,1506.3,1518.4,1512.4,1508.8,1545.4,1537.3,1551.8,1549.4,1536.9,1535.25,1537.95,1535.2,1556,1561.4,1525.6,1516.4,1507,1493.9,1504.9,1506.5,1513.1,1506.5,1509.7,1502,1506.8,1521.5,1529.8,1539.8,1510.9,1511.8,1501.7,1478,1485.4,1505.6,1511.6,1518.6,1498.7,1510.9,1510.8,1498.3,1492,1497.7,1484.8,1494.2,1495.6,1495.6,1487.5,1491.1,1495.1,1506.4 },
+        highs = { 1284.75,1320.6,1327,1330.8,1326.8,1321.6,1326,1328,1325.8,1327.1,1326,1326,1323.5,1322.1,1282.7,1282.95,1315.8,1316.3,1314,1333.2,1334.7,1341.7,1353.2,1354.6,1352.2,1346.4,1345.7,1344.9,1340.7,1344.2,1342.7,1342.1,1345.2,1342,1350,1324.95,1330.75,1369.6,1374.3,1368.4,1359.8,1359,1357,1356,1353.4,1340.6,1322.3,1314.1,1316.1,1312.9,1325.7,1323.5,1326.3,1336,1332.1,1330.1,1330.4,1334.7,1341.1,1344.2,1338.8,1348.4,1345.6,1342.8,1334.7,1322.3,1319.3,1314.7,1316.6,1316.4,1315,1325.4,1328.3,1332.2,1329.2,1316.9,1312.3,1309.5,1299.6,1296.9,1277.9,1299.5,1296.2,1298.4,1302.5,1308.7,1306.4,1305.9,1307,1297.2,1301.7,1305,1305.3,1310.2,1307,1308,1319.8,1321.7,1318.7,1316.2,1305.9,1295.8,1293.8,1293.7,1304.2,1302,1285.15,1286.85,1304,1302,1305.2,1323,1344.1,1345.2,1360.1,1355.3,1363.8,1353,1344.7,1353.6,1358,1373.6,1358.2,1369.6,1377.6,1408.9,1425.5,1435.9,1453.7,1438,1426,1439.1,1418,1435,1452.6,1426.65,1437.5,1421.5,1414.1,1433.3,1441.3,1431.4,1433.9,1432.4,1440.8,1462.3,1467,1443.5,1444,1442.9,1447,1437.6,1440.8,1445.7,1447.8,1458.2,1461.9,1481.8,1486.8,1522.7,1521.3,1521.1,1531.5,1546.1,1534.9,1537.7,1538.6,1523.6,1518.8,1518.4,1514.6,1540.3,1565,1554.5,1556.6,1559.8,1541.9,1542.9,1540.05,1558.9,1566.2,1561.9,1536.2,1523.8,1509.1,1506.2,1532.2,1516.6,1519.7,1515,1519.5,1512.1,1524.5,1534.4,1543.3,1543.3,1542.8,1519.5,1507.2,1493.5,1511.4,1525.8,1522.2,1518.8,1515.3,1518,1522.3,1508,1501.5,1503,1495.5,1501.1,1497.9,1498.7,1492.1,1499.4,1506.9,1520.9 },
+        lows = { 1282.85,1315,1318.7,1309.6,1317.6,1312.9,1312.4,1319.1,1319,1321,1318.1,1321.3,1319.9,1312,1280.5,1276.15,1308,1309.9,1308.5,1312.3,1329.3,1333.1,1340.2,1347,1345.9,1338,1340.8,1335,1332,1337.9,1333,1336.8,1333.2,1329.9,1340.4,1323.85,1324.05,1349,1366.3,1351.2,1349.1,1352.4,1350.7,1344.3,1338.9,1316.3,1308.4,1306.9,1309.6,1306.7,1312.3,1315.4,1319,1327.2,1317.2,1320,1323,1328,1323,1327.8,1331.7,1335.3,1336.6,1331.8,1311.4,1310,1309.5,1308,1310.6,1302.8,1306.6,1313.7,1320,1322.8,1311,1312.1,1303.6,1293.9,1293.5,1291,1277.9,1294.1,1286,1289.1,1293.5,1296.9,1298,1299.6,1292.9,1285.1,1288.5,1296.3,1297.2,1298.4,1298.6,1302,1300.3,1312,1310.8,1301.9,1292,1291.1,1286.3,1289.2,1289.9,1297.4,1283.65,1283.25,1292.9,1295.9,1290.8,1304.2,1322.7,1336.1,1341,1343.5,1345.8,1340.3,1335.1,1341.5,1347.6,1352.8,1348.2,1353.7,1356.5,1373.3,1398,1414.7,1427,1416.4,1412.7,1420.1,1396.4,1398.8,1426.6,1412.85,1400.7,1406,1399.8,1404.4,1415.5,1417.2,1421.9,1415,1413.7,1428.1,1434,1435.7,1427.5,1429.4,1423.9,1425.6,1427.5,1434.8,1422.3,1412.1,1442.5,1448.8,1468.2,1484.3,1501.6,1506.2,1498.6,1488.9,1504.5,1518.3,1513.9,1503.3,1503,1506.5,1502.1,1503,1534.8,1535.3,1541.4,1528.6,1525.6,1535.25,1528.15,1528,1542.6,1514.3,1510.7,1505.5,1492.1,1492.9,1496.8,1493.1,1503.4,1500.9,1490.7,1496.3,1505.3,1505.3,1517.9,1507.4,1507.1,1493.3,1470.5,1465,1480.5,1501.7,1501.4,1493.3,1492.1,1505.1,1495.7,1478,1487.1,1480.8,1480.6,1487,1488.3,1484.8,1484,1490.7,1490.4,1503.1 },
+        closes = { 1283.35,1315.3,1326.1,1317.4,1321.5,1317.4,1323.5,1319.2,1321.3,1323.3,1319.7,1325.1,1323.6,1313.8,1282.05,1279.05,1314.2,1315.2,1310.8,1329.1,1334.5,1340.2,1340.5,1350,1347.1,1344.3,1344.6,1339.7,1339.4,1343.7,1337,1338.9,1340.1,1338.7,1346.8,1324.25,1329.55,1369.6,1372.5,1352.4,1357.6,1354.2,1353.4,1346,1341,1323.8,1311.9,1309.1,1312.2,1310.7,1324.3,1315.7,1322.4,1333.8,1319.4,1327.1,1325.8,1330.9,1325.8,1331.6,1336.5,1346.7,1339.2,1334.7,1313.3,1316.5,1312.4,1313.4,1313.3,1312.2,1313.7,1319.9,1326.3,1331.9,1311.3,1313.4,1309.4,1295.2,1294.7,1294.1,1277.9,1295.8,1291.2,1297.4,1297.7,1306.8,1299.4,1303.6,1302.2,1289.9,1299.2,1301.8,1303.6,1299.5,1303.2,1305.3,1319.5,1313.6,1315.1,1303.5,1293,1294.6,1290.4,1291.4,1302.7,1301,1284.15,1284.95,1294.3,1297.9,1304.1,1322.6,1339.3,1340.1,1344.9,1354,1357.4,1340.7,1342.7,1348.2,1355.1,1355.9,1354.2,1362.1,1360.1,1408.3,1411.2,1429.5,1430.1,1426.8,1423.4,1425.1,1400.8,1419.8,1432.9,1423.55,1412.1,1412.2,1412.8,1424.9,1419.3,1424.8,1426.1,1423.6,1435.9,1440.8,1439.4,1439.7,1434.5,1436.5,1427.5,1432.2,1433.3,1441.8,1437.8,1432.4,1457.5,1476.5,1484.2,1519.6,1509.5,1508.5,1517.2,1514.1,1527.8,1531.2,1523.6,1511.6,1515.7,1515.7,1508.5,1537.6,1537.2,1551.8,1549.1,1536.9,1529.4,1538.05,1535.15,1555.9,1560.4,1525.5,1515.5,1511.1,1499.2,1503.2,1507.4,1499.5,1511.5,1513.4,1515.8,1506.2,1515.1,1531.5,1540.2,1512.3,1515.2,1506.4,1472.9,1489,1507.9,1513.8,1512.9,1504.4,1503.9,1512.8,1500.9,1488.7,1497.6,1483.5,1494,1498.3,1494.1,1488.1,1487.5,1495.7,1504.7,1505.3 },
+    }
+    function D.Demo_CustomPlottersAndTooltips()
+        IMGUI_DEMO_MARKER("Custom/Custom Plotters and Tooltips")
+        local s = S.Demo_CustomPlottersAndTooltips
+        ImGui.BulletText("You can create custom plotters or extend ImPlot using implot_internal.h.")
+        _, s.tooltip = ImGui.Checkbox("Show Tooltip", s.tooltip)
+        ImGui.SameLine()
+        ImGui.SameLine(); ImGui.ColorEdit4("##Bull", s.bullCol, G.ImGuiColorEditFlags.NoInputs)
+        ImGui.SameLine(); ImGui.ColorEdit4("##Bear", s.bearCol, G.ImGuiColorEditFlags.NoInputs)
+        ImPlot.GetStyle().UseLocalTime = false
+
+        if ImPlot.BeginPlot("Candlestick Chart", ImVec2(-1, 0)) then
+            ImPlot.SetupAxes(nil, nil, 0, bor(ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.RangeFit))
+            ImPlot.SetupAxesLimits(1546300800, 1571961600, 1250, 1600)
+            ImPlot.SetupAxisScale(ImAxis.X1, ImPlot.ImPlotScale.Time)
+            ImPlot.SetupAxisLimitsConstraints(ImAxis.X1, 1546300800, 1571961600)
+            ImPlot.SetupAxisZoomConstraints(ImAxis.X1, 60 * 60 * 24 * 14, 1571961600 - 1546300800)
+            ImPlot.SetupAxisFormat(ImAxis.Y1, "$%.0f")
+            My.PlotCandlestick("GOOGL", s.dates, s.opens, s.closes, s.lows, s.highs, 218, s.tooltip, 0.25, s.bullCol, s.bearCol)
+            ImPlot.EndPlot()
         end
     end
 

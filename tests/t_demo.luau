@@ -64,7 +64,8 @@ game:GetService("RunService").Stepped:Connect(function()
             "Colorful Stairstep Plot", "Colorful Bar Plot", "Colorful Stem Plots", "Colorful Infinite Lines", "Log Plot",
             "SymLog Plot", "##Time", "Sqrt", "Multi-Axis Plot", "Plot A", "Plot B", "##AxisConstraints", "##EqualAxes",
             "##DataFitting", "##Legend", "##Bezier", "##lines", "##Main", "##rect", "##Centroid", "##Annotations",
-            "##Tags", "##DND1", "##DND2" } do
+            "##Tags", "##DND1", "##DND2", "Polygon Plot", "##spark", "##SpecStyling", "##strideoffset",
+            "##Custom Data", "##Ticks", "seaborn style", "##CustomRend", "Right Click the Legend", "Candlestick Chart" } do
             assert(plotted[p], "plot never began: " .. p)
         end
         for _, p in { "My Subplots", "##ItemSharing", "##AxisLinking" } do
