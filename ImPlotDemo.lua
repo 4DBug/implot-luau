@@ -984,12 +984,699 @@ return function(G, ImPlot)
     end
 
     ---------------------------------------------------------------------------
+
+    S.Demo_MarkersAndText = { spec = nil } -- [Port] created on first use (ImPlotSpec(ImPlotProp_Marker, ImPlotMarker_Auto))
+    function D.Demo_MarkersAndText()
+        IMGUI_DEMO_MARKER("Plots/Markers and Text")
+        local s = S.Demo_MarkersAndText
+        if s.spec == nil then s.spec = ImPlot.ImPlotSpec(ImPlotProp.Marker, ImPlotMarker.Auto) end
+        local spec = s.spec
+        spec.MarkerSize = ImGui.DragFloat("Marker Size", spec.MarkerSize, 0.1, 2.0, 10.0, "%.2f px")
+        spec.LineWeight = ImGui.DragFloat("Marker Weight", spec.LineWeight, 0.05, 0.5, 3.0, "%.2f px")
+
+        if ImPlot.BeginPlot("##MarkerStyles", ImVec2(-1, 0), ImPlotFlags.CanvasOnly) then
+
+            ImPlot.SetupAxes(nil, nil, ImPlotAxisFlags.NoDecorations, ImPlotAxisFlags.NoDecorations)
+            ImPlot.SetupAxesLimits(0, 10, -2, 12)
+
+            local xs = { 1, 4 }
+            local ys = { 10, 11 }
+
+            -- filled markers
+            for m = 0, ImPlotMarker.COUNT - 1 do
+                ImGui.PushID(m)
+                spec.FillAlpha = 1.0
+                ImPlot.PlotLine("##Filled", xs, ys, 2, spec)
+                ImGui.PopID()
+                ys[1] -= 1; ys[2] -= 1
+            end
+            xs[1] = 6; xs[2] = 9; ys[1] = 10; ys[2] = 11
+            -- open markers
+            for m = 0, ImPlotMarker.COUNT - 1 do
+                ImGui.PushID(m)
+                spec.FillAlpha = 0.0
+                ImPlot.PlotLine("##Open", xs, ys, 2, spec)
+                ImGui.PopID()
+                ys[1] -= 1; ys[2] -= 1
+            end
+
+            ImPlot.PlotText("Filled Markers", 2.5, 5.0)
+            ImPlot.PlotText("Open Markers", 7.5, 5.0)
+
+            ImPlot.PushStyleColor(ImPlot.ImPlotCol.InlayText, ImVec4(1, 0, 1, 1))
+            ImPlot.PlotText("Vertical Text", 5.0, 5.0, ImVec2(0, 0), { Flags = ImPlot.ImPlotTextFlags.Vertical })
+            ImPlot.PopStyleColor()
+
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_NaNValues = { include_nan = true, flags = 0 }
+    function D.Demo_NaNValues()
+        IMGUI_DEMO_MARKER("Plots/NaN Values")
+        local s = S.Demo_NaNValues
+
+        local data1 = { 0.0, 0.25, 0.5, 0.75, 1.0 }
+        local data2 = { 0.0, 0.25, 0.5, 0.75, 1.0 }
+
+        if s.include_nan then
+            data1[3] = 0 / 0
+        end
+
+        _, s.include_nan = ImGui.Checkbox("Include NaN", s.include_nan)
+        ImGui.SameLine()
+        _, s.flags = ImGui.CheckboxFlags("Skip NaN", s.flags, ImPlot.ImPlotLineFlags.SkipNaN)
+
+        if ImPlot.BeginPlot("##NaNValues") then
+            ImPlot.PlotLine("line", data1, data2, 5, {
+                Flags = s.flags,
+                Marker = ImPlotMarker.Square,
+            })
+            ImPlot.PlotBars("bars", data1, 5)
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    -- [Port] ImColor::HSV(...) -> ImU32 and ImGui::GetColorU32(SampleColormap(...))
+    local function HSV_U32(h, s, v) return G.ImColor.HSV(h, s, v):U32() end
+    local function Viridis_U32(t) return ImGui.GetColorU32(ImPlot.SampleColormap(t, ImPlotColormap.Viridis)) end
+
+    S.Demo_PerIndexColors = { flags_stairs = 0, data_bars = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, vals1 = { 1.0, 2.5, 4.0, 5.5, 7.0 } }
+    function D.Demo_PerIndexColors()
+        local s = S.Demo_PerIndexColors
+        -- Colorful Lines
+        local xs1, ys1, colors1 = table.create(1001, 0), table.create(1001, 0), table.create(1001, 0)
+        local t = ImGui.GetTime()
+        for i = 0, 1000 do
+            xs1[i + 1] = i * 0.001
+            ys1[i + 1] = 0.5 + 0.5 * math.sin(50 * (xs1[i + 1] + t / 10))
+            -- Rainbow colors for f(x)
+            colors1[i + 1] = HSV_U32(i / 1000.0, 0.8, 0.9)
+        end
+        local xs2, ys2, colors2 = table.create(20, 0), table.create(20, 0), table.create(20, 0)
+        for i = 0, 19 do
+            xs2[i + 1] = i * 1 / 19.0
+            ys2[i + 1] = xs2[i + 1] * xs2[i + 1]
+            -- Colormap colors for g(x)
+            colors2[i + 1] = Viridis_U32(i / 19.0)
+        end
+        if ImPlot.BeginPlot("Colorful Lines") then
+            ImPlot.SetupAxes("x", "y")
+            ImPlot.PlotLine("f(x)", xs1, ys1, 1001, {
+                LineColors = colors1,
+            })
+            ImPlot.PlotLine("g(x)", xs2, ys2, 20, {
+                Marker = ImPlotMarker.Circle,
+                Flags = ImPlot.ImPlotLineFlags.Segments,
+                LineColors = colors2,
+                MarkerFillColors = colors2,
+                MarkerLineColors = colors2,
+            })
+            ImPlot.EndPlot()
+        end
+
+        -- Colorful Shaded Plots
+        local xs_shaded, ys_shaded = table.create(1001, 0), table.create(1001, 0)
+        local ys1_shaded, ys2_shaded, ys3_shaded, ys4_shaded = table.create(1001, 0), table.create(1001, 0), table.create(1001, 0), table.create(1001, 0)
+        local colors_shaded1, colors_shaded2 = table.create(1001, 0), table.create(1001, 0)
+        math.randomseed(0)
+        for i = 1, 1001 do
+            xs_shaded[i]  = (i - 1) * 0.001
+            ys_shaded[i]  = 0.25 + 0.25 * math.sin(25 * xs_shaded[i]) * math.sin(5 * xs_shaded[i]) + RandomRange(-0.01, 0.01)
+            ys1_shaded[i] = ys_shaded[i] + RandomRange(0.1, 0.12)
+            ys2_shaded[i] = ys_shaded[i] - RandomRange(0.1, 0.12)
+            ys3_shaded[i] = 0.75 + 0.2 * math.sin(25 * xs_shaded[i])
+            ys4_shaded[i] = 0.75 + 0.1 * math.cos(25 * xs_shaded[i])
+
+            -- Rainbow colors for Uncertain Data
+            colors_shaded1[i] = HSV_U32((i - 1) / 1000.0, 0.8, 0.9)
+
+            -- Colormap colors for Overlapping
+            colors_shaded2[i] = Viridis_U32((i - 1) / 1000.0)
+        end
+        local fill_alpha = 0.25 -- [Port] static ImPlotSpec spec_shaded(ImPlotProp_FillAlpha, 0.25f): only FillAlpha is read
+
+        if ImPlot.BeginPlot("Colorful Shaded Plots") then
+            ImPlot.SetupLegend(ImPlotLocation.NorthWest, ImPlotLegendFlags.Reverse)
+            ImPlot.PlotShaded("Uncertain Data", xs_shaded, ys1_shaded, ys2_shaded, 1001, {
+                FillColors = colors_shaded1,
+                FillAlpha = fill_alpha,
+            })
+            ImPlot.PlotLine("Uncertain Data", xs_shaded, ys_shaded, 1001, {
+                LineColors = colors_shaded1,
+            })
+            ImPlot.PlotShaded("Overlapping", xs_shaded, ys3_shaded, ys4_shaded, 1001, {
+                FillColors = colors_shaded2,
+                FillAlpha = fill_alpha,
+            })
+            ImPlot.PlotLine("Overlapping", xs_shaded, ys3_shaded, 1001, {
+                LineColors = colors_shaded2,
+            })
+            ImPlot.PlotLine("Overlapping", xs_shaded, ys4_shaded, 1001, {
+                LineColors = colors_shaded2,
+            })
+            ImPlot.EndPlot()
+        end
+
+        -- Colorful Scatter
+        math.randomseed(0)
+        local xs_scatter1, ys_scatter1 = table.create(100, 0), table.create(100, 0)
+        local colors_scatter1_fill, colors_scatter1_line, sizes_scatter1 = table.create(100, 0), table.create(100, 0), table.create(100, 0)
+        for i = 1, 100 do
+            xs_scatter1[i] = (i - 1) * 0.01
+            ys_scatter1[i] = xs_scatter1[i] + 0.1 * math.random()
+            -- Rainbow hue colors
+            local hue = (i - 1) / 99.0
+            colors_scatter1_fill[i] = HSV_U32(hue, 0.8, 0.9)
+            colors_scatter1_line[i] = HSV_U32(hue, 0.9, 0.7)
+            -- Random sizes between 2 and 6
+            sizes_scatter1[i] = 2.0 + 4.0 * math.random()
+        end
+        local xs_scatter2, ys_scatter2, colors_scatter2, sizes_scatter2 = table.create(50, 0), table.create(50, 0), table.create(50, 0), table.create(50, 0)
+        for i = 1, 50 do
+            xs_scatter2[i] = 0.25 + 0.2 * math.random()
+            ys_scatter2[i] = 0.75 + 0.2 * math.random()
+            -- Colormap colors (Viridis)
+            colors_scatter2[i] = Viridis_U32((i - 1) / 49.0)
+            -- Random sizes between 2 and 6
+            sizes_scatter2[i] = 2.0 + 4.0 * math.random()
+        end
+
+        if ImPlot.BeginPlot("Colorful Scatter", ImVec2(-1, 0)) then
+            ImPlot.PlotScatter("Data 1", xs_scatter1, ys_scatter1, 100, {
+                MarkerFillColors = colors_scatter1_fill,
+                MarkerLineColors = colors_scatter1_line,
+                MarkerSizes = sizes_scatter1,
+            })
+            ImPlot.PlotScatter("Data 2", xs_scatter2, ys_scatter2, 50, {
+                Marker = ImPlotMarker.Square,
+                MarkerFillColors = colors_scatter2,
+                MarkerLineColors = colors_scatter2,
+                MarkerSizes = sizes_scatter2,
+                FillAlpha = 0.5,
+            })
+            ImPlot.EndPlot()
+        end
+
+        -- Colorful Bubbles
+        math.randomseed(0)
+        local xs_bubble, ys1_bubble, ys2_bubble = table.create(20, 0), table.create(20, 0), table.create(20, 0)
+        local szs1_bubble, szs2_bubble = table.create(20, 0), table.create(20, 0)
+        local colors1_bubble, colors2_bubble = table.create(20, 0), table.create(20, 0)
+        for i = 1, 20 do
+            xs_bubble[i] = (i - 1) * 0.1
+            ys1_bubble[i] = math.random()
+            ys2_bubble[i] = math.random()
+
+            szs1_bubble[i] = 0.02 + 0.08 * math.random()
+            szs2_bubble[i] = 0.02 + 0.08 * math.random()
+
+            -- Rainbow colors for Data 1
+            colors1_bubble[i] = HSV_U32((i - 1) / 19.0, 0.8, 0.9)
+
+            -- Colormap colors for Data 2
+            colors2_bubble[i] = Viridis_U32((i - 1) / 19.0)
+        end
+
+        if ImPlot.BeginPlot("Colorful Bubbles", ImVec2(-1, 0), ImPlotFlags.Equal) then
+            ImPlot.PlotBubbles("Data 1", xs_bubble, ys1_bubble, szs1_bubble, 20, {
+                FillAlpha = 0.5,
+                FillColors = colors1_bubble,
+                LineColors = colors1_bubble,
+            })
+            ImPlot.PlotBubbles("Data 2", xs_bubble, ys2_bubble, szs2_bubble, 20, {
+                FillAlpha = 0.5,
+                LineColor = ImVec4(0, 0, 0, 0.0),
+                FillColors = colors2_bubble,
+            })
+
+            ImPlot.EndPlot()
+        end
+
+        -- Colorful Stairstep
+        local ys1_stairs, ys2_stairs = table.create(21, 0), table.create(21, 0)
+        local colors1_stairs, colors2_stairs = table.create(21, 0), table.create(21, 0)
+        for i = 0, 20 do
+            ys1_stairs[i + 1] = 0.75 + 0.2 * math.sin(10 * i * 0.05)
+            ys2_stairs[i + 1] = 0.25 + 0.2 * math.sin(10 * i * 0.05)
+
+            -- Rainbow colors for Post Step
+            colors1_stairs[i + 1] = HSV_U32(i / 20.0, 0.8, 0.9)
+
+            -- Colormap colors for Pre Step
+            colors2_stairs[i + 1] = Viridis_U32(i / 20.0)
+        end
+        local ImPlotStairsFlags = ImPlot.ImPlotStairsFlags
+        s.flags_stairs = CHECKBOX_FLAG(s.flags_stairs, "ImPlotStairsFlags_Shaded", ImPlotStairsFlags.Shaded)
+
+        if ImPlot.BeginPlot("Colorful Stairstep Plot") then
+            ImPlot.SetupAxes("x", "f(x)")
+            ImPlot.SetupAxesLimits(0, 1, 0, 1)
+            ImPlot.PlotLine("##1", ys1_stairs, 21, 0.05, 0, {
+                LineColor = ImVec4(0.5, 0.5, 0.5, 1.0),
+            })
+            ImPlot.PlotLine("##2", ys2_stairs, 21, 0.05, 0, {
+                LineColor = ImVec4(0.5, 0.5, 0.5, 1.0),
+            })
+
+            ImPlot.PlotStairs("Post Step (default)", ys1_stairs, 21, 0.05, 0, {
+                Flags = s.flags_stairs,
+                FillAlpha = 0.25,
+                Marker = ImPlotMarker.Auto,
+                LineColors = colors1_stairs,
+                FillColors = colors1_stairs,
+                MarkerFillColors = colors1_stairs,
+                MarkerLineColors = colors1_stairs,
+            })
+
+            ImPlot.PlotStairs("Pre Step", ys2_stairs, 21, 0.05, 0, {
+                Flags = bor(s.flags_stairs, ImPlotStairsFlags.PreStep),
+                FillAlpha = 0.25,
+                Marker = ImPlotMarker.Auto,
+                LineColors = colors2_stairs,
+                FillColors = colors2_stairs,
+                MarkerFillColors = colors2_stairs,
+                MarkerLineColors = colors2_stairs,
+            })
+
+            ImPlot.EndPlot()
+        end
+
+        -- Colorful Bar Plots
+        local data_bars = s.data_bars
+        local colors_bars_v, colors_bars_h = table.create(10, 0), table.create(10, 0)
+        for i = 0, 9 do
+            -- Rainbow colors for Vertical
+            colors_bars_v[i + 1] = HSV_U32(i / 9.0, 0.8, 0.9)
+
+            -- Colormap colors for Horizontal
+            colors_bars_h[i + 1] = Viridis_U32(i / 9.0)
+        end
+
+        if ImPlot.BeginPlot("Colorful Bar Plot") then
+            ImPlot.PlotBars("Vertical", data_bars, 10, 0.7, 1, {
+                FillColors = colors_bars_v,
+                LineColors = colors_bars_v,
+            })
+            ImPlot.PlotBars("Horizontal", data_bars, 10, 0.4, 1, {
+                Flags = ImPlot.ImPlotBarsFlags.Horizontal,
+                FillColors = colors_bars_h,
+                LineColors = colors_bars_h,
+            })
+            ImPlot.EndPlot()
+        end
+
+        -- Colorful Stem Plots
+        local xs_stems, ys1_stems, ys2_stems = table.create(51, 0), table.create(51, 0), table.create(51, 0)
+        local colors1_stems, colors2_stems = table.create(51, 0), table.create(51, 0)
+        for i = 0, 50 do
+            local x = i * 0.02
+            xs_stems[i + 1] = x
+            ys1_stems[i + 1] = 1.0 + 0.5 * math.sin(25 * x) * math.cos(2 * x)
+            ys2_stems[i + 1] = 0.5 + 0.25 * math.sin(10 * x) * math.sin(x)
+
+            -- Rainbow colors for Stems 1
+            colors1_stems[i + 1] = HSV_U32(i / 50.0, 0.8, 0.9)
+
+            -- Colormap colors for Stems 2
+            colors2_stems[i + 1] = Viridis_U32(i / 50.0)
+        end
+
+        if ImPlot.BeginPlot("Colorful Stem Plots") then
+            ImPlot.SetupAxisLimits(ImAxis.X1, 0, 1.0)
+            ImPlot.SetupAxisLimits(ImAxis.Y1, 0, 1.6)
+            ImPlot.PlotStems("Stems 1", xs_stems, ys1_stems, 51, 0, {
+                LineColors = colors1_stems,
+                MarkerFillColors = colors1_stems,
+                MarkerLineColors = colors1_stems,
+            })
+            ImPlot.PlotStems("Stems 2", xs_stems, ys2_stems, 51, 0, {
+                Marker = ImPlotMarker.Circle,
+                LineColors = colors2_stems,
+                MarkerFillColors = colors2_stems,
+                MarkerLineColors = colors2_stems,
+            })
+            ImPlot.EndPlot()
+        end
+
+        -- Colorful Infinite Lines
+        if ImPlot.BeginPlot("Colorful Infinite Lines", ImVec2(-1, 0)) then
+            ImPlot.SetupAxes("x", "y")
+            ImPlot.SetupAxesLimits(0, 10, -1, 10)
+
+            -- 1. Constant color infinite lines
+            ImPlot.PlotInfLines("Const Color", s.vals1, 5, {
+                LineColor = ImVec4(0.0, 0.7, 1.0, 1.0),
+            })
+
+            -- 2. Per-line rainbow colors (horizontal)
+            local vals2, colors_infline_rainbow = table.create(8, 0), table.create(8, 0)
+            for i = 0, 7 do
+                vals2[i + 1] = 1.0 + i * 1.0
+                colors_infline_rainbow[i + 1] = ImGui.GetColorU32(ImPlot.SampleColormap(i / 7.0, ImPlotColormap.Jet))
+            end
+            ImPlot.PlotInfLines("Rainbow Horizontal", vals2, 8, {
+                LineColors = colors_infline_rainbow,
+                Flags = ImPlot.ImPlotInfLinesFlags.Horizontal,
+            })
+
+            -- 3. Per-line colormap colors (vertical)
+            local vals3, colors_infline_viridis = table.create(6, 0), table.create(6, 0)
+            for i = 0, 5 do
+                vals3[i + 1] = 1.5 + i * 1.5
+                colors_infline_viridis[i + 1] = ImGui.GetColorU32(ImPlot.SampleColormap(i / 5.0, ImPlotColormap.Plasma))
+            end
+            ImPlot.PlotInfLines("Plasma Vertical", vals3, 6, {
+                LineColors = colors_infline_viridis,
+            })
+
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_LogScale = { xs = table.create(1001, 0), ys1 = table.create(1001, 0), ys2 = table.create(1001, 0), ys3 = table.create(1001, 0) }
+    function D.Demo_LogScale()
+        IMGUI_DEMO_MARKER("Axes/Log Scale")
+        local s = S.Demo_LogScale
+        local xs, ys1, ys2, ys3 = s.xs, s.ys1, s.ys2, s.ys3
+        for i = 1, 1001 do
+            xs[i]  = (i - 1) * 0.1
+            ys1[i] = math.sin(xs[i]) + 1
+            ys2[i] = math.log(xs[i])
+            ys3[i] = math.pow(10.0, xs[i])
+        end
+        if ImPlot.BeginPlot("Log Plot", ImVec2(-1, 0)) then
+            ImPlot.SetupAxisScale(ImAxis.X1, ImPlot.ImPlotScale.Log10)
+            ImPlot.SetupAxesLimits(0.1, 100, 0, 10)
+            ImPlot.PlotLine("f(x) = x",        xs, xs,  1001)
+            ImPlot.PlotLine("f(x) = sin(x)+1", xs, ys1, 1001)
+            ImPlot.PlotLine("f(x) = log(x)",   xs, ys2, 1001)
+            ImPlot.PlotLine("f(x) = 10^x",     xs, ys3, 21)
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_SymmetricLogScale = { xs = table.create(1001, 0), ys1 = table.create(1001, 0), ys2 = table.create(1001, 0) }
+    function D.Demo_SymmetricLogScale()
+        IMGUI_DEMO_MARKER("Axes/Symmetric Log Scale")
+        local s = S.Demo_SymmetricLogScale
+        local xs, ys1, ys2 = s.xs, s.ys1, s.ys2
+        for i = 0, 1000 do
+            xs[i + 1]  = i * 0.1 - 50
+            ys1[i + 1] = math.sin(xs[i + 1])
+            ys2[i + 1] = i * 0.002 - 1
+        end
+        if ImPlot.BeginPlot("SymLog Plot", ImVec2(-1, 0)) then
+            ImPlot.SetupAxisScale(ImAxis.X1, ImPlot.ImPlotScale.SymLog)
+            ImPlot.PlotLine("f(x) = a*x+b", xs, ys2, 1001)
+            ImPlot.PlotLine("f(x) = sin(x)", xs, ys1, 1001)
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    -- Huge data used by Time Formatting example (~500 MB allocation!)
+    local HugeTimeData_Size = 60 * 60 * 24 * 366
+    local function HugeTimeData_GetY(t)
+        return 0.5 + 0.25 * math.sin(t / 86400 / 12) + 0.005 * math.sin(t / 3600)
+    end
+    local function HugeTimeData(min)
+        local Ts, Ys = table.create(HugeTimeData_Size), table.create(HugeTimeData_Size)
+        for i = 1, HugeTimeData_Size do
+            Ts[i] = min + (i - 1)
+            Ys[i] = HugeTimeData_GetY(Ts[i])
+        end
+        return { Ts = Ts, Ys = Ys }
+    end
+
+    S.Demo_TimeScale = {
+        t_min = 1609459200, -- 01/01/2021 @ 12:00:00am (UTC)
+        t_max = 1640995200, -- 01/01/2022 @ 12:00:00am (UTC)
+        data = nil,
+    }
+    function D.Demo_TimeScale()
+        IMGUI_DEMO_MARKER("Axes/Time Scale")
+        local s = S.Demo_TimeScale
+        local t_min, t_max = s.t_min, s.t_max
+
+        ImGui.BulletText("When ImPlotAxisFlags_Time is enabled on the X-Axis, values are interpreted as\n" ..
+                            "UNIX timestamps in seconds and axis labels are formated as date/time.")
+        ImGui.BulletText("By default, labels are in UTC time but can be set to use local time instead.")
+
+        local style = ImPlot.GetStyle()
+        _, style.UseLocalTime = ImGui.Checkbox("Local Time", style.UseLocalTime)
+        ImGui.SameLine()
+        _, style.UseISO8601 = ImGui.Checkbox("ISO 8601", style.UseISO8601)
+        ImGui.SameLine()
+        _, style.Use24HourClock = ImGui.Checkbox("24 Hour Clock", style.Use24HourClock)
+
+        if s.data == nil then
+            ImGui.SameLine()
+            if ImGui.Button("Generate Huge Data (~500MB!)") then
+                s.data = HugeTimeData(t_min)
+            end
+        end
+
+        if ImPlot.BeginPlot("##Time", ImVec2(-1, 0)) then
+            ImPlot.SetupAxisScale(ImAxis.X1, ImPlot.ImPlotScale.Time)
+            ImPlot.SetupAxesLimits(t_min, t_max, 0, 1)
+            local data = s.data
+            if data ~= nil then
+                -- downsample our data
+                local limits = ImPlot.GetPlotLimits()
+                local downsample = math.floor(limits.X:Size() / 1000) + 1
+                local start = math.floor(limits.X.Min - t_min)
+                start = math.clamp(start, 0, HugeTimeData_Size - 1)
+                local stop = math.floor(limits.X.Max - t_min) + 1000
+                stop = math.clamp(stop, 0, HugeTimeData_Size - 1)
+                local size = (stop - start) // downsample
+                -- [Port] &data->Ts[start] + Stride: no pointer arithmetic, copy the strided slice instead
+                local ts, ys = table.create(size), table.create(size)
+                for i = 1, size do
+                    local j = start + (i - 1) * downsample + 1
+                    ts[i] = data.Ts[j]
+                    ys[i] = data.Ys[j]
+                end
+                -- plot it
+                ImPlot.PlotLine("Time Series", ts, ys, size)
+            end
+            -- plot time now
+            local t_now = os.time()
+            local y_now = HugeTimeData_GetY(t_now)
+            ImPlot.PlotScatter("Now", { t_now }, { y_now }, 1)
+            ImPlot.Annotation(t_now, y_now, ImPlot.GetLastItemColor(), ImVec2(10, 10), false, "Now")
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    local function TransformForward_Sqrt(v, _data)
+        return math.sqrt(v)
+    end
+
+    local function TransformInverse_Sqrt(v, _data)
+        return v * v
+    end
+
+    S.Demo_CustomScale = { v = table.create(100, 0) }
+    function D.Demo_CustomScale()
+        IMGUI_DEMO_MARKER("Axes/Custom Scale")
+        local v = S.Demo_CustomScale.v
+        for i = 0, 99 do
+            v[i + 1] = i * 0.01
+        end
+        if ImPlot.BeginPlot("Sqrt") then
+            ImPlot.SetupAxis(ImAxis.X1, "Linear")
+            ImPlot.SetupAxis(ImAxis.Y1, "Sqrt")
+            ImPlot.SetupAxisScale(ImAxis.Y1, TransformForward_Sqrt, TransformInverse_Sqrt)
+            ImPlot.SetupAxisLimitsConstraints(ImAxis.Y1, 0, math.huge)
+            ImPlot.PlotLine("##data", v, v, 100)
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_MultipleAxes = {
+        xs = table.create(1001, 0), xs2 = table.create(1001, 0), ys1 = table.create(1001, 0),
+        ys2 = table.create(1001, 0), ys3 = table.create(1001, 0),
+        x2_axis = true, y2_axis = true, y3_axis = true,
+    }
+    function D.Demo_MultipleAxes()
+        IMGUI_DEMO_MARKER("Axes/Multiple Axes")
+        local s = S.Demo_MultipleAxes
+        local xs, xs2, ys1, ys2, ys3 = s.xs, s.xs2, s.ys1, s.ys2, s.ys3
+        for i = 1, 1001 do
+            xs[i]  = (i - 1) * 0.1
+            xs2[i] = xs[i] + 10.0
+            ys1[i] = math.sin(xs[i]) * 3 + 1
+            ys2[i] = math.cos(xs[i]) * 0.2 + 0.5
+            ys3[i] = math.sin(xs[i] + 0.5) * 100 + 200
+        end
+
+        _, s.x2_axis = ImGui.Checkbox("X-Axis 2", s.x2_axis)
+        ImGui.SameLine()
+        _, s.y2_axis = ImGui.Checkbox("Y-Axis 2", s.y2_axis)
+        ImGui.SameLine()
+        _, s.y3_axis = ImGui.Checkbox("Y-Axis 3", s.y3_axis)
+
+        ImGui.BulletText("You can drag axes to the opposite side of the plot.")
+        ImGui.BulletText("Hover over legend items to see which axis they are plotted on.")
+
+        if ImPlot.BeginPlot("Multi-Axis Plot", ImVec2(-1, 0)) then
+            ImPlot.SetupAxes("X-Axis 1", "Y-Axis 1")
+            ImPlot.SetupAxesLimits(0, 100, 0, 10)
+            if s.x2_axis then
+                ImPlot.SetupAxis(ImAxis.X2, "X-Axis 2", ImPlotAxisFlags.AuxDefault)
+                ImPlot.SetupAxisLimits(ImAxis.X2, 0, 100)
+            end
+            if s.y2_axis then
+                ImPlot.SetupAxis(ImAxis.Y2, "Y-Axis 2", ImPlotAxisFlags.AuxDefault)
+                ImPlot.SetupAxisLimits(ImAxis.Y2, 0, 1)
+            end
+            if s.y3_axis then
+                ImPlot.SetupAxis(ImAxis.Y3, "Y-Axis 3", ImPlotAxisFlags.AuxDefault)
+                ImPlot.SetupAxisLimits(ImAxis.Y3, 0, 300)
+            end
+
+            ImPlot.PlotLine("f(x) = x", xs, xs, 1001)
+            if s.x2_axis then
+                ImPlot.SetAxes(ImAxis.X2, ImAxis.Y1)
+                ImPlot.PlotLine("f(x) = sin(x)*3+1", xs2, ys1, 1001)
+            end
+            if s.y2_axis then
+                ImPlot.SetAxes(ImAxis.X1, ImAxis.Y2)
+                ImPlot.PlotLine("f(x) = cos(x)*.2+.5", xs, ys2, 1001)
+            end
+            if s.x2_axis and s.y3_axis then
+                ImPlot.SetAxes(ImAxis.X2, ImAxis.Y3)
+                ImPlot.PlotLine("f(x) = sin(x+.5)*100+200 ", xs2, ys3, 1001)
+            end
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    -- [Port] static ImPlotRect lims: link refs (tables whose [1] holds the value) replace &lims.X.Min etc.
+    S.Demo_LinkedAxes = { xmin = { 0 }, xmax = { 1 }, ymin = { 0 }, ymax = { 1 }, linkx = true, linky = true }
+    function D.Demo_LinkedAxes()
+        IMGUI_DEMO_MARKER("Axes/Linked Axes")
+        local s = S.Demo_LinkedAxes
+        local data = { 0, 1 }
+        _, s.linkx = ImGui.Checkbox("Link X", s.linkx)
+        ImGui.SameLine()
+        _, s.linky = ImGui.Checkbox("Link Y", s.linky)
+
+        local lims = { s.xmin[1], s.xmax[1], s.ymin[1], s.ymax[1] }
+        ImGui.DragScalarN("Limits", G.ImGuiDataType.Double, lims, 4, 0.01)
+        s.xmin[1], s.xmax[1], s.ymin[1], s.ymax[1] = lims[1], lims[2], lims[3], lims[4]
+
+        if ImPlot.BeginAlignedPlots("AlignedGroup") then
+            for _, title in { "Plot A", "Plot B" } do
+                if ImPlot.BeginPlot(title) then
+                    ImPlot.SetupAxisLinks(ImAxis.X1, s.linkx and s.xmin or nil, s.linkx and s.xmax or nil)
+                    ImPlot.SetupAxisLinks(ImAxis.Y1, s.linky and s.ymin or nil, s.linky and s.ymax or nil)
+                    ImPlot.PlotLine("Line", data, 2)
+                    ImPlot.EndPlot()
+                end
+            end
+            ImPlot.EndAlignedPlots()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_AxisConstraints = { limits = { -10, 10 }, zoom = { 1, 20 }, flags = 0 } -- [Port] constraints[4] -> two DragFloat2 arrays
+    function D.Demo_AxisConstraints()
+        IMGUI_DEMO_MARKER("Axes/Axis Constraints")
+        local s = S.Demo_AxisConstraints
+        ImGui.DragFloat2("Limits Constraints", s.limits, 0.01)
+        ImGui.DragFloat2("Zoom Constraints", s.zoom, 0.01)
+        s.flags = CHECKBOX_FLAG(s.flags, "ImPlotAxisFlags_PanStretch", ImPlotAxisFlags.PanStretch)
+        if ImPlot.BeginPlot("##AxisConstraints", ImVec2(-1, 0)) then
+            ImPlot.SetupAxes("X", "Y", s.flags, s.flags)
+            ImPlot.SetupAxesLimits(-1, 1, -1, 1)
+            ImPlot.SetupAxisLimitsConstraints(ImAxis.X1, s.limits[1], s.limits[2])
+            ImPlot.SetupAxisZoomConstraints(ImAxis.X1, s.zoom[1], s.zoom[2])
+            ImPlot.SetupAxisLimitsConstraints(ImAxis.Y1, s.limits[1], s.limits[2])
+            ImPlot.SetupAxisZoomConstraints(ImAxis.Y1, s.zoom[1], s.zoom[2])
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_EqualAxes = { xs1 = table.create(360, 0), ys1 = table.create(360, 0), xs2 = { -1, 0, 1, 0, -1 }, ys2 = { 0, 1, 0, -1, 0 } }
+    function D.Demo_EqualAxes()
+        IMGUI_DEMO_MARKER("Axes/Equal Axes")
+        local s = S.Demo_EqualAxes
+        ImGui.BulletText("Equal constraint applies to axis pairs (e.g ImAxis_X1/Y1, ImAxis_X2/Y2)")
+        for i = 0, 359 do
+            local angle = i * 2 * math.pi / 359.0
+            s.xs1[i + 1] = math.cos(angle); s.ys1[i + 1] = math.sin(angle)
+        end
+        if ImPlot.BeginPlot("##EqualAxes", ImVec2(-1, 0), ImPlotFlags.Equal) then
+            ImPlot.SetupAxis(ImAxis.X2, nil, ImPlotAxisFlags.AuxDefault)
+            ImPlot.SetupAxis(ImAxis.Y2, nil, ImPlotAxisFlags.AuxDefault)
+            ImPlot.PlotLine("Circle", s.xs1, s.ys1, 360)
+            ImPlot.SetAxes(ImAxis.X2, ImAxis.Y2)
+            ImPlot.PlotLine("Diamond", s.xs2, s.ys2, 5)
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
+
+    S.Demo_AutoFittingData = {
+        xflags = ImPlotAxisFlags.None,
+        yflags = bor(ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.RangeFit),
+        data = table.create(101, 0),
+    }
+    function D.Demo_AutoFittingData()
+        IMGUI_DEMO_MARKER("Axes/Auto-Fitting Data")
+        local s = S.Demo_AutoFittingData
+        ImGui.BulletText("The Y-axis has been configured to auto-fit to only the data visible in X-axis range.")
+        ImGui.BulletText("Zoom and pan the X-axis. Disable Stems to see a difference in fit.")
+        ImGui.BulletText("If ImPlotAxisFlags_RangeFit is disabled, the axis will fit ALL data.")
+
+        ImGui.TextUnformatted("X: "); ImGui.SameLine()
+        _, s.xflags = ImGui.CheckboxFlags("ImPlotAxisFlags_AutoFit##X", s.xflags, ImPlotAxisFlags.AutoFit); ImGui.SameLine()
+        _, s.xflags = ImGui.CheckboxFlags("ImPlotAxisFlags_RangeFit##X", s.xflags, ImPlotAxisFlags.RangeFit)
+
+        ImGui.TextUnformatted("Y: "); ImGui.SameLine()
+        _, s.yflags = ImGui.CheckboxFlags("ImPlotAxisFlags_AutoFit##Y", s.yflags, ImPlotAxisFlags.AutoFit); ImGui.SameLine()
+        _, s.yflags = ImGui.CheckboxFlags("ImPlotAxisFlags_RangeFit##Y", s.yflags, ImPlotAxisFlags.RangeFit)
+
+        local data = s.data
+        for i = 0, 100 do
+            data[i + 1] = 1 + math.sin(i / 10.0)
+        end
+
+        if ImPlot.BeginPlot("##DataFitting") then
+            ImPlot.SetupAxes("X", "Y", s.xflags, s.yflags)
+            ImPlot.PlotLine("Line", data, 101)
+            ImPlot.PlotStems("Stems", data, 101)
+            ImPlot.EndPlot()
+        end
+    end
+
+    ---------------------------------------------------------------------------
     -- [Port] TODO: the remaining demos are not ported yet; stubs show a placeholder
     ---------------------------------------------------------------------------
 
     for _, name in {
-        "MarkersAndText", "NaNValues", "PerIndexColors", "LogScale", "SymmetricLogScale", "TimeScale", "CustomScale",
-        "MultipleAxes", "TickLabels", "LinkedAxes", "AxisConstraints", "EqualAxes", "AutoFittingData", "SubplotsSizing",
+        "TickLabels", "SubplotsSizing",
         "SubplotItemSharing", "SubplotAxisLinking", "Tables", "LegendOptions", "LegendPopups", "DragPoints", "DragLines",
         "DragRects", "Querying", "Annotations", "Tags", "DragAndDrop", "ColormapWidgets", "ItemStylingAndSpec",
         "OffsetAndStride", "CustomStyles", "CustomDataAndGetters", "CustomRendering", "CustomPlottersAndTooltips",

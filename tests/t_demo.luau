@@ -49,10 +49,14 @@ game:GetService("RunService").Stepped:Connect(function()
     if frame == 100 then
         done = true
         for _, t in tabs do assert(seen[t], "tab never opened: " .. t) end
-        -- every ported Plots/Config demo submitted its plot
+        -- every ported Plots/Axes/Config demo submitted its plot
         for _, p in { "Line Plots", "Stock Prices", "Shaded Plots", "Scatter Plot", "Bubble Plot", "##Scrolling", "##Rolling",
             "Stairstep Plot", "Bar Plot", "Bar Group", "PolitiFact: Who Lies More?", "##ErrorBars", "Stem Plots", "##Infinite",
-            "##Pie1", "##Pie2", "##Heatmap1", "##Heatmap2", "##Histograms", "##Hist2D", "##Digital", "##image", "Preview" } do
+            "##Pie1", "##Pie2", "##Heatmap1", "##Heatmap2", "##Histograms", "##Hist2D", "##Digital", "##image", "Preview",
+            "##MarkerStyles", "##NaNValues", "Colorful Lines", "Colorful Shaded Plots", "Colorful Scatter", "Colorful Bubbles",
+            "Colorful Stairstep Plot", "Colorful Bar Plot", "Colorful Stem Plots", "Colorful Infinite Lines", "Log Plot",
+            "SymLog Plot", "##Time", "Sqrt", "Multi-Axis Plot", "Plot A", "Plot B", "##AxisConstraints", "##EqualAxes",
+            "##DataFitting" } do
             assert(plotted[p], "plot never began: " .. p)
         end
         ImPlot.DestroyContext()
