@@ -872,8 +872,78 @@ return function(G)
                 Plots = G.ImPool(function() return internal.ImPlotPlot() end),
                 CurrentAlignmentH = nil,
                 CurrentAlignmentV = nil,
-                -- [Port] TODO: NextPlotData, NextItemData, Annotations, Tags, Subplots (later milestones)
+                -- Temp data for general use
+                OpenContextThisFrame = false,
+                -- [Port] TODO: NextItemData, Annotations, Tags, Subplots (later milestones)
+                NextPlotData = internal.ImPlotNextPlotData(),
+                InputMap = ImPlot.ImPlotInputMap(),
             }
+        end
+
+        -- Temporary data storage for upcoming plot
+        -- [Port] LinkedMin/LinkedMax are link refs: tables whose [1] holds the linked value (replaces double*)
+        local NextPlotDataMT = {}
+        NextPlotDataMT.__index = NextPlotDataMT
+        function internal.ImPlotNextPlotData()
+            local d = setmetatable({ RangeCond = {}, Range = {}, HasRange = {}, Fit = {}, LinkedMin = {}, LinkedMax = {} }, NextPlotDataMT)
+            for i = 0, ImPlot.ImAxis.COUNT - 1 do
+                d.RangeCond[i] = ImPlot.ImPlotCond.None
+                d.Range[i]     = ImPlot.ImPlotRange(0, 0)
+            end
+            d:Reset()
+            return d
+        end
+        function NextPlotDataMT:Reset()
+            for i = 0, ImPlot.ImAxis.COUNT - 1 do
+                self.HasRange[i]  = false
+                self.Fit[i]       = false
+                self.LinkedMin[i] = nil
+                self.LinkedMax[i] = nil
+            end
+        end
+
+        -- Input mapping structure. Default values listed. See also MapInputDefault, MapInputReverse.
+        function ImPlot.ImPlotInputMap()
+            local map = {}
+            ImPlot.MapInputDefault(map)
+            return map
+        end
+
+        function ImPlot.GetInputMap()
+            IM_ASSERT(GImPlot ~= nil, "No current context. Did you call ImPlot::CreateContext() or ImPlot::SetCurrentContext()?")
+            return GImPlot.InputMap
+        end
+
+        function ImPlot.MapInputDefault(dst)
+            local map = dst or ImPlot.GetInputMap()
+            map.Pan           = G.ImGuiMouseButton.Left
+            map.PanMod        = G.ImGuiMod_None
+            map.Fit           = G.ImGuiMouseButton.Left
+            map.Menu          = G.ImGuiMouseButton.Right
+            map.Select        = G.ImGuiMouseButton.Right
+            map.SelectMod     = G.ImGuiMod_None
+            map.SelectCancel  = G.ImGuiMouseButton.Left
+            map.SelectHorzMod = G.ImGuiMod_Alt
+            map.SelectVertMod = G.ImGuiMod_Shift
+            map.OverrideMod   = G.ImGuiMod_Ctrl
+            map.ZoomMod       = G.ImGuiMod_None
+            map.ZoomRate      = 0.1
+        end
+
+        function ImPlot.MapInputReverse(dst)
+            local map = dst or ImPlot.GetInputMap()
+            map.Pan           = G.ImGuiMouseButton.Right
+            map.PanMod        = G.ImGuiMod_None
+            map.Fit           = G.ImGuiMouseButton.Left
+            map.Menu          = G.ImGuiMouseButton.Right
+            map.Select        = G.ImGuiMouseButton.Left
+            map.SelectMod     = G.ImGuiMod_None
+            map.SelectCancel  = G.ImGuiMouseButton.Right
+            map.SelectHorzMod = G.ImGuiMod_Alt
+            map.SelectVertMod = G.ImGuiMod_Shift
+            map.OverrideMod   = G.ImGuiMod_Ctrl
+            map.ZoomMod       = G.ImGuiMod_None
+            map.ZoomRate      = 0.1
         end
 
         function ImPlot.CreateContext()
@@ -1388,7 +1458,34 @@ return function(G)
         function AxisMT:IsInputLocked()    return self:IsLocked() or self:IsAutoFitting() end
         function AxisMT:HasMenus()         return not ImHasFlag(self.Flags, ImPlotAxisFlags.NoMenus) end
 
-        -- [Port] TODO: IsPanLocked, PushLinks/PullLinks (input / linked axes milestones)
+        function AxisMT:IsPanLocked(increasing)
+            if ImHasFlag(self.Flags, ImPlotAxisFlags.PanStretch) then
+                return self:IsInputLocked()
+            end
+            if self:IsLockedMin() or self:IsLockedMax() or self:IsAutoFitting() then
+                return false
+            end
+            if increasing then
+                return self.Range.Max == self.ConstraintRange.Max
+            end
+            return self.Range.Min == self.ConstraintRange.Min
+        end
+
+        -- [Port] LinkedMin/LinkedMax are link refs (tables whose [1] holds the value) instead of double*
+        function AxisMT:PushLinks()
+            if self.LinkedMin then self.LinkedMin[1] = self.Range.Min end
+            if self.LinkedMax then self.LinkedMax[1] = self.Range.Max end
+        end
+
+        function AxisMT:PullLinks()
+            if self.LinkedMin and self.LinkedMax then
+                self:SetRange(self.LinkedMin[1], self.LinkedMax[1])
+            elseif self.LinkedMin then
+                self:SetMin(self.LinkedMin[1], true)
+            elseif self.LinkedMax then
+                self:SetMax(self.LinkedMax[1], true)
+            end
+        end
 
         -- Holds Plot state information that must persist after EndPlot
         -- [Port] Axes is indexed by 0-based ImAxis values; Title/axis labels are stored as strings (no TextBuffer).
@@ -1580,6 +1677,8 @@ return function(G)
         local GetStyleColorVec4 = internal.GetStyleColorVec4
         local IM_COL32_BLACK_TRANS = G.IM_COL32_BLACK_TRANS
         local ImRect = G.ImRect
+        local HUGE_VAL = math.huge
+        local DBL_EPSILON = 2.220446049250313e-16
 
         -- [Port] scratch vector reused for text positions (AddText copies the position)
         local tmp_pos = ImVec2(0, 0)
@@ -1645,7 +1744,9 @@ return function(G)
         end
 
         function internal.ResetCtxForNextPlot(ctx)
-            -- [Port] TODO: NextPlotData/NextItemData/Annotations/Tags/digital counters (later milestones)
+            -- [Port] TODO: NextItemData/Annotations/Tags/digital counters (later milestones)
+            -- reset legend items
+            ctx.NextPlotData:Reset()
             ctx.OpenContextThisFrame = false
             -- nullify plot
             ctx.CurrentPlot  = nil
@@ -1852,16 +1953,562 @@ return function(G)
         local RenderGridLinesX = internal.RenderGridLinesX
         local RenderGridLinesY = internal.RenderGridLinesY
 
+        -----------------------------------------------------------------------
+        -- Context Menu
+        -----------------------------------------------------------------------
+
+        -- [Port] DragFloat<double> -> ImGui.DragScalar(Double); returns (value, changed)
+        local function DragFloat(label, v, v_speed, v_min, v_max)
+            return ImGui.DragScalar(label, G.ImGuiDataType.Double, v, v_speed, v_min, v_max, "%.3g", 1)
+        end
+
+        local function BeginDisabledControls(cond)
+            if cond then
+                ImGui.PushItemFlag(G.ImGuiItemFlags.Disabled, true)
+                ImGui.PushStyleVar(G.ImGuiStyleVar.Alpha, ImGui.GetStyle().Alpha * 0.25)
+            end
+        end
+
+        local function EndDisabledControls(cond)
+            if cond then
+                ImGui.PopItemFlag()
+                ImGui.PopStyleVar()
+            end
+        end
+
+        local function ImFlipFlag(flags, flag)
+            if ImHasFlag(flags, flag) then
+                return bit32.band(flags, bit32.bnot(flag))
+            end
+            return bit32.bor(flags, flag)
+        end
+
+        -- [Port] TODO: time scale branch (Min Time / Max Time pickers)
+        function internal.ShowAxisContextMenu(axis, equal_axis, _time_allowed)
+            ImGui.PushItemWidth(75)
+            local always_locked = axis:IsRangeLocked() or axis:IsAutoFitting()
+            local label         = axis:HasLabel()
+            local grid          = axis:HasGridLines()
+            local ticks         = axis:HasTickMarks()
+            local labels        = axis:HasTickLabels()
+            local drag_speed    = 0.01 * axis.Range:Size()
+            if axis.Range:Size() <= DBL_EPSILON then
+                drag_speed = DBL_EPSILON * 1.0e+13 -- recover from almost equal axis limits.
+            end
+            local _
+
+            BeginDisabledControls(always_locked)
+            _, axis.Flags = ImGui.CheckboxFlags("##LockMin", axis.Flags, ImPlotAxisFlags.LockMin)
+            EndDisabledControls(always_locked)
+            ImGui.SameLine()
+            local dis_min = axis:IsLockedMin() or always_locked
+            BeginDisabledControls(dis_min)
+            local temp_min, changed_min = DragFloat("Min", axis.Range.Min, drag_speed, -HUGE_VAL, axis.Range.Max - DBL_EPSILON)
+            if changed_min then
+                axis:SetMin(temp_min, true)
+                if equal_axis ~= nil then
+                    equal_axis:SetAspect(axis:GetAspect())
+                end
+            end
+            EndDisabledControls(dis_min)
+
+            BeginDisabledControls(always_locked)
+            _, axis.Flags = ImGui.CheckboxFlags("##LockMax", axis.Flags, ImPlotAxisFlags.LockMax)
+            EndDisabledControls(always_locked)
+            ImGui.SameLine()
+            local dis_max = axis:IsLockedMax() or always_locked
+            BeginDisabledControls(dis_max)
+            local temp_max, changed_max = DragFloat("Max", axis.Range.Max, drag_speed, axis.Range.Min + DBL_EPSILON, HUGE_VAL)
+            if changed_max then
+                axis:SetMax(temp_max, true)
+                if equal_axis ~= nil then
+                    equal_axis:SetAspect(axis:GetAspect())
+                end
+            end
+            EndDisabledControls(dis_max)
+
+            ImGui.Separator()
+
+            _, axis.Flags = ImGui.CheckboxFlags("Auto-Fit", axis.Flags, ImPlotAxisFlags.AutoFit)
+            ImGui.Separator()
+            _, axis.Flags = ImGui.CheckboxFlags("Invert", axis.Flags, ImPlotAxisFlags.Invert)
+            _, axis.Flags = ImGui.CheckboxFlags("Opposite", axis.Flags, ImPlotAxisFlags.Opposite)
+            ImGui.Separator()
+            -- [Port] LabelOffset == -1 -> Label == nil
+            local no_label = axis.Label == nil
+            BeginDisabledControls(no_label)
+            if ImGui.Checkbox("Label", label) then
+                axis.Flags = ImFlipFlag(axis.Flags, ImPlotAxisFlags.NoLabel)
+            end
+            EndDisabledControls(no_label)
+            if ImGui.Checkbox("Grid Lines", grid) then
+                axis.Flags = ImFlipFlag(axis.Flags, ImPlotAxisFlags.NoGridLines)
+            end
+            if ImGui.Checkbox("Tick Marks", ticks) then
+                axis.Flags = ImFlipFlag(axis.Flags, ImPlotAxisFlags.NoTickMarks)
+            end
+            if ImGui.Checkbox("Tick Labels", labels) then
+                axis.Flags = ImFlipFlag(axis.Flags, ImPlotAxisFlags.NoTickLabels)
+            end
+            -- [Port] upstream never pops this item width
+            ImGui.PopItemWidth()
+        end
+
+        -- [Port] TODO: Legend and Subplots menus (legend / subplots milestones)
+        function internal.ShowPlotContextMenu(plot)
+            local equal = ImHasFlag(plot.Flags, ImPlotFlags.Equal)
+
+            for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                local x_axis = plot:XAxis(i)
+                if x_axis.Enabled and x_axis:HasMenus() then
+                    ImGui.PushID(i)
+                    local buf = "X-Axis"
+                    if i ~= 0 then buf = string.format("X-Axis %d", i + 1) end
+                    if x_axis:HasLabel() then buf = plot:GetAxisLabel(x_axis) end
+                    if ImGui.BeginMenu(buf) then
+                        internal.ShowAxisContextMenu(x_axis, equal and x_axis.OrthoAxis or nil, false)
+                        ImGui.EndMenu()
+                    end
+                    ImGui.PopID()
+                end
+            end
+
+            for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                local y_axis = plot:YAxis(i)
+                if y_axis.Enabled and y_axis:HasMenus() then
+                    ImGui.PushID(i)
+                    local buf = "Y-Axis"
+                    if i ~= 0 then buf = string.format("Y-Axis %d", i + 1) end
+                    if y_axis:HasLabel() then buf = plot:GetAxisLabel(y_axis) end
+                    if ImGui.BeginMenu(buf) then
+                        internal.ShowAxisContextMenu(y_axis, equal and y_axis.OrthoAxis or nil, false)
+                        ImGui.EndMenu()
+                    end
+                    ImGui.PopID()
+                end
+            end
+
+            ImGui.Separator()
+            if ImGui.BeginMenu("Settings") then
+                if ImGui.MenuItem("Equal", nil, ImHasFlag(plot.Flags, ImPlotFlags.Equal)) then
+                    plot.Flags = ImFlipFlag(plot.Flags, ImPlotFlags.Equal)
+                end
+                if ImGui.MenuItem("Box Select", nil, not ImHasFlag(plot.Flags, ImPlotFlags.NoBoxSelect)) then
+                    plot.Flags = ImFlipFlag(plot.Flags, ImPlotFlags.NoBoxSelect)
+                end
+                local no_title = plot.Title == nil
+                BeginDisabledControls(no_title)
+                if ImGui.MenuItem("Title", nil, plot:HasTitle()) then
+                    plot.Flags = ImFlipFlag(plot.Flags, ImPlotFlags.NoTitle)
+                end
+                EndDisabledControls(no_title)
+                if ImGui.MenuItem("Mouse Position", nil, not ImHasFlag(plot.Flags, ImPlotFlags.NoMouseText)) then
+                    plot.Flags = ImFlipFlag(plot.Flags, ImPlotFlags.NoMouseText)
+                end
+                if ImGui.MenuItem("Crosshairs", nil, ImHasFlag(plot.Flags, ImPlotFlags.Crosshairs)) then
+                    plot.Flags = ImFlipFlag(plot.Flags, ImPlotFlags.Crosshairs)
+                end
+                ImGui.EndMenu()
+            end
+        end
+
+        -----------------------------------------------------------------------
+        -- Input Handling
+        -----------------------------------------------------------------------
+
+        local MOUSE_CURSOR_DRAG_THRESHOLD = 5.0
+        local BOX_SELECT_DRAG_THRESHOLD   = 4.0
+
+        function internal.RenderSelectionRect(DrawList, p_min, p_max, col)
+            local col_bg = ImGui.GetColorU32(ImVec4(col.x, col.y, col.z, col.w * 0.25))
+            local col_bd = ImGui.GetColorU32(col)
+            DrawList:AddRectFilled(p_min, p_max, col_bg)
+            DrawList:AddRect(p_min, p_max, col_bd)
+        end
+
+        local function AllAxesInputLocked(plot, first, count)
+            for i = first, first + count - 1 do
+                local a = plot.Axes[i]
+                if a.Enabled and not a:IsInputLocked() then
+                    return false
+                end
+            end
+            return true
+        end
+
+        local function AnyAxesHeld(plot, first, count)
+            for i = first, first + count - 1 do
+                if plot.Axes[i].Enabled and plot.Axes[i].Held then
+                    return true
+                end
+            end
+            return false
+        end
+
+        local function AnyAxesHovered(plot, first, count)
+            for i = first, first + count - 1 do
+                if plot.Axes[i].Enabled and plot.Axes[i].Hovered then
+                    return true
+                end
+            end
+            return false
+        end
+
         local plot_button_flags = bit32.bor(G.ImGuiButtonFlags.AllowOverlap, G.ImGuiButtonFlags.PressedOnClick, G.ImGuiButtonFlags.PressedOnDoubleClick,
                                             G.ImGuiButtonFlags.MouseButtonLeft, G.ImGuiButtonFlags.MouseButtonRight, G.ImGuiButtonFlags.MouseButtonMiddle)
+        local axis_button_flags = bit32.bor(G.ImGuiButtonFlags.FlattenChildren, plot_button_flags)
+
+        -- [Port] scratch per-axis arrays (0-based, reused every call)
+        local x_hov, x_held = {}, {}
+        local y_hov, y_held = {}, {}
 
         function internal.UpdateInput(plot)
+            local changed = false
+
+            local gp = GImPlot
+            local IO = ImGui.GetIO()
+            local map = gp.InputMap
+
             -- BUTTON STATE -----------------------------------------------------------
-            local _, hovered, held = ImGui.ButtonBehavior(plot.PlotRect, plot.ID, plot_button_flags)
-            plot.Hovered = hovered
-            plot.Held = held
-            -- [Port] TODO: axis buttons, fit on double click, panning, zooming, box selection, context menus (input milestone)
-            return false
+
+            local plot_clicked
+            plot_clicked, plot.Hovered, plot.Held = ImGui.ButtonBehavior(plot.PlotRect, plot.ID, plot_button_flags)
+
+            if plot_clicked then
+                if not ImHasFlag(plot.Flags, ImPlotFlags.NoBoxSelect) and IO.MouseClicked[map.Select] and ImHasFlag(IO.KeyMods, map.SelectMod) then
+                    plot.Selecting   = true
+                    plot.SelectStart = ImVec2(IO.MousePos.x, IO.MousePos.y)
+                    local sr = plot.SelectRect
+                    sr.Min.x, sr.Min.y, sr.Max.x, sr.Max.y = 0, 0, 0, 0
+                end
+                if IO.MouseDoubleClicked[map.Fit] then
+                    plot.FitThisFrame = true
+                    for i = 0, ImAxis.COUNT - 1 do
+                        plot.Axes[i].FitThisFrame = true
+                    end
+                end
+            end
+
+            local can_pan = IO.MouseDown[map.Pan] and ImHasFlag(IO.KeyMods, map.PanMod)
+
+            plot.Held = plot.Held and can_pan
+
+            for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                local xax = plot:XAxis(i)
+                x_hov[i], x_held[i] = false, false
+                if xax.Enabled then
+                    ImGui.KeepAliveID(xax.ID)
+                    local x_click
+                    x_click, xax.Hovered, xax.Held = ImGui.ButtonBehavior(xax.HoverRect, xax.ID, axis_button_flags)
+                    if x_click and IO.MouseDoubleClicked[map.Fit] then
+                        plot.FitThisFrame = true
+                        xax.FitThisFrame = true
+                    end
+                    xax.Held  = xax.Held and can_pan
+                    x_hov[i]  = xax.Hovered or plot.Hovered
+                    x_held[i] = xax.Held or plot.Held
+                end
+            end
+
+            for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                local yax = plot:YAxis(i)
+                y_hov[i], y_held[i] = false, false
+                if yax.Enabled then
+                    ImGui.KeepAliveID(yax.ID)
+                    local y_click
+                    y_click, yax.Hovered, yax.Held = ImGui.ButtonBehavior(yax.HoverRect, yax.ID, axis_button_flags)
+                    if y_click and IO.MouseDoubleClicked[map.Fit] then
+                        plot.FitThisFrame = true
+                        yax.FitThisFrame = true
+                    end
+                    yax.Held  = yax.Held and can_pan
+                    y_hov[i]  = yax.Hovered or plot.Hovered
+                    y_held[i] = yax.Held or plot.Held
+                end
+            end
+
+            -- cancel due to DND activity
+            if ImGui.GetCurrentContext().DragDropActive or (IO.KeyMods == map.OverrideMod and map.OverrideMod ~= 0) then
+                return false
+            end
+
+            -- STATE -------------------------------------------------------------------
+
+            local axis_equal     = ImHasFlag(plot.Flags, ImPlotFlags.Equal)
+
+            local any_x_hov      = plot.Hovered or AnyAxesHovered(plot, ImAxis.X1, IMPLOT_NUM_X_AXES)
+            local any_x_held     = plot.Held    or AnyAxesHeld(plot, ImAxis.X1, IMPLOT_NUM_X_AXES)
+            local any_y_hov      = plot.Hovered or AnyAxesHovered(plot, ImAxis.Y1, IMPLOT_NUM_Y_AXES)
+            local any_y_held     = plot.Held    or AnyAxesHeld(plot, ImAxis.Y1, IMPLOT_NUM_Y_AXES)
+            local any_hov        = any_x_hov    or any_y_hov
+            local any_held       = any_x_held   or any_y_held
+
+            local select_drag    = ImGui.GetMouseDragDelta(map.Select)
+            local pan_drag       = ImGui.GetMouseDragDelta(map.Pan)
+            local select_drag_sq = select_drag.x * select_drag.x + select_drag.y * select_drag.y
+            local pan_drag_sq    = pan_drag.x * pan_drag.x + pan_drag.y * pan_drag.y
+            local selecting      = plot.Selecting and select_drag_sq > MOUSE_CURSOR_DRAG_THRESHOLD
+            local panning        = any_held       and pan_drag_sq    > MOUSE_CURSOR_DRAG_THRESHOLD
+
+            -- CONTEXT MENU -----------------------------------------------------------
+
+            if IO.MouseReleased[map.Menu] and not plot.ContextLocked then
+                gp.OpenContextThisFrame = true
+            end
+
+            if selecting or panning then
+                plot.ContextLocked = true
+            elseif not (IO.MouseDown[map.Menu] or IO.MouseReleased[map.Menu]) then
+                plot.ContextLocked = false
+            end
+
+            -- DRAG INPUT -------------------------------------------------------------
+
+            local delta = IO.MouseDelta
+            if any_held and not plot.Selecting then
+                local drag_direction = 0
+                for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                    local x_axis = plot:XAxis(i)
+                    if x_held[i] and not x_axis:IsInputLocked() then
+                        drag_direction = bit32.bor(drag_direction, 2)
+                        local increasing = delta.x < 0
+                        if x_axis:IsInverted() then increasing = delta.x > 0 end
+                        if delta.x ~= 0 and not x_axis:IsPanLocked(increasing) then
+                            local plot_l = x_axis:PixelsToPlot(plot.PlotRect.Min.x - delta.x)
+                            local plot_r = x_axis:PixelsToPlot(plot.PlotRect.Max.x - delta.x)
+                            if x_axis:IsInverted() then plot_l, plot_r = plot_r, plot_l end
+                            x_axis:SetMin(plot_l)
+                            x_axis:SetMax(plot_r)
+                            if axis_equal and x_axis.OrthoAxis ~= nil then
+                                x_axis.OrthoAxis:SetAspect(x_axis:GetAspect())
+                            end
+                            changed = true
+                        end
+                    end
+                end
+                for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                    local y_axis = plot:YAxis(i)
+                    if y_held[i] and not y_axis:IsInputLocked() then
+                        drag_direction = bit32.bor(drag_direction, 4)
+                        local increasing = delta.y > 0
+                        if y_axis:IsInverted() then increasing = delta.y < 0 end
+                        if delta.y ~= 0 and not y_axis:IsPanLocked(increasing) then
+                            local plot_t = y_axis:PixelsToPlot(plot.PlotRect.Min.y - delta.y)
+                            local plot_b = y_axis:PixelsToPlot(plot.PlotRect.Max.y - delta.y)
+                            if y_axis:IsInverted() then plot_t, plot_b = plot_b, plot_t end
+                            y_axis:SetMin(plot_b)
+                            y_axis:SetMax(plot_t)
+                            if axis_equal and y_axis.OrthoAxis ~= nil then
+                                y_axis.OrthoAxis:SetAspect(y_axis:GetAspect())
+                            end
+                            changed = true
+                        end
+                    end
+                end
+                if IO.MouseDragMaxDistanceSqr[map.Pan] > MOUSE_CURSOR_DRAG_THRESHOLD then
+                    if drag_direction == 0 then
+                        ImGui.SetMouseCursor(G.ImGuiMouseCursor.NotAllowed)
+                    elseif drag_direction == 2 then
+                        ImGui.SetMouseCursor(G.ImGuiMouseCursor.ResizeEW)
+                    elseif drag_direction == 4 then
+                        ImGui.SetMouseCursor(G.ImGuiMouseCursor.ResizeNS)
+                    else
+                        ImGui.SetMouseCursor(G.ImGuiMouseCursor.ResizeAll)
+                    end
+                end
+            end
+
+            -- SCROLL INPUT -----------------------------------------------------------
+
+            if any_hov and ImHasFlag(IO.KeyMods, map.ZoomMod) then
+                local zoom_rate = map.ZoomRate
+                if IO.MouseWheel == 0.0 then
+                    zoom_rate = 0
+                elseif IO.MouseWheel > 0 then
+                    zoom_rate = (-zoom_rate) / (1.0 + (2.0 * zoom_rate))
+                end
+                local prc = plot.PlotRect
+                local rect_w, rect_h = prc:GetWidth(), prc:GetHeight()
+                local tx = (IO.MousePos.x - prc.Min.x) / (prc.Max.x - prc.Min.x) -- ImRemap(.., 0, 1)
+                local ty = (IO.MousePos.y - prc.Min.y) / (prc.Max.y - prc.Min.y)
+
+                -- Track which axis to use as reference for equal aspect
+                local equal_ref_axis = nil
+
+                for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                    local x_axis = plot:XAxis(i)
+                    local equal_zoom   = axis_equal and x_axis.OrthoAxis ~= nil
+                    local equal_locked = equal_zoom and x_axis.OrthoAxis:IsInputLocked()
+                    if x_hov[i] and not x_axis:IsInputLocked() and not equal_locked then
+                        ImGui.SetKeyOwner(G.ImGuiKey.MouseWheelY, plot.ID)
+                        if zoom_rate ~= 0.0 then
+                            local plot_l = x_axis:PixelsToPlot(prc.Min.x - rect_w * tx * zoom_rate)
+                            local plot_r = x_axis:PixelsToPlot(prc.Max.x + rect_w * (1 - tx) * zoom_rate)
+                            if x_axis:IsInverted() then plot_l, plot_r = plot_r, plot_l end
+                            x_axis:SetMin(plot_l)
+                            x_axis:SetMax(plot_r)
+                            if equal_zoom then
+                                equal_ref_axis = x_axis
+                            end
+                            changed = true
+                        end
+                    end
+                end
+                for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                    local y_axis = plot:YAxis(i)
+                    local equal_zoom   = axis_equal and y_axis.OrthoAxis ~= nil
+                    local equal_locked = equal_zoom and y_axis.OrthoAxis:IsInputLocked()
+                    if y_hov[i] and not y_axis:IsInputLocked() and not equal_locked then
+                        ImGui.SetKeyOwner(G.ImGuiKey.MouseWheelY, plot.ID)
+                        if zoom_rate ~= 0.0 then
+                            local plot_t = y_axis:PixelsToPlot(prc.Min.y - rect_h * ty * zoom_rate)
+                            local plot_b = y_axis:PixelsToPlot(prc.Max.y + rect_h * (1 - ty) * zoom_rate)
+                            if y_axis:IsInverted() then plot_t, plot_b = plot_b, plot_t end
+                            y_axis:SetMin(plot_b)
+                            y_axis:SetMax(plot_t)
+                            if equal_zoom then
+                                equal_ref_axis = y_axis
+                            end
+                            changed = true
+                        end
+                    end
+                end
+
+                -- Apply equal aspect constraint after zooming both axes
+                if equal_ref_axis ~= nil and equal_ref_axis.OrthoAxis ~= nil then
+                    equal_ref_axis.OrthoAxis:SetAspect(equal_ref_axis:GetAspect())
+                end
+            end
+
+            -- BOX-SELECTION ----------------------------------------------------------
+
+            if plot.Selecting then
+                local mp = IO.MousePos
+                local dx, dy = plot.SelectStart.x - mp.x, plot.SelectStart.y - mp.y
+                local x_can_change = not ImHasFlag(IO.KeyMods, map.SelectHorzMod) and math.abs(dx) > 2
+                local y_can_change = not ImHasFlag(IO.KeyMods, map.SelectVertMod) and math.abs(dy) > 2
+                -- confirm
+                if IO.MouseReleased[map.Select] then
+                    for i = 0, IMPLOT_NUM_X_AXES - 1 do
+                        local x_axis = plot:XAxis(i)
+                        if not x_axis:IsInputLocked() and x_can_change then
+                            local p1 = x_axis:PixelsToPlot(plot.SelectStart.x)
+                            local p2 = x_axis:PixelsToPlot(mp.x)
+                            x_axis:SetMin(math.min(p1, p2))
+                            x_axis:SetMax(math.max(p1, p2))
+                            changed = true
+                        end
+                    end
+                    for i = 0, IMPLOT_NUM_Y_AXES - 1 do
+                        local y_axis = plot:YAxis(i)
+                        if not y_axis:IsInputLocked() and y_can_change then
+                            local p1 = y_axis:PixelsToPlot(plot.SelectStart.y)
+                            local p2 = y_axis:PixelsToPlot(mp.y)
+                            y_axis:SetMin(math.min(p1, p2))
+                            y_axis:SetMax(math.max(p1, p2))
+                            changed = true
+                        end
+                    end
+                    if x_can_change or y_can_change or (ImHasFlag(IO.KeyMods, map.SelectHorzMod) and ImHasFlag(IO.KeyMods, map.SelectVertMod)) then
+                        gp.OpenContextThisFrame = false
+                    end
+                    plot.Selected = false
+                    plot.Selecting = false
+                -- cancel
+                elseif IO.MouseReleased[map.SelectCancel] then
+                    plot.Selected = false
+                    plot.Selecting = false
+                    gp.OpenContextThisFrame = false
+                elseif dx * dx + dy * dy > BOX_SELECT_DRAG_THRESHOLD then
+                    -- bad selection
+                    if plot:IsInputLocked() then
+                        ImGui.SetMouseCursor(G.ImGuiMouseCursor.NotAllowed)
+                        gp.OpenContextThisFrame = false
+                        plot.Selected = false
+                    else
+                        -- TODO: Handle only min or max locked cases
+                        local full_width  = ImHasFlag(IO.KeyMods, map.SelectHorzMod) or AllAxesInputLocked(plot, ImAxis.X1, IMPLOT_NUM_X_AXES)
+                        local full_height = ImHasFlag(IO.KeyMods, map.SelectVertMod) or AllAxesInputLocked(plot, ImAxis.Y1, IMPLOT_NUM_Y_AXES)
+                        local prc, sr, ss = plot.PlotRect, plot.SelectRect, plot.SelectStart
+                        if full_width then
+                            sr.Min.x, sr.Max.x = prc.Min.x, prc.Max.x
+                        else
+                            sr.Min.x, sr.Max.x = math.min(ss.x, mp.x), math.max(ss.x, mp.x)
+                        end
+                        if full_height then
+                            sr.Min.y, sr.Max.y = prc.Min.y, prc.Max.y
+                        else
+                            sr.Min.y, sr.Max.y = math.min(ss.y, mp.y), math.max(ss.y, mp.y)
+                        end
+                        sr.Min.x -= prc.Min.x; sr.Min.y -= prc.Min.y
+                        sr.Max.x -= prc.Min.x; sr.Max.y -= prc.Min.y
+                        plot.Selected = true
+                    end
+                else
+                    plot.Selected = false
+                end
+            end
+            return changed
+        end
+
+        -----------------------------------------------------------------------
+        -- Next Plot Data (Legacy)
+        -----------------------------------------------------------------------
+
+        function internal.ApplyNextPlotData(idx)
+            local gp   = GImPlot
+            local plot = gp.CurrentPlot
+            local axis = plot.Axes[idx]
+            if not axis.Enabled then
+                return
+            end
+            local npd = gp.NextPlotData
+            axis.LinkedMin = npd.LinkedMin[idx]
+            axis.LinkedMax = npd.LinkedMax[idx]
+            axis:PullLinks()
+            if npd.HasRange[idx] then
+                if not plot.Initialized or npd.RangeCond[idx] == ImPlotCond.Always then
+                    axis:SetRange(npd.Range[idx])
+                end
+            end
+            axis.HasRange  = npd.HasRange[idx]
+            axis.RangeCond = npd.RangeCond[idx]
+        end
+
+        function ImPlot.SetNextAxisLimits(axis, v_min, v_max, cond)
+            if cond == nil then cond = ImPlotCond.Once end
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot == nil, "SetNextAxisLimits() needs to be called before BeginPlot()!")
+            IM_ASSERT(cond == ImPlotCond.None or cond == ImPlotCond.Once or cond == ImPlotCond.Always) -- Make sure the user only passes a single condition flag
+            gp.NextPlotData.HasRange[axis]  = true
+            gp.NextPlotData.RangeCond[axis] = cond
+            gp.NextPlotData.Range[axis].Min = v_min
+            gp.NextPlotData.Range[axis].Max = v_max
+        end
+
+        -- [Port] link_min/link_max are link refs (tables whose [1] holds the value)
+        function ImPlot.SetNextAxisLinks(axis, link_min, link_max)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot == nil, "SetNextAxisLinks() needs to be called before BeginPlot()!")
+            gp.NextPlotData.LinkedMin[axis] = link_min
+            gp.NextPlotData.LinkedMax[axis] = link_max
+        end
+
+        function ImPlot.SetNextAxisToFit(axis)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot == nil, "SetNextAxisToFit() needs to be called before BeginPlot()!")
+            gp.NextPlotData.Fit[axis] = true
+        end
+
+        function ImPlot.SetNextAxesLimits(x_min, x_max, y_min, y_max, cond)
+            ImPlot.SetNextAxisLimits(ImAxis.X1, x_min, x_max, cond)
+            ImPlot.SetNextAxisLimits(ImAxis.Y1, y_min, y_max, cond)
+        end
+
+        function ImPlot.SetNextAxesToFit()
+            for i = 0, ImAxis.COUNT - 1 do
+                ImPlot.SetNextAxisToFit(i)
+            end
         end
 
         -----------------------------------------------------------------------
@@ -1919,7 +2566,18 @@ return function(G)
             end
         end
 
-        -- [Port] TODO: SetupAxisLinks, SetupAxisTicks, SetupAxisScale, SetupAxisLimitsConstraints, SetupAxisZoomConstraints, SetupLegend, SetupMouseText
+        -- [Port] min_lnk/max_lnk are link refs (tables whose [1] holds the value) instead of double*
+        function ImPlot.SetupAxisLinks(idx, min_lnk, max_lnk)
+            CheckSetup()
+            local plot = GImPlot.CurrentPlot
+            local axis = plot.Axes[idx]
+            IM_ASSERT(axis.Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            axis.LinkedMin = min_lnk
+            axis.LinkedMax = max_lnk
+            axis:PullLinks()
+        end
+
+        -- [Port] TODO: SetupAxisTicks, SetupAxisScale, SetupAxisLimitsConstraints, SetupAxisZoomConstraints, SetupLegend, SetupMouseText
 
         function ImPlot.SetupAxes(x_label, y_label, x_flags, y_flags)
             ImPlot.SetupAxis(ImAxis.X1, x_label, x_flags)
@@ -1992,7 +2650,9 @@ return function(G)
             plot.CurrentY = ImAxis.Y1
 
             -- process next plot data (legacy)
-            -- [Port] TODO: ApplyNextPlotData (SetNextAxis* milestone)
+            for i = 0, ImAxis.COUNT - 1 do
+                internal.ApplyNextPlotData(i)
+            end
 
             -- clear text buffers
             plot:ClearTextBuffer()
@@ -2215,8 +2875,7 @@ return function(G)
 
             -- fit from FitNextPlotAxes or auto fit
             for i = 0, ImAxis.COUNT - 1 do
-                -- [Port] TODO: gp.NextPlotData.Fit[i]
-                if plot.Axes[i]:IsAutoFitting() then
+                if gp.NextPlotData.Fit[i] or plot.Axes[i]:IsAutoFitting() then
                     plot.FitThisFrame = true
                     plot.Axes[i].FitThisFrame = true
                 end
@@ -2447,7 +3106,13 @@ return function(G)
             end
             ImGui.PopClipRect()
 
-            -- [Port] TODO: annotations, selection, crosshairs, mouse text, axis side switch, legend (later milestones)
+            -- render selection
+            if plot.Selected then
+                local sr = plot.SelectRect
+                internal.RenderSelectionRect(DrawList, ImVec2(sr.Min.x + pr.Min.x, sr.Min.y + pr.Min.y), ImVec2(sr.Max.x + pr.Min.x, sr.Max.y + pr.Min.y), GetStyleColorVec4(ImPlotCol.Selection))
+            end
+
+            -- [Port] TODO: annotations, crosshairs, mouse text, axis side switch, legend (later milestones)
 
             -- render border
             if render_border then
@@ -2473,10 +3138,52 @@ return function(G)
             end
 
             -- CONTEXT MENUS -----------------------------------------------------------
-            -- [Port] TODO: plot/axis context menus (input milestone)
+            ImGui.PushOverrideID(plot.ID)
+
+            -- [Port] TODO: && !plot.Items.Legend.Hovered (legend milestone)
+            local can_ctx = gp.OpenContextThisFrame and not ImHasFlag(plot.Flags, ImPlotFlags.NoMenus)
+            local axis_equal = ImHasFlag(plot.Flags, ImPlotFlags.Equal)
+
+            -- main ctx menu
+            if can_ctx and plot.Hovered then
+                ImGui.OpenPopup("##PlotContext")
+            end
+            if ImGui.BeginPopup("##PlotContext") then
+                internal.ShowPlotContextMenu(plot)
+                ImGui.EndPopup()
+            end
+
+            -- axes ctx menus
+            for i = 0, ImAxis.COUNT - 1 do
+                local axis = plot.Axes[i]
+                local is_x = i < IMPLOT_NUM_X_AXES
+                local n = i
+                if not is_x then n = i - IMPLOT_NUM_X_AXES end
+                local popup = "##YContext"
+                if is_x then popup = "##XContext" end
+                ImGui.PushID(n)
+                if can_ctx and axis.Hovered and axis:HasMenus() then
+                    ImGui.OpenPopup(popup)
+                end
+                if ImGui.BeginPopup(popup) then
+                    local name = "Y-Axis"
+                    if is_x then name = "X-Axis" end
+                    if n ~= 0 then name = string.format("%s %d", name, n + 1) end
+                    if axis:HasLabel() then name = plot:GetAxisLabel(axis) end
+                    ImGui.Text(name)
+                    ImGui.Separator()
+                    internal.ShowAxisContextMenu(axis, axis_equal and axis.OrthoAxis or nil, is_x)
+                    ImGui.EndPopup()
+                end
+                ImGui.PopID()
+            end
+            ImGui.PopID()
 
             -- LINKED AXES ------------------------------------------------------------
-            -- [Port] TODO: PushLinks
+
+            for i = 0, ImAxis.COUNT - 1 do
+                plot.Axes[i]:PushLinks()
+            end
 
             -- CLEANUP ----------------------------------------------------------------
 
