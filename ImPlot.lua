@@ -4490,6 +4490,66 @@ return function(G)
             SetupLock()
             return GImPlot.CurrentPlot.Hovered
         end
+
+        function ImPlot.IsAxisHovered(axis)
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "IsPlotXAxisHovered() needs to be called between BeginPlot() and EndPlot()!")
+            SetupLock()
+            return GImPlot.CurrentPlot.Axes[axis].Hovered
+        end
+
+        function ImPlot.IsPlotSelected()
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "IsPlotSelected() needs to be called between BeginPlot() and EndPlot()!")
+            SetupLock()
+            return GImPlot.CurrentPlot.Selected
+        end
+
+        function ImPlot.GetPlotSelection(x_idx, y_idx)
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "GetPlotSelection() needs to be called between BeginPlot() and EndPlot()!")
+            SetupLock()
+            local plot = GImPlot.CurrentPlot
+            if not plot.Selected then
+                return ImPlot.ImPlotRect(0, 0, 0, 0)
+            end
+            local sr, pm = plot.SelectRect, plot.PlotRect.Min
+            local p1 = ImPlot.PixelsToPlot(sr.Min.x + pm.x, sr.Min.y + pm.y, x_idx, y_idx)
+            local p2 = ImPlot.PixelsToPlot(sr.Max.x + pm.x, sr.Max.y + pm.y, x_idx, y_idx)
+            return ImPlot.ImPlotRect(math.min(p1.x, p2.x), math.max(p1.x, p2.x), math.min(p1.y, p2.y), math.max(p1.y, p2.y))
+        end
+
+        function ImPlot.CancelPlotSelection()
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "CancelPlotSelection() needs to be called between BeginPlot() and EndPlot()!")
+            SetupLock()
+            local plot = GImPlot.CurrentPlot
+            if plot.Selected then
+                plot.Selected = false
+                plot.Selecting = false
+            end
+        end
+
+        function ImPlot.SetAxis(axis)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil, "SetAxis() needs to be called between BeginPlot() and EndPlot()!")
+            IM_ASSERT(axis >= ImAxis.X1 and axis < ImAxis.COUNT, "Axis index out of bounds!")
+            IM_ASSERT(gp.CurrentPlot.Axes[axis].Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            SetupLock()
+            if axis < ImAxis.Y1 then
+                gp.CurrentPlot.CurrentX = axis
+            else
+                gp.CurrentPlot.CurrentY = axis
+            end
+        end
+
+        function ImPlot.SetAxes(x_idx, y_idx)
+            local gp = GImPlot
+            IM_ASSERT(gp.CurrentPlot ~= nil, "SetAxes() needs to be called between BeginPlot() and EndPlot()!")
+            IM_ASSERT(x_idx >= ImAxis.X1 and x_idx < ImAxis.Y1, "X-Axis index out of bounds!")
+            IM_ASSERT(y_idx >= ImAxis.Y1 and y_idx < ImAxis.COUNT, "Y-Axis index out of bounds!")
+            IM_ASSERT(gp.CurrentPlot.Axes[x_idx].Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            IM_ASSERT(gp.CurrentPlot.Axes[y_idx].Enabled, "Axis is not enabled! Did you forget to call SetupAxis()?")
+            SetupLock()
+            gp.CurrentPlot.CurrentX = x_idx
+            gp.CurrentPlot.CurrentY = y_idx
+        end
     end
 
     --------------------------------------------------------------------------
@@ -4804,6 +4864,36 @@ return function(G)
         end
         function internal.PopPlotClipRect() ImGui.PopClipRect() end
         local PushPlotClipRect, PopPlotClipRect = internal.PushPlotClipRect, internal.PopPlotClipRect
+
+        -- public versions (with SetupLock, like upstream)
+        function ImPlot.GetPlotDrawList() return internal.GetPlotDrawList() end
+        function ImPlot.PushPlotClipRect(expand)
+            IM_ASSERT(GImPlot.CurrentPlot ~= nil, "PushPlotClipRect() needs to be called between BeginPlot() and EndPlot()!")
+            internal.SetupLock()
+            PushPlotClipRect(expand)
+        end
+        function ImPlot.PopPlotClipRect()
+            internal.SetupLock()
+            PopPlotClipRect()
+        end
+
+        function ImPlot.HideNextItem(hidden, cond)
+            if hidden == nil then hidden = true end
+            local d = GImPlot.NextItemData
+            d.HasHidden  = true
+            d.Hidden     = hidden
+            d.HiddenCond = cond or ImPlot.ImPlotCond.Once
+        end
+
+        -- ItemIcon(ImVec4) / ItemIcon(ImU32)
+        function ImPlot.ItemIcon(col)
+            if type(col) == "table" then col = ImGui.ColorConvertFloat4ToU32(col) end
+            local txt_size = ImGui.GetTextLineHeight()
+            local size = ImVec2(txt_size - 4, txt_size)
+            local pos = ImGui.GetCurrentWindow().DC.CursorPos
+            ImGui.GetWindowDrawList():AddRectFilled(ImVec2(pos.x, pos.y + 2), ImVec2(pos.x + size.x, pos.y + size.y - 2), col)
+            ImGui.Dummy(size)
+        end
 
         -----------------------------------------------------------------------
         -- BeginItem / EndItem
@@ -5559,6 +5649,64 @@ return function(G)
 
         function ImPlot.PlotScatterG(label_id, getter_func, data, count, spec)
             internal.PlotScatterEx(label_id, internal.GetterFuncPtr(getter_func, data, count), ResolveSpec(spec))
+        end
+
+        -----------------------------------------------------------------------
+        -- PlotPolygon
+        -----------------------------------------------------------------------
+
+        function internal.PlotPolygonEx(label_id, getter, spec)
+            if BeginItemEx(label_id, internal.Fitter1(getter), spec, spec.FillColor, spec.Marker) then
+                if getter.Count < 2 then
+                    EndItem()
+                    return
+                end
+                local s = GetItemData()
+                local is_concave = ImHasFlag(spec.Flags, ImPlot.ImPlotPolygonFlags.Concave)
+
+                local draw_list = internal.GetPlotDrawList()
+                local plot = GImPlot.CurrentPlot
+                local x_axis, y_axis = plot.Axes[plot.CurrentX], plot.Axes[plot.CurrentY]
+                internal.SetTransformer(x_axis, y_axis)
+
+                -- Flip points to make sure they are in counter-clockwise order for correct filling when one axis is inverted
+                local x_inv = ImHasFlag(x_axis.Flags, ImPlot.ImPlotAxisFlags.Invert)
+                local y_inv = ImHasFlag(y_axis.Flags, ImPlot.ImPlotAxisFlags.Invert)
+                local flip = x_inv == y_inv
+
+                -- Transform all points to screen space
+                local n = getter.Count
+                local points = table.create(n)
+                for i = 0, n - 1 do
+                    local x, y
+                    if flip then x, y = getter.Get(getter, n - 1 - i) else x, y = getter.Get(getter, i) end
+                    points[i + 1] = ImVec2(TransformX(x), TransformY(y))
+                end
+
+                if s.RenderFill and n >= 3 then
+                    local col_fill = ImGui.GetColorU32(s.Spec.FillColor)
+                    if is_concave then
+                        draw_list:AddConcavePolyFilled(points, n, col_fill)
+                    else
+                        draw_list:AddConvexPolyFilled(points, n, col_fill)
+                    end
+                end
+                if s.RenderLine and n >= 2 then
+                    local col_line = ImGui.GetColorU32(s.Spec.LineColor)
+                    draw_list:AddPolyline(points, n, col_line, s.Spec.LineWeight, G.ImDrawFlags.Closed)
+                end
+
+                EndItem()
+            end
+        end
+
+        -- PlotPolygon(label_id, xs, ys, count?, spec?)
+        function ImPlot.PlotPolygon(label_id, xs, ys, count, spec)
+            if type(count) == "table" then spec, count = count, nil end
+            count = count or math.min(#xs, #ys)
+            local sp = ResolveSpec(spec)
+            local getter = internal.GetterXY(internal.IndexerIdx(xs, count, sp.Offset, sp.Stride), internal.IndexerIdx(ys, count, sp.Offset, sp.Stride), count)
+            internal.PlotPolygonEx(label_id, getter, sp)
         end
 
         -----------------------------------------------------------------------
@@ -7749,6 +7897,8 @@ return function(G)
             x_axis:ExtendFitWith(y_axis, x, y)
             y_axis:ExtendFitWith(x_axis, y, x)
         end
+        -- [Port] FitPoint(ImPlotPoint) -> FitPoint(x, y)
+        internal.FitThisFrame, internal.FitPoint = FitThisFrame, FitPoint
 
         function ImPlot.GetPlotMousePos(x_idx, y_idx)
             IM_ASSERT(GImPlot.CurrentPlot ~= nil, "GetPlotMousePos() needs to be called between BeginPlot() and EndPlot()!")
