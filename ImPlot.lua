@@ -1031,6 +1031,21 @@ return function(G)
             return GImPlot.ColormapData:GetIndex(name)
         end
 
+        -- [Port] ImVec4* / ImU32* overloads: `colormap` is a 1-based array of ImVec4 or ImU32; size defaults to #colormap
+        function ImPlot.AddColormap(name, colormap, size, qual)
+            local gp = GImPlot
+            size = size or #colormap
+            if qual == nil then qual = true end
+            IM_ASSERT(size > 1, "The colormap size must be greater than 1!")
+            IM_ASSERT(gp.ColormapData:GetIndex(name) == -1, "The colormap name has already been used!")
+            local buffer = table.create(size)
+            for i = 1, size do
+                local c = colormap[i]
+                buffer[i] = type(c) == "number" and c or ImGui.ColorConvertFloat4ToU32(c)
+            end
+            return gp.ColormapData:Append(name, buffer, size, qual)
+        end
+
         -- [Port] PushColormap(ImPlotColormap) / PushColormap(const char*) overloads
         function ImPlot.PushColormap(colormap)
             local gp = GImPlot
@@ -1239,7 +1254,8 @@ return function(G)
             a.LinkedMin        = nil
             a.LinkedMax        = nil
             a.PickerLevel      = 0
-            -- [Port] TODO: PickerTimeMin/PickerTimeMax (time scale milestone)
+            a.PickerTimeMin    = internal.ImPlotTime(0, 0)
+            a.PickerTimeMax    = internal.ImPlotTime(0, 0)
             a.TransformForward = nil
             a.TransformInverse = nil
             a.TransformData    = nil
@@ -1305,7 +1321,7 @@ return function(G)
                 return false
             end
             self.Range.Min = _min
-            -- [Port] TODO: PickerTimeMin
+            self.PickerTimeMin = internal.ImPlotTimeFromDouble(self.Range.Min)
             self:UpdateTransformCache()
             return true
         end
@@ -1329,7 +1345,7 @@ return function(G)
                 return false
             end
             self.Range.Max = _max
-            -- [Port] TODO: PickerTimeMax
+            self.PickerTimeMax = internal.ImPlotTimeFromDouble(self.Range.Max)
             self:UpdateTransformCache()
             return true
         end
@@ -1340,7 +1356,8 @@ return function(G)
             self.Range.Min = math.min(v1, v2)
             self.Range.Max = math.max(v1, v2)
             self:Constrain()
-            -- [Port] TODO: PickerTimeMin/PickerTimeMax
+            self.PickerTimeMin = internal.ImPlotTimeFromDouble(self.Range.Min)
+            self.PickerTimeMax = internal.ImPlotTimeFromDouble(self.Range.Max)
             self:UpdateTransformCache()
         end
 
@@ -2734,7 +2751,9 @@ return function(G)
             return bit32.bor(flags, flag)
         end
 
-        -- [Port] TODO: time scale branch (Min Time / Max Time pickers)
+        internal.BeginDisabledControls = BeginDisabledControls
+        internal.EndDisabledControls = EndDisabledControls
+
         function internal.ShowAxisContextMenu(axis, equal_axis, _time_allowed)
             ImGui.PushItemWidth(75)
             local always_locked = axis:IsRangeLocked() or axis:IsAutoFitting()
@@ -2748,35 +2767,88 @@ return function(G)
             end
             local _
 
-            BeginDisabledControls(always_locked)
-            _, axis.Flags = ImGui.CheckboxFlags("##LockMin", axis.Flags, ImPlotAxisFlags.LockMin)
-            EndDisabledControls(always_locked)
-            ImGui.SameLine()
-            local dis_min = axis:IsLockedMin() or always_locked
-            BeginDisabledControls(dis_min)
-            local temp_min, changed_min = DragFloat("Min", axis.Range.Min, drag_speed, -HUGE_VAL, axis.Range.Max - DBL_EPSILON)
-            if changed_min then
-                axis:SetMin(temp_min, true)
-                if equal_axis ~= nil then
-                    equal_axis:SetAspect(axis:GetAspect())
-                end
-            end
-            EndDisabledControls(dis_min)
+            if axis.Scale == ImPlotScale.Time then
+                local FromDouble, AddTime, S_ = internal.ImPlotTimeFromDouble, internal.AddTime, internal.ImPlotTimeUnit.S
+                local tmin = FromDouble(axis.Range.Min)
+                local tmax = FromDouble(axis.Range.Max)
+                local clk
 
-            BeginDisabledControls(always_locked)
-            _, axis.Flags = ImGui.CheckboxFlags("##LockMax", axis.Flags, ImPlotAxisFlags.LockMax)
-            EndDisabledControls(always_locked)
-            ImGui.SameLine()
-            local dis_max = axis:IsLockedMax() or always_locked
-            BeginDisabledControls(dis_max)
-            local temp_max, changed_max = DragFloat("Max", axis.Range.Max, drag_speed, axis.Range.Min + DBL_EPSILON, HUGE_VAL)
-            if changed_max then
-                axis:SetMax(temp_max, true)
-                if equal_axis ~= nil then
-                    equal_axis:SetAspect(axis:GetAspect())
+                BeginDisabledControls(always_locked)
+                _, axis.Flags = ImGui.CheckboxFlags("##LockMin", axis.Flags, ImPlotAxisFlags.LockMin)
+                EndDisabledControls(always_locked)
+                ImGui.SameLine()
+                local dis_min = axis:IsLockedMin() or always_locked
+                BeginDisabledControls(dis_min)
+                if ImGui.BeginMenu("Min Time") then
+                    clk, tmin = internal.ShowTimePicker("mintime", tmin)
+                    if clk then
+                        if tmin >= tmax then tmax = AddTime(tmin, S_, 1) end
+                        axis:SetRange(tmin:ToDouble(), tmax:ToDouble())
+                    end
+                    ImGui.Separator()
+                    clk, axis.PickerLevel, axis.PickerTimeMin = internal.ShowDatePicker("mindate", axis.PickerLevel, axis.PickerTimeMin, tmin, tmax)
+                    if clk then
+                        tmin = internal.CombineDateTime(axis.PickerTimeMin, tmin)
+                        if tmin >= tmax then tmax = AddTime(tmin, S_, 1) end
+                        axis:SetRange(tmin:ToDouble(), tmax:ToDouble())
+                    end
+                    ImGui.EndMenu()
                 end
+                EndDisabledControls(dis_min)
+
+                BeginDisabledControls(always_locked)
+                _, axis.Flags = ImGui.CheckboxFlags("##LockMax", axis.Flags, ImPlotAxisFlags.LockMax)
+                EndDisabledControls(always_locked)
+                ImGui.SameLine()
+                local dis_max = axis:IsLockedMax() or always_locked
+                BeginDisabledControls(dis_max)
+                if ImGui.BeginMenu("Max Time") then
+                    clk, tmax = internal.ShowTimePicker("maxtime", tmax)
+                    if clk then
+                        if tmax <= tmin then tmin = AddTime(tmax, S_, -1) end
+                        axis:SetRange(tmin:ToDouble(), tmax:ToDouble())
+                    end
+                    ImGui.Separator()
+                    clk, axis.PickerLevel, axis.PickerTimeMax = internal.ShowDatePicker("maxdate", axis.PickerLevel, axis.PickerTimeMax, tmin, tmax)
+                    if clk then
+                        tmax = internal.CombineDateTime(axis.PickerTimeMax, tmax)
+                        if tmax <= tmin then tmin = AddTime(tmax, S_, -1) end
+                        axis:SetRange(tmin:ToDouble(), tmax:ToDouble())
+                    end
+                    ImGui.EndMenu()
+                end
+                EndDisabledControls(dis_max)
+            else
+                BeginDisabledControls(always_locked)
+                _, axis.Flags = ImGui.CheckboxFlags("##LockMin", axis.Flags, ImPlotAxisFlags.LockMin)
+                EndDisabledControls(always_locked)
+                ImGui.SameLine()
+                local dis_min = axis:IsLockedMin() or always_locked
+                BeginDisabledControls(dis_min)
+                local temp_min, changed_min = DragFloat("Min", axis.Range.Min, drag_speed, -HUGE_VAL, axis.Range.Max - DBL_EPSILON)
+                if changed_min then
+                    axis:SetMin(temp_min, true)
+                    if equal_axis ~= nil then
+                        equal_axis:SetAspect(axis:GetAspect())
+                    end
+                end
+                EndDisabledControls(dis_min)
+
+                BeginDisabledControls(always_locked)
+                _, axis.Flags = ImGui.CheckboxFlags("##LockMax", axis.Flags, ImPlotAxisFlags.LockMax)
+                EndDisabledControls(always_locked)
+                ImGui.SameLine()
+                local dis_max = axis:IsLockedMax() or always_locked
+                BeginDisabledControls(dis_max)
+                local temp_max, changed_max = DragFloat("Max", axis.Range.Max, drag_speed, axis.Range.Min + DBL_EPSILON, HUGE_VAL)
+                if changed_max then
+                    axis:SetMax(temp_max, true)
+                    if equal_axis ~= nil then
+                        equal_axis:SetAspect(axis:GetAspect())
+                    end
+                end
+                EndDisabledControls(dis_max)
             end
-            EndDisabledControls(dis_max)
 
             ImGui.Separator()
 
@@ -8794,7 +8866,39 @@ return function(G)
                         ImGui.EndGroup()
                         ImGui.PopID()
                     end
-                    -- [Port] TODO: custom colormap builder (needs AddColormap)
+                    if S.custom == nil then
+                        S.custom = { ImVec4(1, 0, 0, 1), ImVec4(0, 1, 0, 1), ImVec4(0, 0, 1, 1) }
+                        S.cmap_name = ImGui.NewTextBuffer("MyColormap", 16)
+                        S.qual = true
+                    end
+                    local custom = S.custom
+                    ImGui.Separator()
+                    ImGui.BeginGroup()
+                    local half = (100 - ImGui.GetStyle().ItemSpacing.x) / 2
+                    if ImGui.Button("+", ImVec2(half, 0)) then
+                        table.insert(custom, ImVec4(0, 0, 0, 1))
+                    end
+                    ImGui.SameLine()
+                    if ImGui.Button("-", ImVec2(half, 0)) and #custom > 2 then
+                        table.remove(custom)
+                    end
+                    ImGui.SetNextItemWidth(100)
+                    ImGui.InputText("##Name", S.cmap_name, 16, G.ImGuiInputTextFlags.CharsNoBlank)
+                    _, S.qual = ImGui.Checkbox("Qualitative", S.qual)
+                    local cname = ImGui.TextBufferToString(S.cmap_name)
+                    if ImGui.Button("Add", ImVec2(100, 0)) and gp.ColormapData:GetIndex(cname) == -1 then
+                        ImPlot.AddColormap(cname, custom, #custom, S.qual)
+                    end
+                    ImGui.EndGroup()
+                    ImGui.SameLine()
+                    ImGui.BeginGroup()
+                    for c = 1, #custom do
+                        ImGui.PushID(c - 1)
+                        ImGui.ColorEdit4("##Col1", custom[c], G.ImGuiColorEditFlags.NoInputs)
+                        if c % 12 ~= 0 then ImGui.SameLine() end
+                        ImGui.PopID()
+                    end
+                    ImGui.EndGroup()
                     ImGui.EndTabItem()
                 end
                 ImGui.EndTabBar()
@@ -8826,6 +8930,477 @@ return function(G)
             ImGui.Unindent()
             ImGui.BulletText("Click legend label icons to show/hide plot items.")
         end
+
+        function ImPlot.ShowAltLegend(title_id, vertical, size, interactable)
+            if vertical == nil then vertical = true end
+            size = size or ImVec2(0, 0)
+            if interactable == nil then interactable = true end
+            local gp = GImPlot
+            local Window = ImGui.GetCurrentWindow()
+            if Window.SkipItems then
+                return
+            end
+            local DrawList = Window.DrawList
+            local plot = internal.GetPlot(title_id)
+            local legend_size = ImVec2(0, 0)
+            local pad = gp.Style.LegendPadding
+            local default_size = ImVec2(pad.x * 2, pad.y * 2)
+            if plot ~= nil then
+                legend_size  = internal.CalcLegendSize(plot.Items, gp.Style.LegendInnerPadding, gp.Style.LegendSpacing, vertical)
+                default_size = ImVec2(legend_size.x + pad.x * 2, legend_size.y + pad.y * 2)
+            end
+            local frame_size = ImGui.CalcItemSize(size, default_size.x, default_size.y)
+            local cp = Window.DC.CursorPos
+            local bb_frame = G.ImRect(cp.x, cp.y, cp.x + frame_size.x, cp.y + frame_size.y)
+            ImGui.ItemSize(bb_frame)
+            if not ImGui.ItemAdd(bb_frame, 0, bb_frame) then
+                return
+            end
+            ImGui.RenderFrame(bb_frame.Min, bb_frame.Max, ImPlot.GetStyleColorU32(ImPlotCol.FrameBg), true, ImGui.GetStyle().FrameRounding)
+            DrawList:PushClipRect(bb_frame.Min, bb_frame.Max, true)
+            if plot ~= nil then
+                local legend_pos = internal.GetLocationPos(bb_frame, legend_size, 0, pad)
+                local legend_bb  = G.ImRect(legend_pos.x, legend_pos.y, legend_pos.x + legend_size.x, legend_pos.y + legend_size.y)
+                interactable = interactable and bb_frame:Contains(ImGui.GetIO().MousePos)
+                DrawList:AddRectFilled(legend_bb.Min, legend_bb.Max, ImPlot.GetStyleColorU32(ImPlotCol.LegendBg))
+                DrawList:AddRect(legend_bb.Min, legend_bb.Max, ImPlot.GetStyleColorU32(ImPlotCol.LegendBorder))
+                internal.ShowLegendEntries(plot.Items, legend_bb, interactable, gp.Style.LegendInnerPadding, gp.Style.LegendSpacing, vertical, DrawList)
+            end
+            DrawList:PopClipRect()
+        end
+
+        local M = { show_plot_rects = false, show_axes_rects = false, show_axis_rects = false, show_canvas_rects = false,
+                    show_frame_rects = false, show_subplot_frame_rects = false, show_subplot_grid_rects = false,
+                    show_legend_rects = false, t = 0.5 }
+
+        local function ShowAxisMetrics(plot, axis)
+            ImGui.BulletText("Label: %s", axis.Label == nil and "[none]" or plot:GetAxisLabel(axis))
+            ImGui.BulletText("Flags: 0x%08X", axis.Flags)
+            ImGui.BulletText("Range: [%f,%f]", axis.Range.Min, axis.Range.Max)
+            ImGui.BulletText("Pixels: %f", axis:PixelSize())
+            ImGui.BulletText("Aspect: %f", axis:GetAspect())
+            if axis.OrthoAxis == nil then ImGui.BulletText("OrthoAxis: NULL") else ImGui.BulletText("OrthoAxis: 0x%08X", axis.OrthoAxis.ID) end
+            ImGui.BulletText("LinkedMin: %s", tostring(axis.LinkedMin))
+            ImGui.BulletText("LinkedMax: %s", tostring(axis.LinkedMax))
+            ImGui.BulletText("HasRange: %s", tostring(axis.HasRange))
+            ImGui.BulletText("Hovered: %s", tostring(axis.Hovered))
+            ImGui.BulletText("Held: %s", tostring(axis.Held))
+            if ImGui.TreeNode("Transform") then
+                ImGui.BulletText("PixelMin: %f", axis.PixelMin)
+                ImGui.BulletText("PixelMax: %f", axis.PixelMax)
+                ImGui.BulletText("ScaleToPixel: %f", axis.ScaleToPixel)
+                ImGui.BulletText("ScaleMax: %f", axis.ScaleMax)
+                ImGui.TreePop()
+            end
+            if ImGui.TreeNode("Ticks") then
+                ImGui.BulletText("Size: %d", axis.Ticker:TickCount())
+                ImGui.BulletText("MaxSize: [%f,%f]", axis.Ticker.MaxSize.x, axis.Ticker.MaxSize.y)
+                ImGui.TreePop()
+            end
+        end
+
+        local function ShowItemsMetrics(items, legend_hovered_label, show_marker)
+            local n_items = items:GetItemCount()
+            if ImGui.TreeNode("Items", "Items (%d)", n_items) then
+                for i = 0, n_items - 1 do
+                    local item = items:GetItemByIndex(i)
+                    ImGui.PushID(i)
+                    if ImGui.TreeNode("Item", "Item [0x%08X]", item.ID) then
+                        local _
+                        ImGui.Bullet(); _, item.Show = ImGui.Checkbox("Show", item.Show)
+                        ImGui.Bullet()
+                        local temp = ImGui.ColorConvertU32ToFloat4(item.Color)
+                        if ImGui.ColorEdit4("Color", temp, G.ImGuiColorEditFlags.NoInputs) then
+                            item.Color = ImGui.ColorConvertFloat4ToU32(temp)
+                        end
+                        if show_marker then ImGui.BulletText("Marker: %d", item.Marker) end
+                        ImGui.BulletText("Name: %s", item.Label or "N/A") -- [Port] NameOffset -> Label
+                        ImGui.BulletText("Hovered: %s", tostring(item.LegendHovered))
+                        ImGui.TreePop()
+                    end
+                    ImGui.PopID()
+                end
+                ImGui.TreePop()
+            end
+        end
+
+        -- [Port] bool* p_popen: pass the current open state, returns the updated one (like ImGui.Begin)
+        function ImPlot.ShowMetricsWindow(p_open)
+            local fg = ImGui.GetForegroundDrawList()
+            local gp = GImPlot
+            local io = ImGui.GetIO()
+            local _
+            p_open = ImGui.Begin("ImPlot Metrics", p_open)
+            ImGui.Text("ImPlot (Luau port)")
+            ImGui.Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0 / io.Framerate, io.Framerate)
+            ImGui.Text("Mouse Position: [%.0f,%.0f]", io.MousePos.x, io.MousePos.y)
+            ImGui.Separator()
+            if ImGui.TreeNode("Tools") then
+                if ImGui.Button("Bust Plot Cache") then internal.BustPlotCache() end
+                ImGui.SameLine()
+                if ImGui.Button("Bust Item Cache") then internal.BustItemCache() end
+                _, M.show_frame_rects = ImGui.Checkbox("Show Frame Rects", M.show_frame_rects)
+                _, M.show_canvas_rects = ImGui.Checkbox("Show Canvas Rects", M.show_canvas_rects)
+                _, M.show_plot_rects = ImGui.Checkbox("Show Plot Rects", M.show_plot_rects)
+                _, M.show_axes_rects = ImGui.Checkbox("Show Axes Rects", M.show_axes_rects)
+                _, M.show_axis_rects = ImGui.Checkbox("Show Axis Rects", M.show_axis_rects)
+                _, M.show_subplot_frame_rects = ImGui.Checkbox("Show Subplot Frame Rects", M.show_subplot_frame_rects)
+                _, M.show_subplot_grid_rects = ImGui.Checkbox("Show Subplot Grid Rects", M.show_subplot_grid_rects)
+                _, M.show_legend_rects = ImGui.Checkbox("Show Legend Rects", M.show_legend_rects)
+                ImGui.TreePop()
+            end
+            -- [Port] pools may hold freed slots; collect live entries
+            local plots, subplots = {}, {}
+            for p = 0, gp.Plots:GetMapSize() - 1 do
+                local plot = gp.Plots:GetByIndex(p)
+                if plot then table.insert(plots, plot) end
+            end
+            for p = 0, gp.Subplots:GetMapSize() - 1 do
+                local sp = gp.Subplots:GetByIndex(p)
+                if sp then table.insert(subplots, sp) end
+            end
+            local function legend_rects(items)
+                if M.show_legend_rects and items:GetLegendCount() > 0 then
+                    fg:AddRect(items.Legend.Rect.Min, items.Legend.Rect.Max, IM_COL32(255, 192, 0, 255))
+                    fg:AddRect(items.Legend.RectClamped.Min, items.Legend.RectClamped.Max, IM_COL32(255, 128, 0, 255))
+                end
+            end
+            for _, plot in plots do
+                if M.show_frame_rects then fg:AddRect(plot.FrameRect.Min, plot.FrameRect.Max, IM_COL32(255, 0, 255, 255)) end
+                if M.show_canvas_rects then fg:AddRect(plot.CanvasRect.Min, plot.CanvasRect.Max, IM_COL32(0, 255, 255, 255)) end
+                if M.show_plot_rects then fg:AddRect(plot.PlotRect.Min, plot.PlotRect.Max, IM_COL32(255, 255, 0, 255)) end
+                if M.show_axes_rects then fg:AddRect(plot.AxesRect.Min, plot.AxesRect.Max, IM_COL32(0, 255, 128, 255)) end
+                if M.show_axis_rects then
+                    for i = 0, ImPlot.ImAxis.COUNT - 1 do
+                        local ax = plot.Axes[i]
+                        if ax.Enabled then fg:AddRect(ax.HoverRect.Min, ax.HoverRect.Max, IM_COL32(0, 255, 0, 255)) end
+                    end
+                end
+                legend_rects(plot.Items)
+            end
+            for _, sp in subplots do
+                if M.show_subplot_frame_rects then fg:AddRect(sp.FrameRect.Min, sp.FrameRect.Max, IM_COL32(255, 0, 0, 255)) end
+                if M.show_subplot_grid_rects then fg:AddRect(sp.GridRect.Min, sp.GridRect.Max, IM_COL32(0, 0, 255, 255)) end
+                legend_rects(sp.Items)
+            end
+            if ImGui.TreeNode("Plots", "Plots (%d)", #plots) then
+                for p, plot in plots do
+                    ImGui.PushID(p - 1)
+                    if ImGui.TreeNode("Plot", "Plot [0x%08X]", plot.ID) then
+                        ShowItemsMetrics(plot.Items, nil, true)
+                        for i = 0, ImPlot.ImAxis.COUNT - 1 do
+                            local ax = plot.Axes[i]
+                            local is_x = i < ImPlot.ImAxis.Y1
+                            local n = is_x and (i + 1) or (i - ImPlot.ImAxis.Y1 + 1)
+                            local buff = string.format("%s-Axis %d", is_x and "X" or "Y", n)
+                            if ax.Enabled and ImGui.TreeNode(buff, "%s [0x%08X]", buff, ax.ID) then
+                                ShowAxisMetrics(plot, ax)
+                                ImGui.TreePop()
+                            end
+                        end
+                        ImGui.BulletText("Title: %s", plot:HasTitle() and plot:GetTitle() or "none")
+                        ImGui.BulletText("Flags: 0x%08X", plot.Flags)
+                        ImGui.BulletText("Initialized: %s", tostring(plot.Initialized))
+                        ImGui.BulletText("Selecting: %s", tostring(plot.Selecting))
+                        ImGui.BulletText("Selected: %s", tostring(plot.Selected))
+                        ImGui.BulletText("Hovered: %s", tostring(plot.Hovered))
+                        ImGui.BulletText("Held: %s", tostring(plot.Held))
+                        ImGui.BulletText("LegendHovered: %s", tostring(plot.Items.Legend.Hovered))
+                        ImGui.BulletText("ContextLocked: %s", tostring(plot.ContextLocked))
+                        ImGui.TreePop()
+                    end
+                    ImGui.PopID()
+                end
+                ImGui.TreePop()
+            end
+            if ImGui.TreeNode("Subplots", "Subplots (%d)", #subplots) then
+                for p, sp in subplots do
+                    ImGui.PushID(p - 1)
+                    if ImGui.TreeNode("Subplot", "Subplot [0x%08X]", sp.ID) then
+                        ShowItemsMetrics(sp.Items, nil, false)
+                        ImGui.BulletText("Flags: 0x%08X", sp.Flags)
+                        ImGui.BulletText("FrameHovered: %s", tostring(sp.FrameHovered))
+                        ImGui.BulletText("LegendHovered: %s", tostring(sp.Items.Legend.Hovered))
+                        ImGui.TreePop()
+                    end
+                    ImGui.PopID()
+                end
+                ImGui.TreePop()
+            end
+            if ImGui.TreeNode("Colormaps") then
+                local cd = gp.ColormapData
+                ImGui.BulletText("Colormaps:  %d", cd.Count)
+                ImGui.BulletText("Memory: %d bytes", #cd.Tables * 4)
+                if ImGui.TreeNode("Data") then
+                    for m = 0, cd.Count - 1 do
+                        if ImGui.TreeNode(cd:GetName(m)) then
+                            local size = cd:GetTableSize(m)
+                            ImGui.BulletText("Qualitative: %s", tostring(cd:IsQual(m)))
+                            ImGui.BulletText("Key Count: %d", cd:GetKeyCount(m))
+                            ImGui.BulletText("Table Size: %d", size)
+                            ImGui.Indent()
+                            local samp = ImVec4(0, 0, 0, 0)
+                            local wid = 32 * 10 - ImGui.GetFrameHeight() - ImGui.GetStyle().ItemSpacing.x
+                            ImGui.SetNextItemWidth(wid)
+                            M.t = ImPlot.ColormapSlider("##Sample", M.t, samp, "%.3f", m)
+                            ImGui.SameLine()
+                            ImGui.ColorButton("Sampler", samp)
+                            ImGui.PushStyleColor(G.ImGuiCol.FrameBg, ImVec4(0, 0, 0, 0))
+                            ImGui.PushStyleVar(G.ImGuiStyleVar.ItemSpacing, ImVec2(0, 0))
+                            for c = 0, size - 1 do
+                                ImGui.PushID(m * 1000 + c)
+                                ImGui.ColorButton("", ImGui.ColorConvertU32ToFloat4(cd:GetTableColor(m, c)), 0, ImVec2(10, 10))
+                                ImGui.PopID()
+                                if (c + 1) % 32 ~= 0 and c ~= size - 1 then ImGui.SameLine() end
+                            end
+                            ImGui.PopStyleVar()
+                            ImGui.PopStyleColor()
+                            ImGui.Unindent()
+                            ImGui.TreePop()
+                        end
+                    end
+                    ImGui.TreePop()
+                end
+                ImGui.TreePop()
+            end
+            ImGui.End()
+            return p_open
+        end
+
+        local PTm = { tm_year = 70, tm_mon = 0, tm_mday = 1, tm_hour = 0, tm_min = 0, tm_sec = 0, tm_wday = 0, tm_yday = 0 }
+
+        -- [Port] int* level / ImPlotTime* t by value: returns (clicked, level, t)
+        function internal.ShowDatePicker(id, level, t, t1, t2)
+            local TU = internal.ImPlotTimeUnit
+            local GetTime, FloorTime, AddTime, MakeTime = internal.GetTime, internal.FloorTime, internal.AddTime, internal.MakeTime
+            local BeginDis, EndDis = internal.BeginDisabledControls, internal.EndDisabledControls
+            local Up, Down = G.ImGuiDir.Up, G.ImGuiDir.Down
+            ImGui.PushID(id)
+            ImGui.BeginGroup()
+
+            local style   = ImGui.GetStyle()
+            local col_txt = style.Colors[G.ImGuiCol.Text]
+            local col_dis = style.Colors[G.ImGuiCol.TextDisabled]
+            local col_btn = style.Colors[G.ImGuiCol.Button]
+            ImGui.PushStyleColor(G.ImGuiCol.Button, ImVec4(0, 0, 0, 0))
+            ImGui.PushStyleVar(G.ImGuiStyleVar.ItemSpacing, ImVec2(0, 0))
+
+            local ht = ImGui.GetFrameHeight()
+            local cell_size = ImVec2(ht * 1.25, ht)
+            local clk = false
+            local min_yr, max_yr = 1970, 2999
+
+            local t1_mo, t1_md, t1_yr = 0, 0, 0
+            if t1 ~= nil then
+                GetTime(t1, PTm)
+                t1_mo, t1_md, t1_yr = PTm.tm_mon, PTm.tm_mday, PTm.tm_year + 1900
+            end
+            local t2_mo, t2_md, t2_yr = 0, 0, 0
+            if t2 ~= nil then
+                GetTime(t2, PTm)
+                t2_mo, t2_md, t2_yr = PTm.tm_mon, PTm.tm_mday, PTm.tm_year + 1900
+            end
+
+            if level == 0 then
+                t = FloorTime(t, TU.Day)
+                GetTime(t, PTm)
+                local this_year = PTm.tm_year + 1900
+                local last_year = this_year - 1
+                local next_year = this_year + 1
+                local this_mon  = PTm.tm_mon
+                local last_mon  = this_mon == 0 and 11 or this_mon - 1
+                local next_mon  = this_mon == 11 and 0 or this_mon + 1
+                local days_this_mo = internal.GetDaysInMonth(this_year, this_mon)
+                local days_last_mo = internal.GetDaysInMonth(this_mon == 0 and last_year or this_year, last_mon)
+                GetTime(FloorTime(t, TU.Mo), PTm)
+                local first_wd = PTm.tm_wday
+                if ImGui.Button(string.format("%s %d", internal.MONTH_NAMES[this_mon + 1], this_year)) then
+                    level = 1
+                end
+                ImGui.SameLine(5 * cell_size.x)
+                local dis = this_year <= min_yr and this_mon == 0
+                BeginDis(dis)
+                if ImGui.ArrowButtonEx("##Up", Up, cell_size) then t = AddTime(t, TU.Mo, -1) end
+                EndDis(dis)
+                ImGui.SameLine()
+                dis = this_year >= max_yr and this_mon == 11
+                BeginDis(dis)
+                if ImGui.ArrowButtonEx("##Down", Down, cell_size) then t = AddTime(t, TU.Mo, 1) end
+                EndDis(dis)
+                ImGui.PushItemFlag(G.ImGuiItemFlags.Disabled, true)
+                for i = 1, 7 do
+                    ImGui.Button(internal.WD_ABRVS[i], cell_size)
+                    if i ~= 7 then ImGui.SameLine() end
+                end
+                ImGui.PopItemFlag()
+                -- 0 = last mo, 1 = this mo, 2 = next mo
+                local mo = first_wd > 0 and 0 or 1
+                local day = mo == 1 and 1 or days_last_mo - first_wd + 1
+                for i = 0, 5 do
+                    for j = 0, 6 do
+                        if mo == 0 and day > days_last_mo then
+                            mo = 1; day = 1
+                        elseif mo == 1 and day > days_this_mo then
+                            mo = 2; day = 1
+                        end
+                        local now_yr = (mo == 0 and this_mon == 0) and last_year or ((mo == 2 and this_mon == 11) and next_year or this_year)
+                        local now_mo = mo == 0 and last_mon or (mo == 1 and this_mon or next_mon)
+                        local now_md = day
+                        local off_mo = mo == 0 or mo == 2
+                        local t1_or_t2 = (t1 ~= nil and t1_mo == now_mo and t1_yr == now_yr and t1_md == now_md) or
+                                         (t2 ~= nil and t2_mo == now_mo and t2_yr == now_yr and t2_md == now_md)
+                        if off_mo then ImGui.PushStyleColor(G.ImGuiCol.Text, col_dis) end
+                        if t1_or_t2 then
+                            ImGui.PushStyleColor(G.ImGuiCol.Button, col_btn)
+                            ImGui.PushStyleColor(G.ImGuiCol.Text, col_txt)
+                        end
+                        ImGui.PushID(i * 7 + j)
+                        if now_yr == min_yr - 1 or now_yr == max_yr + 1 then
+                            ImGui.Dummy(cell_size)
+                        elseif ImGui.Button(tostring(day), cell_size) and not clk then
+                            t = MakeTime(now_yr, now_mo, now_md)
+                            clk = true
+                        end
+                        ImGui.PopID()
+                        if t1_or_t2 then ImGui.PopStyleColor(2) end
+                        if off_mo then ImGui.PopStyleColor() end
+                        if j ~= 6 then ImGui.SameLine() end
+                        day += 1
+                    end
+                end
+            elseif level == 1 then
+                t = FloorTime(t, TU.Mo)
+                GetTime(t, PTm)
+                local this_yr = PTm.tm_year + 1900
+                if ImGui.Button(tostring(this_yr)) then level = 2 end
+                BeginDis(this_yr <= min_yr)
+                ImGui.SameLine(5 * cell_size.x)
+                if ImGui.ArrowButtonEx("##Up", Up, cell_size) then t = AddTime(t, TU.Yr, -1) end
+                EndDis(this_yr <= min_yr)
+                ImGui.SameLine()
+                BeginDis(this_yr >= max_yr)
+                if ImGui.ArrowButtonEx("##Down", Down, cell_size) then t = AddTime(t, TU.Yr, 1) end
+                EndDis(this_yr >= max_yr)
+                cell_size = ImVec2(cell_size.x * 7 / 4, cell_size.y * 7 / 3)
+                local mo = 0
+                for _ = 0, 2 do
+                    for j = 0, 3 do
+                        local t1_or_t2 = (t1 ~= nil and t1_yr == this_yr and t1_mo == mo) or (t2 ~= nil and t2_yr == this_yr and t2_mo == mo)
+                        if t1_or_t2 then ImGui.PushStyleColor(G.ImGuiCol.Button, col_btn) end
+                        if ImGui.Button(internal.MONTH_ABRVS[mo + 1], cell_size) and not clk then
+                            t = MakeTime(this_yr, mo)
+                            level = 0
+                        end
+                        if t1_or_t2 then ImGui.PopStyleColor() end
+                        if j ~= 3 then ImGui.SameLine() end
+                        mo += 1
+                    end
+                end
+            elseif level == 2 then
+                t = FloorTime(t, TU.Yr)
+                local this_yr = internal.GetYear(t)
+                local yr = this_yr - this_yr % 20
+                ImGui.PushItemFlag(G.ImGuiItemFlags.Disabled, true)
+                ImGui.Button(string.format("%d-%d", yr, yr + 19))
+                ImGui.PopItemFlag()
+                ImGui.SameLine(5 * cell_size.x)
+                BeginDis(yr <= min_yr)
+                if ImGui.ArrowButtonEx("##Up", Up, cell_size) then t = MakeTime(yr - 20) end
+                EndDis(yr <= min_yr)
+                ImGui.SameLine()
+                BeginDis(yr + 20 >= max_yr)
+                if ImGui.ArrowButtonEx("##Down", Down, cell_size) then t = MakeTime(yr + 20) end
+                EndDis(yr + 20 >= max_yr)
+                cell_size = ImVec2(cell_size.x * 7 / 4, cell_size.y * 7 / 5)
+                for _ = 0, 4 do
+                    for j = 0, 3 do
+                        local t1_or_t2 = (t1 ~= nil and t1_yr == yr) or (t2 ~= nil and t2_yr == yr)
+                        if t1_or_t2 then ImGui.PushStyleColor(G.ImGuiCol.Button, col_btn) end
+                        if yr < 1970 or yr > 3000 then
+                            ImGui.Dummy(cell_size)
+                        elseif ImGui.Button(tostring(yr), cell_size) then
+                            t = MakeTime(yr)
+                            level = 1
+                        end
+                        if t1_or_t2 then ImGui.PopStyleColor() end
+                        if j ~= 3 then ImGui.SameLine() end
+                        yr += 1
+                    end
+                end
+            end
+            ImGui.PopStyleVar()
+            ImGui.PopStyleColor()
+            ImGui.EndGroup()
+            ImGui.PopID()
+            return clk, level, t
+        end
+        ImPlot.ShowDatePicker = internal.ShowDatePicker
+
+        local NUMS = {}
+        for i = 0, 59 do NUMS[i] = string.format("%02d", i) end
+
+        -- [Port] ImPlotTime* t by value: returns (changed, t)
+        function internal.ShowTimePicker(id, t)
+            local gp = GImPlot
+            ImGui.PushID(id)
+            internal.GetTime(t, PTm)
+            local hour24 = gp.Style.Use24HourClock
+            local hr  = hour24 and PTm.tm_hour or ((PTm.tm_hour == 0 or PTm.tm_hour == 12) and 12 or PTm.tm_hour % 12)
+            local min = PTm.tm_min
+            local sec = PTm.tm_sec
+            local ap  = PTm.tm_hour < 12 and 0 or 1
+            local changed = false
+
+            local spacing = ImVec2(0, ImGui.GetStyle().ItemSpacing.y)
+            local width  = ImGui.CalcTextSize("888").x
+            local height = ImGui.GetFrameHeight()
+
+            ImGui.PushStyleVar(G.ImGuiStyleVar.ItemSpacing, spacing)
+            ImGui.PushStyleVar(G.ImGuiStyleVar.ScrollbarSize, 2.0)
+            ImGui.PushStyleColor(G.ImGuiCol.FrameBg, ImVec4(0, 0, 0, 0))
+            ImGui.PushStyleColor(G.ImGuiCol.Button, ImVec4(0, 0, 0, 0))
+            ImGui.PushStyleColor(G.ImGuiCol.FrameBgHovered, ImGui.GetStyleColorVec4(G.ImGuiCol.ButtonHovered))
+
+            local function combo(label, cur, ia, ib)
+                ImGui.SetNextItemWidth(width)
+                if ImGui.BeginCombo(label, NUMS[cur], G.ImGuiComboFlags.NoArrowButton) then
+                    for i = ia, ib - 1 do
+                        if ImGui.Selectable(NUMS[i], i == cur) then
+                            cur = i
+                            changed = true
+                        end
+                    end
+                    ImGui.EndCombo()
+                end
+                return cur
+            end
+            hr = combo("##hr", hr, hour24 and 0 or 1, hour24 and 24 or 13)
+            ImGui.SameLine(); ImGui.Text(":"); ImGui.SameLine()
+            min = combo("##min", min, 0, 60)
+            ImGui.SameLine(); ImGui.Text(":"); ImGui.SameLine()
+            sec = combo("##sec", sec, 0, 60)
+            if not hour24 then
+                ImGui.SameLine()
+                if ImGui.Button(ap == 0 and "am" or "pm", ImVec2(0, height)) then
+                    ap = 1 - ap
+                    changed = true
+                end
+            end
+
+            ImGui.PopStyleColor(3)
+            ImGui.PopStyleVar(2)
+            ImGui.PopID()
+
+            if changed then
+                if not hour24 then hr = hr % 12 + ap * 12 end
+                PTm.tm_hour = hr
+                PTm.tm_min  = min
+                PTm.tm_sec  = sec
+                t = internal.MkTime(PTm)
+            end
+            return changed, t
+        end
+        ImPlot.ShowTimePicker = internal.ShowTimePicker
     end
 
 
