@@ -5295,6 +5295,21 @@ end            -- apply highlight mods
             r.U, r.V = uv.x, uv.y
         end
 
+        -- [Port] no axis transform functions (and per-index colours covering i0..i1): point read + transform + colour
+        -- inlined. Returns the getter's Get and, when it reads two plain arrays, those arrays (read directly); nil when the
+        -- range can't be inlined.
+        local function RangeSource(r, i0, i1)
+            if tx_fwd ~= nil or ty_fwd ~= nil or (r.Cols ~= nil and (i0 < 0 or i1 >= r.ColCount)) then
+                return nil
+            end
+            local g = r.Getter
+            if g.Get == XYGet then
+                local xs, ys = PlainData(g.IndexerX), PlainData(g.IndexerY)
+                if xs ~= nil and ys ~= nil then return XYGet, xs, ys end
+            end
+            return g.Get, nil, nil
+        end
+
         local function LineStripRender(r, dl, cr, prim)
             local g = r.Getter
             local x, y = g.Get(g, prim + 1)
@@ -5309,21 +5324,20 @@ end            -- apply highlight mods
             return true
         end
 
-        -- [Port] prims i0..i1 in one call when the getter reads two plain arrays (no axis transform functions):
-        -- LineStripRender + XYGet + TransformX/Y + Overlaps + GetCol + PrimLine inlined, same math. Returns culled count.
+        -- [Port] prims i0..i1 in one call when there are no axis transform functions: LineStripRender + TransformX/Y +
+        -- Overlaps + GetCol + PrimLine inlined, same math; a getter reading two plain arrays is read directly, any other
+        -- getter through Get. Returns culled count.
 
         local function LineStripRange(r, dl, cr, i0, i1)
-            local g = r.Getter
-            local ix, iy = g.IndexerX, g.IndexerY
-            local cols, alpha = r.Cols, r.ColAlpha
-            if g.Get ~= XYGet or ix.At ~= IdxAt3 or iy.At ~= IdxAt3 or tx_fwd ~= nil or ty_fwd ~= nil or (cols ~= nil and (i0 < 0 or i1 >= r.ColCount)) then
+            local get, xs, ys = RangeSource(r, i0, i1)
+            if get == nil then
                 local culled = 0
                 for i = i0, i1 do
                     if not LineStripRender(r, dl, cr, i) then culled =culled+ 1 end
                 end
                 return culled
             end
-            local xs, ys = ix.Data, iy.Data
+            local g, cols, alpha = r.Getter, r.Cols, r.ColAlpha
             local cminx, cminy, cmaxx, cmaxy = cr.Min.x, cr.Min.y, cr.Max.x, cr.Max.y
             local xpm, xm, xpl, ypm, ym, ypl = tx_pixmin, tx_m, tx_pltmin, ty_pixmin, ty_m, ty_pltmin
             local hw, col, u0, v0, u1, v1, skip = r.HalfWeight, r.Col, r.U0, r.V0, r.U1, r.V1, r.Skip
@@ -5332,7 +5346,13 @@ end            -- apply highlight mods
             local p1x, p1y = r.P1x, r.P1y
             local culled = 0
             for i = i0, i1 do
-                local p2x, p2y = xpm + xm * (xs[i + 2] - xpl), ypm + ym * (ys[i + 2] - ypl)
+                local x, y
+                if xs ~= nil then
+                    x, y = xs[i + 2], ys[i + 2]
+                else
+                    x, y = get(g, i + 1)
+                end
+                local p2x, p2y = xpm + xm * (x - xpl), ypm + ym * (y - ypl)
                 local minx, maxx = p1x, p2x
                 if p2x < p1x then minx, maxx = p2x, p1x end
                 local miny, maxy = p1y, p2y
@@ -5552,31 +5572,36 @@ end            -- apply highlight mods
             end
             return false
         end
-        -- [Port] plain-array getter, no axis transform functions, one colour: point read + transform inlined
-        local function PlainXY(r)
-            local g = r.Getter
-            return g.Get == XYGet and g.IndexerX.At == IdxAt3 and g.IndexerY.At == IdxAt3 and tx_fwd == nil
-                and ty_fwd == nil and r.Cols == nil
-        end
 
         local function MarkersFillRange(r, dl, cr, i0, i1)
-            if not PlainXY(r) then
+            local get, xs, ys = RangeSource(r, i0, i1)
+            if get == nil then
                 local culled = 0
                 for i = i0, i1 do
                     if not MarkersFillRender(r, dl, cr, i) then culled =culled+ 1 end
                 end
                 return culled
             end
-            local g = r.Getter
-            local xs, ys = g.IndexerX.Data, g.IndexerY.Data
+            local g, cols, alpha = r.Getter, r.Cols, r.ColAlpha
             local cminx, cminy, cmaxx, cmaxy = cr.Min.x, cr.Min.y, cr.Max.x, cr.Max.y
             local m, count, u, v, col, sizes, size = r.Marker, r.Count, r.U, r.V, r.Col, r.Sizes, r.Size
             local b, id = dl.VtxBuffer.Buf, dl.IdxBuffer.Data
             local vw, iw, idx = dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx
             local culled = 0
             for prim = i0, i1 do
-                local px, py = tx_pixmin + tx_m * (xs[prim + 1] - tx_pltmin), ty_pixmin + ty_m * (ys[prim + 1] - ty_pltmin)
+                local x, y
+                if xs ~= nil then
+                    x, y = xs[prim + 1], ys[prim + 1]
+                else
+                    x, y = get(g, prim)
+                end
+                local px, py = tx_pixmin + tx_m * (x - tx_pltmin), ty_pixmin + ty_m * (y - ty_pltmin)
                 if px >= cminx and py >= cminy and px <= cmaxx and py <= cmaxy then
+                    local col = col
+                    if cols ~= nil then
+                        col = cols[prim + 1]
+                        if alpha < 1 then col = MulAlphaU32(col, alpha) end
+                    end
                     local sz = size
                     if sizes then sz = sizes[prim + 1] end
                     local o = (vw - 1) * VTX_STRIDE
@@ -5623,15 +5648,15 @@ end            -- apply highlight mods
         end
 
         local function MarkersLineRange(r, dl, cr, i0, i1)
-            if not PlainXY(r) then
+            local get, xs, ys = RangeSource(r, i0, i1)
+            if get == nil then
                 local culled = 0
                 for i = i0, i1 do
                     if not MarkersLineRender(r, dl, cr, i) then culled =culled+ 1 end
                 end
                 return culled
             end
-            local g = r.Getter
-            local xs, ys = g.IndexerX.Data, g.IndexerY.Data
+            local g, cols, alpha = r.Getter, r.Cols, r.ColAlpha
             local cminx, cminy, cmaxx, cmaxy = cr.Min.x, cr.Min.y, cr.Max.x, cr.Max.y
             local m, count, col, sizes, size = r.Marker, r.Count, r.Col, r.Sizes, r.Size
             local hw, u0, v0, u1, v1 = r.HalfWeight, r.U0, r.V0, r.U1, r.V1
@@ -5639,8 +5664,19 @@ end            -- apply highlight mods
             local vw, iw, idx = dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx
             local culled = 0
             for prim = i0, i1 do
-                local px, py = tx_pixmin + tx_m * (xs[prim + 1] - tx_pltmin), ty_pixmin + ty_m * (ys[prim + 1] - ty_pltmin)
+                local x, y
+                if xs ~= nil then
+                    x, y = xs[prim + 1], ys[prim + 1]
+                else
+                    x, y = get(g, prim)
+                end
+                local px, py = tx_pixmin + tx_m * (x - tx_pltmin), ty_pixmin + ty_m * (y - ty_pltmin)
                 if px >= cminx and py >= cminy and px <= cmaxx and py <= cmaxy then
+                    local col = col
+                    if cols ~= nil then
+                        col = cols[prim + 1]
+                        if alpha < 1 then col = MulAlphaU32(col, alpha) end
+                    end
                     local sz = size
                     if sizes then sz = sizes[prim + 1] end
                     for i = 0, count - 1, 2 do
