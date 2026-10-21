@@ -5019,9 +5019,13 @@ end            -- apply highlight mods
         -----------------------------------------------------------------------
 
         -- [Port] IndexData switch -> one At function per case, picked at construction
+
         local function IdxAt3(self, i) return self.Data[i + 1] end
+
         local function IdxAt2(self, i) return self.Data[(self.Offset + i) % self.Count + 1] end
+
         local function IdxAt1(self, i) return self.Data[i * self.Stride + 1] end
+
         local function IdxAt0(self, i) return self.Data[((self.Offset + i) % self.Count) * self.Stride + 1] end
 
         function internal.IndexerIdx(data, count, offset, stride)
@@ -6370,6 +6374,7 @@ end            -- apply highlight mods
             function internal.IndexerAdd(i1, i2, s1, s2) return { Indexer1 = i1, Indexer2 = i2, Scale1 = s1, Scale2 = s2, At = AddAt } end
 
             -- [Port] GetterXYZ: Get returns (x, y, z)
+
             local function XYZGet(self, i)
                 local ix, iy, iz = self.IndexerX, self.IndexerY, self.IndexerZ
                 return ix.At(ix, i), iy.At(iy, i), iz.At(iz, i)
@@ -6845,6 +6850,7 @@ end            -- apply highlight mods
             end
 
             -- [Port] ImMinMaxIndexer -> returns (min, max)
+
             local function ImMinMaxIndexer(indexer, count)
                 local min_out, max_out = indexer.At(indexer, 0), indexer.At(indexer, 0)
                 for i = 1, count - 1 do
@@ -7202,6 +7208,7 @@ end            -- apply highlight mods
             local hist_spec = SpecDefaults({})
 
             -- PlotHistogram(label_id, values, count?, bins = ImPlotBin.Sturges, bar_scale = 1.0, range = ImPlotRange(), spec?)
+
             function ImPlot.PlotHistogram(label_id, values, count, bins, bar_scale, range, sp)
                 count = count or #values
                 bins = bins or ImPlotBin.Sturges
@@ -7307,6 +7314,7 @@ end            -- apply highlight mods
             local bin_counts_2d = {}
 
             -- PlotHistogram2D(label_id, xs, ys, count?, x_bins = ImPlotBin.Sturges, y_bins = ImPlotBin.Sturges, range = ImPlotRect(), spec?)
+
             function ImPlot.PlotHistogram2D(label_id, xs, ys, count, x_bins, y_bins, range, sp)
                 count = count or min(#xs, #ys)
                 x_bins = x_bins or ImPlotBin.Sturges

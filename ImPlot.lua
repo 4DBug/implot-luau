@@ -835,6 +835,7 @@ return function(G)
         function CM:GetTableSize(cmap) return self.TableSizes[cmap + 1] end
         function CM:GetTableColor(cmap, idx) return self.Tables[self.TableOffsets[cmap + 1] + idx + 1] end
 
+        @native
         function CM:LerpTable(cmap, t)
             local off = self.TableOffsets[cmap + 1]
             local siz = self.TableSizes[cmap + 1]
@@ -1435,6 +1436,7 @@ return function(G)
             return plt
         end
 
+        @native
         function AxisMT:ExtendFit(v)
             if not ImNanOrInf(v) and v >= self.ConstraintRange.Min and v <= self.ConstraintRange.Max then
                 if v < self.FitExtents.Min then self.FitExtents.Min = v end
@@ -1442,6 +1444,7 @@ return function(G)
             end
         end
 
+        @native
         function AxisMT:ExtendFitWith(alt, v, v_alt)
             if ImHasFlag(self.Flags, ImPlotAxisFlags.RangeFit) and not alt.Range:Contains(v_alt) then
                 return
@@ -5017,9 +5020,13 @@ return function(G)
         -----------------------------------------------------------------------
 
         -- [Port] IndexData switch -> one At function per case, picked at construction
+        @native
         local function IdxAt3(self, i) return self.Data[i + 1] end
+        @native
         local function IdxAt2(self, i) return self.Data[(self.Offset + i) % self.Count + 1] end
+        @native
         local function IdxAt1(self, i) return self.Data[i * self.Stride + 1] end
+        @native
         local function IdxAt0(self, i) return self.Data[((self.Offset + i) % self.Count) * self.Stride + 1] end
 
         function internal.IndexerIdx(data, count, offset, stride)
@@ -5034,9 +5041,11 @@ return function(G)
             return { Data = data, Count = count, Offset = offset, Stride = stride, At = at }
         end
 
+        @native
         local function LinAt(self, i) return self.M * i + self.B end
         function internal.IndexerLin(m, b) return { M = m, B = b, At = LinAt } end
 
+        @native
         local function ConstAt(self) return self.Ref end
         function internal.IndexerConst(ref) return { Ref = ref, At = ConstAt } end
 
@@ -5044,18 +5053,22 @@ return function(G)
         -- Getters
         -----------------------------------------------------------------------
 
+        @native
         local function XYGet(self, i)
             local ix, iy = self.IndexerX, self.IndexerY
             return ix.At(ix, i), iy.At(iy, i)
         end
         function internal.GetterXY(ix, iy, count) return { IndexerX = ix, IndexerY = iy, Count = count, Get = XYGet } end
 
+        @native
         local function OverrideXGet(self, i) local g = self.Getter; local _, y = g.Get(g, i); return self.X, y end
         function internal.GetterOverrideX(getter, x) return { Getter = getter, X = x, Count = getter.Count, Get = OverrideXGet } end
 
+        @native
         local function OverrideYGet(self, i) local g = self.Getter; local x = g.Get(g, i); return x, self.Y end
         function internal.GetterOverrideY(getter, y) return { Getter = getter, Y = y, Count = getter.Count, Get = OverrideYGet } end
 
+        @native
         local function LoopGet(self, i) local g = self.Getter; return g.Get(g, i % (self.Count - 1)) end
         function internal.GetterLoop(getter) return { Getter = getter, Count = getter.Count + 1, Get = LoopGet } end
 
@@ -5071,6 +5084,7 @@ return function(G)
         -- Fitters
         -----------------------------------------------------------------------
 
+        @native
         local function Fitter1Fit(self, x_axis, y_axis)
             local g = self.Getter
             local get = g.Get
@@ -5082,12 +5096,14 @@ return function(G)
         end
         function internal.Fitter1(getter) return { Getter = getter, Fit = Fitter1Fit } end
 
+        @native
         local function FitterXFit(self, x_axis)
             local g = self.Getter
             for i = 0, g.Count - 1 do local x = g.Get(g, i); x_axis:ExtendFit(x) end
         end
         function internal.FitterX(getter) return { Getter = getter, Fit = FitterXFit } end
 
+        @native
         local function FitterYFit(self, _, y_axis)
             local g = self.Getter
             for i = 0, g.Count - 1 do local _, y = g.Get(g, i); y_axis:ExtendFit(y) end
@@ -6382,6 +6398,7 @@ return function(G)
             function internal.IndexerAdd(i1, i2, s1, s2) return { Indexer1 = i1, Indexer2 = i2, Scale1 = s1, Scale2 = s2, At = AddAt } end
 
             -- [Port] GetterXYZ: Get returns (x, y, z)
+            @native
             local function XYZGet(self, i)
                 local ix, iy, iz = self.IndexerX, self.IndexerY, self.IndexerZ
                 return ix.At(ix, i), iy.At(iy, i), iz.At(iz, i)
@@ -6857,6 +6874,7 @@ return function(G)
             end
 
             -- [Port] ImMinMaxIndexer -> returns (min, max)
+            @native
             local function ImMinMaxIndexer(indexer, count)
                 local min_out, max_out = indexer.At(indexer, 0), indexer.At(indexer, 0)
                 for i = 1, count - 1 do
@@ -6867,6 +6885,7 @@ return function(G)
                 return min_out, max_out
             end
 
+            @native
             local function ImStdDev(indexer, count)
                 local den = 1.0 / (count - 1.0)
                 local mu = 0
@@ -7214,6 +7233,7 @@ return function(G)
             local hist_spec = SpecDefaults({})
 
             -- PlotHistogram(label_id, values, count?, bins = ImPlotBin.Sturges, bar_scale = 1.0, range = ImPlotRange(), spec?)
+            @native
             function ImPlot.PlotHistogram(label_id, values, count, bins, bar_scale, range, sp)
                 count = count or #values
                 bins = bins or ImPlotBin.Sturges
@@ -7319,6 +7339,7 @@ return function(G)
             local bin_counts_2d = {}
 
             -- PlotHistogram2D(label_id, xs, ys, count?, x_bins = ImPlotBin.Sturges, y_bins = ImPlotBin.Sturges, range = ImPlotRect(), spec?)
+            @native
             function ImPlot.PlotHistogram2D(label_id, xs, ys, count, x_bins, y_bins, range, sp)
                 count = count or min(#xs, #ys)
                 x_bins = x_bins or ImPlotBin.Sturges
