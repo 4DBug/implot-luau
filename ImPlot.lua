@@ -1188,6 +1188,7 @@ return function(G)
         -- [Port] AddTick(value, major, level, show_label, label) and AddTick(..., formatter, data) overloads:
         -- `label_or_formatter` is a string or a formatter function(value, data) -> string
         function TickerMT:AddTick(value, major, level, show_label, label_or_formatter, data)
+            self.MemoValid = false -- [Luau] see Locator_Default
             local n = self.Size + 1
             local tick = self.Ticks[n]
             if tick == nil then
@@ -1639,8 +1640,52 @@ return function(G)
         local TICK_FILL_X = 0.8
         local TICK_FILL_Y = 1.0
 
+        -- [Luau] Locator_Default memo: the inputs of the previous call on this ticker. When the ticker held no other ticks and
+        -- nothing changed (range, pixels, orientation, Formatter_Default + format, font + size), the previous call's ticks
+        -- are still in ticker.Ticks (recycled, untouched: any AddTick clears MemoValid) and are restored instead of being
+        -- regenerated (labels formatted and measured again). Same ticks, labels, sizes and pruning.
+        local function LocatorMemoHit(ticker, range, pixels, vertical, formatter, formatter_data)
+            local m = ticker.Memo
+            if not ticker.MemoValid or m == nil or ticker.Size ~= 0 or formatter ~= internal.Formatter_Default then
+                return false
+            end
+            local g = ImGui.GetCurrentContext()
+            if m.Min ~= range.Min or m.Max ~= range.Max or m.Pixels ~= pixels or m.Vertical ~= vertical or m.Data ~= formatter_data
+                or m.Font ~= g.Font or m.FontSize ~= g.FontSize or m.FontBaked ~= g.FontBaked then
+                return false
+            end
+            ticker.Size = m.Count
+            if m.MaxX > ticker.MaxSize.x then ticker.MaxSize.x = m.MaxX end
+            if m.MaxY > ticker.MaxSize.y then ticker.MaxSize.y = m.MaxY end
+            return true
+        end
+        local function LocatorMemoStore(ticker, range, pixels, vertical, formatter, formatter_data, idx0)
+            if idx0 ~= 0 or formatter ~= internal.Formatter_Default then
+                return
+            end
+            local m = ticker.Memo
+            if m == nil then m = {}; ticker.Memo = m end
+            local g = ImGui.GetCurrentContext()
+            m.Min, m.Max, m.Pixels, m.Vertical, m.Data = range.Min, range.Max, pixels, vertical, formatter_data
+            m.Font, m.FontSize, m.FontBaked = g.Font, g.FontSize, g.FontBaked
+            m.Count = ticker.Size
+            -- label-only MaxSize contribution (MaxSize also starts from LateSize, which can differ next frame)
+            local mx, my = 0, 0
+            local ticks = ticker.Ticks
+            for i = 1, ticker.Size do
+                local ls = ticks[i].LabelSize
+                if ls.x > mx then mx = ls.x end
+                if ls.y > my then my = ls.y end
+            end
+            m.MaxX, m.MaxY = mx, my
+            ticker.MemoValid = true
+        end
+
         function internal.Locator_Default(ticker, range, pixels, vertical, formatter, formatter_data)
             if range.Min == range.Max then
+                return
+            end
+            if LocatorMemoHit(ticker, range, pixels, vertical, formatter, formatter_data) then
                 return
             end
             local nMinor        = 10
@@ -1686,6 +1731,7 @@ return function(G)
                     ticks[i + 1].ShowLabel = false
                 end
             end
+            LocatorMemoStore(ticker, range, pixels, vertical, formatter, formatter_data, idx0)
         end
         local Locator_Default = internal.Locator_Default
         local DBL_MIN = 2.2250738585072014e-308
