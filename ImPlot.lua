@@ -4603,6 +4603,7 @@ return function(G)
         internal.ImAlphaU32 = ImAlphaU32
 
         -- [Port] scalar alpha multiply on a packed color (replaces ColorConvertU32ToFloat4 + GetColorU32 per point)
+        @native
         local function MulAlphaU32(col, alpha)
             local a = floor(rshift(col, 24) * alpha + 0.5)
             if a > 255 then a = 255 elseif a < 0 then a = 0 end
@@ -5042,6 +5043,12 @@ return function(G)
         end
 
         @native
+        -- [Luau] the array behind a plain (offset 0, stride 1) IndexerIdx, or nil: hot loops read it directly instead of
+        -- calling At per value (same values)
+        local function PlainData(indexer) return indexer.At == IdxAt3 and indexer.Data or nil end
+        internal.PlainData = PlainData
+
+        @native
         local function LinAt(self, i) return self.M * i + self.B end
         function internal.IndexerLin(m, b) return { M = m, B = b, At = LinAt } end
 
@@ -5271,13 +5278,14 @@ return function(G)
             return true
         end
 
-        -- [Port] prims i0..i1 in one call when the getter reads two plain arrays (no axis transform functions, one
-        -- colour): LineStripRender + XYGet + TransformX/Y + Overlaps + PrimLine inlined, same math. Returns culled count.
+        -- [Port] prims i0..i1 in one call when the getter reads two plain arrays (no axis transform functions):
+        -- LineStripRender + XYGet + TransformX/Y + Overlaps + GetCol + PrimLine inlined, same math. Returns culled count.
         @native
         local function LineStripRange(r, dl, cr, i0, i1)
             local g = r.Getter
             local ix, iy = g.IndexerX, g.IndexerY
-            if g.Get ~= XYGet or ix.At ~= IdxAt3 or iy.At ~= IdxAt3 or tx_fwd ~= nil or ty_fwd ~= nil or r.Cols ~= nil then
+            local cols, alpha = r.Cols, r.ColAlpha
+            if g.Get ~= XYGet or ix.At ~= IdxAt3 or iy.At ~= IdxAt3 or tx_fwd ~= nil or ty_fwd ~= nil or (cols ~= nil and (i0 < 0 or i1 >= r.ColCount)) then
                 local culled = 0
                 for i = i0, i1 do
                     if not LineStripRender(r, dl, cr, i) then culled += 1 end
@@ -5299,15 +5307,20 @@ return function(G)
                 local miny, maxy = p1y, p2y
                 if p2y < p1y then miny, maxy = p2y, p1y end
                 if miny < cmaxy and maxy > cminy and minx < cmaxx and maxx > cminx then
+                    local c = col
+                    if cols ~= nil then
+                        c = cols[i + 1]
+                        if alpha < 1 then c = MulAlphaU32(c, alpha) end
+                    end
                     local dx, dy = p2x - p1x, p2y - p1y
                     local d2 = dx * dx + dy * dy
                     if d2 > 0 then local inv = 1 / sqrt(d2); dx *= inv; dy *= inv end
                     dx *= hw; dy *= hw
                     local o = (vw - 1) * VTX_STRIDE
-                    WV(b, o,                  p1x + dy, p1y - dx, u0, v0, col)
-                    WV(b, o + VTX_STRIDE,     p2x + dy, p2y - dx, u0, v0, col)
-                    WV(b, o + VTX_STRIDE * 2, p2x - dy, p2y + dx, u1, v1, col)
-                    WV(b, o + VTX_STRIDE * 3, p1x - dy, p1y + dx, u1, v1, col)
+                    WV(b, o,                  p1x + dy, p1y - dx, u0, v0, c)
+                    WV(b, o + VTX_STRIDE,     p2x + dy, p2y - dx, u0, v0, c)
+                    WV(b, o + VTX_STRIDE * 2, p2x - dy, p2y + dx, u1, v1, c)
+                    WV(b, o + VTX_STRIDE * 3, p1x - dy, p1y + dx, u1, v1, c)
                     id[iw] = idx; id[iw + 1] = idx + 1; id[iw + 2] = idx + 2
                     id[iw + 3] = idx; id[iw + 4] = idx + 2; id[iw + 5] = idx + 3
                     vw += 4; iw += 6; idx += 4
@@ -5408,6 +5421,72 @@ return function(G)
             dl._VtxWritePtr = vw + 5; dl._IdxWritePtr = iw + 6; dl._VtxCurrentIdx = idx + 5
             return true
         end
+        -- [Luau] prims i0..i1 in one call when both getters are GetterXY and there are no axis transform functions:
+        -- ShadedRender + XYGet + TransformX/Y + GetCol inlined (plain arrays read directly), same math. Returns culled count.
+        @native
+        local function ShadedRange(r, dl, cr, i0, i1)
+            local g1, g2 = r.Getter1, r.Getter2
+            local cols, alpha = r.Cols, r.ColAlpha
+            if g1.Get ~= XYGet or g2.Get ~= XYGet or tx_fwd ~= nil or ty_fwd ~= nil or (cols ~= nil and (i0 < 0 or i1 >= r.ColCount)) then
+                local culled = 0
+                for i = i0, i1 do
+                    if not ShadedRender(r, dl, cr, i) then culled += 1 end
+                end
+                return culled
+            end
+            local iax, iay, ibx, iby = g1.IndexerX, g1.IndexerY, g2.IndexerX, g2.IndexerY
+            local dax, day, dbx, dby = PlainData(iax), PlainData(iay), PlainData(ibx), PlainData(iby)
+            local cminx, cminy, cmaxx, cmaxy = cr.Min.x, cr.Min.y, cr.Max.x, cr.Max.y
+            local xpm, xm, xpl, ypm, ym, ypl = tx_pixmin, tx_m, tx_pltmin, ty_pixmin, ty_m, ty_pltmin
+            local p11x, p11y, p12x, p12y = r.P11x, r.P11y, r.P12x, r.P12y
+            local col, u, v = r.Col, r.U, r.V
+            local b, id = dl.VtxBuffer.Buf, dl.IdxBuffer.Data
+            local vw, iw, idx = dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx
+            local culled = 0
+            for prim = i0, i1 do
+                local j = prim + 1
+                local ax = dax and dax[j + 1] or iax.At(iax, j)
+                local ay = day and day[j + 1] or iay.At(iay, j)
+                local bx = dbx and dbx[j + 1] or ibx.At(ibx, j)
+                local by = dby and dby[j + 1] or iby.At(iby, j)
+                local p21x, p21y = xpm + xm * (ax - xpl), ypm + ym * (ay - ypl)
+                local p22x, p22y = xpm + xm * (bx - xpl), ypm + ym * (by - ypl)
+                local minx, miny = min(p11x, p12x, p21x, p22x), min(p11y, p12y, p21y, p22y)
+                local maxx, maxy = max(p11x, p12x, p21x, p22x), max(p11y, p12y, p21y, p22y)
+                if miny < cmaxy and maxy > cminy and minx < cmaxx and maxx > cminx then
+                    local c = col
+                    if cols ~= nil then
+                        c = cols[prim + 1]
+                        if alpha < 1 then c = MulAlphaU32(c, alpha) end
+                    end
+                    local intersect = ((p11y > p12y and p22y > p21y) or (p12y > p11y and p21y > p22y)) and 1 or 0
+                    local ix, iy = 0, 0
+                    if intersect == 1 then
+                        -- Intersection(P11,P21,P12,P22)
+                        local v1 = p11x * p21y - p11y * p21x
+                        local v2 = p12x * p22y - p12y * p22x
+                        local v3 = (p11x - p21x) * (p12y - p22y) - (p11y - p21y) * (p12x - p22x)
+                        ix = (v1 * (p12x - p22x) - v2 * (p11x - p21x)) / v3
+                        iy = (v1 * (p12y - p22y) - v2 * (p11y - p21y)) / v3
+                    end
+                    local o = (vw - 1) * VTX_STRIDE
+                    WV(b, o,                  p11x, p11y, u, v, c)
+                    WV(b, o + VTX_STRIDE,     p21x, p21y, u, v, c)
+                    WV(b, o + VTX_STRIDE * 2, ix, iy, u, v, c)
+                    WV(b, o + VTX_STRIDE * 3, p12x, p12y, u, v, c)
+                    WV(b, o + VTX_STRIDE * 4, p22x, p22y, u, v, c)
+                    id[iw] = idx; id[iw + 1] = idx + 1 + intersect; id[iw + 2] = idx + 3
+                    id[iw + 3] = idx + 1; id[iw + 4] = idx + 4; id[iw + 5] = idx + 3 - intersect
+                    vw += 5; iw += 6; idx += 5
+                else
+                    culled += 1
+                end
+                p11x, p11y, p12x, p12y = p21x, p21y, p22x, p22y
+            end
+            dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx = vw, iw, idx
+            r.P11x, r.P11y, r.P12x, r.P12y = p11x, p11y, p12x, p12y
+            return culled
+        end
         function internal.RendererShaded(getter1, getter2)
             local ax, ay = getter1.Get(getter1, 0)
             local bx, by = getter2.Get(getter2, 0)
@@ -5415,7 +5494,7 @@ return function(G)
                 Prims = min(getter1.Count, getter2.Count) - 1, IdxConsumed = 6, VtxConsumed = 5,
                 Getter1 = getter1, Getter2 = getter2,
                 P11x = TransformX(ax), P11y = TransformY(ay), P12x = TransformX(bx), P12y = TransformY(by),
-                Init = WhiteInit, Render = ShadedRender,
+                Init = WhiteInit, Render = ShadedRender, RenderRange = ShadedRange,
             }
         end
 
@@ -6877,8 +6956,9 @@ return function(G)
             @native
             local function ImMinMaxIndexer(indexer, count)
                 local min_out, max_out = indexer.At(indexer, 0), indexer.At(indexer, 0)
+                local d = PlainData(indexer)
                 for i = 1, count - 1 do
-                    local v = indexer.At(indexer, i)
+                    local v = d and d[i + 1] or indexer.At(indexer, i)
                     if v < min_out then min_out = v end
                     if v > max_out then max_out = v end
                 end
@@ -7127,8 +7207,8 @@ return function(G)
             -- (renderer table reused across calls, so nothing is allocated per cell)
             @native
             local function HeatmapRender(r, dl, cr, prim)
-                local ix = r.Indexer
-                local val = ix.At(ix, prim)
+                local ix, d = r.Indexer, r.Data
+                local val = d and d[prim + 1] or ix.At(ix, prim)
                 local row, c
                 if r.ColMaj then
                     row, c = prim % r.Rows, prim // r.Rows
@@ -7148,7 +7228,72 @@ return function(G)
                 PrimRectFill(dl, p1x, p1y, p2x, p2y, col, r.U, r.V)
                 return true
             end
-            local heat_r = { IdxConsumed = 6, VtxConsumed = 4, Init = WhiteInit, Render = HeatmapRender }
+            -- [Luau] cells i0..i1 in one call when there are no axis transform functions: HeatmapRender + LerpTable +
+            -- TransformX/Y + Overlaps + PrimRectFill inlined, same math. Returns culled count.
+            @native
+            local function HeatmapRange(r, dl, cr, i0, i1)
+                if tx_fwd ~= nil or ty_fwd ~= nil then
+                    local culled = 0
+                    for i = i0, i1 do
+                        if not HeatmapRender(r, dl, cr, i) then culled += 1 end
+                    end
+                    return culled
+                end
+                local ix, d = r.Indexer, r.Data
+                local rows, cols, col_maj = r.Rows, r.Cols, r.ColMaj
+                local w, h = r.Width, r.Height
+                local hx, hy = w * 0.5, h * 0.5
+                local xref, yref, ydir = r.XRef, r.YRef, r.YDir
+                local smin, smax = r.ScaleMin, r.ScaleMax
+                local cm, cmap = r.Colormaps, r.Cmap
+                local tables, off, siz, qual = cm.Tables, cm.TableOffsets[cmap + 1], cm.TableSizes[cmap + 1], cm.Quals[cmap + 1]
+                local cminx, cminy, cmaxx, cmaxy = cr.Min.x, cr.Min.y, cr.Max.x, cr.Max.y
+                local xpm, xm, xpl, ypm, ym, ypl = tx_pixmin, tx_m, tx_pltmin, ty_pixmin, ty_m, ty_pltmin
+                local u, v = r.U, r.V
+                local b, id = dl.VtxBuffer.Buf, dl.IdxBuffer.Data
+                local vw, iw, vi = dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx
+                local culled = 0
+                for prim = i0, i1 do
+                    local val = d and d[prim + 1] or ix.At(ix, prim)
+                    local row, c
+                    if col_maj then
+                        row, c = prim % rows, prim // rows
+                    else
+                        row, c = prim // cols, prim % cols
+                    end
+                    local px = xref + hx + c * w
+                    local py = yref + ydir * (hy + row * h)
+                    local t = math.clamp((val - smin) / (smax - smin), 0.0, 1.0)
+                    local idx
+                    if qual then
+                        idx = min(max(floor(siz * t), 0), siz - 1) -- ImClamp
+                    else
+                        idx = floor((siz - 1) * t + 0.5)
+                    end
+                    local col = tables[off + idx + 1]
+                    local x1, y1 = xpm + xm * ((px - hx) - xpl), ypm + ym * ((py - hy) - ypl)
+                    local x2, y2 = xpm + xm * ((px + hx) - xpl), ypm + ym * ((py + hy) - ypl)
+                    local minx, maxx = x1, x2
+                    if x2 < x1 then minx, maxx = x2, x1 end
+                    local miny, maxy = y1, y2
+                    if y2 < y1 then miny, maxy = y2, y1 end
+                    if band(col, IM_COL32_A_MASK) ~= 0 and miny < cmaxy and maxy > cminy and minx < cmaxx and maxx > cminx then
+                        local o = (vw - 1) * VTX_STRIDE
+                        WV(b, o,                  x1, y1, u, v, col)
+                        WV(b, o + VTX_STRIDE,     x2, y2, u, v, col)
+                        WV(b, o + VTX_STRIDE * 2, x1, y2, u, v, col)
+                        WV(b, o + VTX_STRIDE * 3, x2, y1, u, v, col)
+                        id[iw] = vi; id[iw + 1] = vi + 1; id[iw + 2] = vi + 2
+                        id[iw + 3] = vi; id[iw + 4] = vi + 1; id[iw + 5] = vi + 3
+                        vw += 4; iw += 6; vi += 4
+                    else
+                        culled += 1
+                    end
+                end
+                dl._VtxWritePtr, dl._IdxWritePtr, dl._VtxCurrentIdx = vw, iw, vi
+                return culled
+            end
+            local heat_r = { IdxConsumed = 6, VtxConsumed = 4, Init = WhiteInit, Render = HeatmapRender, RenderRange = HeatmapRange }
 
             local label_pos = ImVec2(0, 0)
 
@@ -7168,12 +7313,13 @@ return function(G)
                 if reverse_y then yref, ydir = bmax_y, -1 end
                 local r = heat_r
                 r.Indexer, r.Prims, r.Rows, r.Cols, r.ColMaj = indexer, rows * cols, rows, cols, col_maj
+                r.Data = PlainData(indexer)
                 r.ScaleMin, r.ScaleMax = scale_min, scale_max
                 r.Width, r.Height = (bmax_x - bmin_x) / cols, (bmax_y - bmin_y) / rows
                 r.XRef, r.YRef, r.YDir = bmin_x, yref, ydir
                 r.Colormaps, r.Cmap = gp.ColormapData, gp.Style.Colormap
                 RenderPrimitivesEx(r, draw_list, gp.CurrentPlot.PlotRect)
-                r.Indexer = nil
+                r.Indexer, r.Data = nil, nil
                 -- labels
                 if fmt ~= nil then
                     local w = (bmax_x - bmin_x) / cols
@@ -7270,8 +7416,9 @@ return function(G)
                 end
                 local counted = 0
                 local max_count = 0
+                local d = PlainData(indexer)
                 for i = 0, count - 1 do
-                    local val = indexer.At(indexer, i)
+                    local val = d and d[i + 1] or indexer.At(indexer, i)
                     if val >= rmin and val <= rmax then
                         local b = math.clamp(floor((val - rmin) / width), 0, bins - 1) + 1
                         bin_counts[b] += 1.0
@@ -7387,8 +7534,10 @@ return function(G)
 
                 local counted = 0
                 local max_count = 0
+                local dx, dy = PlainData(indexer_x), PlainData(indexer_y)
                 for i = 0, count - 1 do
-                    local x, y = indexer_x.At(indexer_x, i), indexer_y.At(indexer_y, i)
+                    local x = dx and dx[i + 1] or indexer_x.At(indexer_x, i)
+                    local y = dy and dy[i + 1] or indexer_y.At(indexer_y, i)
                     if x >= xmin and x <= xmax and y >= ymin and y <= ymax then
                         local xb = math.clamp(floor((x - xmin) / width), 0, x_bins - 1)
                         local yb = math.clamp(floor((y - ymin) / height), 0, y_bins - 1)
