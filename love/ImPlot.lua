@@ -3613,9 +3613,18 @@ end                        plot.Selected = true
             end
 
             -- reset axes
+            -- [Luau] the cached colours do not depend on the axis: resolved once (X1) and copied to the other axes
+            -- (resolving the auto colours walks the auto colour chain and allocates: ~1.5 us per axis per frame)
+            local a0 = plot.Axes[0]
             for i = 0, ImAxis.COUNT - 1 do
-                plot.Axes[i]:Reset()
-                UpdateAxisColors(plot.Axes[i])
+                local axis = plot.Axes[i]
+                axis:Reset()
+                if i == 0 then
+                    UpdateAxisColors(axis)
+                else
+                    axis.ColorMaj, axis.ColorMin, axis.ColorTick, axis.ColorTxt = a0.ColorMaj, a0.ColorMin, a0.ColorTick, a0.ColorTxt
+                    axis.ColorBg, axis.ColorHov, axis.ColorAct = a0.ColorBg, a0.ColorHov, a0.ColorAct
+                end
             end
             -- ensure first axes enabled
             plot.Axes[ImAxis.X1].Enabled = true
